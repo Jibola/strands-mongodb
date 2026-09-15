@@ -1,13 +1,15 @@
 name: CI - Python
 
-# Four gates, none of which needs a credential. Asserted by tests/test_ci.py (AT-104 to AT-109), because
-# this file is the one part of the repository nothing else in the suite can execute: the tests read it as
-# YAML and check that it says what the requirements ask it to say.
+# Five gates on a change and two jobs on the weekly cron. Asserted by tests/test_ci.py (AT-104 to AT-109,
+# AT-130, AT-131), because this file is the one part of the repository nothing else in the suite can
+# execute: the tests read it as YAML and check that it says what the requirements ask it to say.
 #
-# The contract tier is deliberately absent. It needs MONGODB_URI, and the two ways to supply one are a
-# repository secret and provisioning a deployment per job. A run here
-# reports the contract tier as skipped rather than as passed, because conftest.py's tier gate turns an
-# unset variable into a skip that names the variable.
+# The contract tier runs on every change against a service container rather than a credential. The tier's
+# own definition is "any real MongoDB, including a plain mongod", and this package opens no transaction, no
+# session and no change stream, so a container satisfies it by definition and costs nothing. The two tiers
+# that genuinely need a cluster -- integration and autoembed, which need mongot and a registered embedding
+# model -- run on the schedule instead, because a pull request from a fork receives no secret and would
+# report the resulting skip as a pass.
 
 on:
   pull_request:
@@ -102,6 +104,51 @@ jobs:
       - name: Run tests
         run: hatch run test
 
+  contract:
+    name: Contract tier
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+
+    # A real MongoDB, supplied by the runner rather than by a secret. The tier gate in conftest.py asks only
+    # that MONGODB_URI point at something that answers, and nothing in this package needs a replica set.
+    services:
+      mongodb:
+        image: mongo:8
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    # Under env: rather than on the command line. REQ-E-108 is written about every connection string rather
+    # than only the secret ones: a rule with an exception is a rule somebody has to remember.
+    env:
+      MONGODB_URI: mongodb://localhost:27017
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install hatch
+        run: pip install hatch
+
+      # -m contract rather than the whole suite: the matrix job above already runs the unit tier on four
+      # interpreters, and this job exists for the assertions that need a server. It also selects the
+      # storage quickstart, which carries `contract` beside `example`, so one of the two shipped examples
+      # is executed here rather than merely linted.
+      - name: Run the contract tier
+        run: hatch run test -m contract
+
   coverage:
     name: Coverage floors
     if: github.event_name != 'schedule'
@@ -139,6 +186,23 @@ jobs:
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
 
+    # The same container the contract job uses, for the same reason it costs nothing. The canary is
+    # specified to run the contract tier beside both protocol checks; that clause was unmet while the
+    # tier needed a credential, and a service container is not a credential.
+    services:
+      mongodb:
+        image: mongo:8
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      MONGODB_URI: mongodb://localhost:27017
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -166,3 +230,43 @@ jobs:
 
       - name: Run the compat tier
         run: hatch run test -m compat
+
+      # Separate step rather than `-m "compat or contract"`, so a failure names which of the two broke and
+      # the compat selector stays readable as the thing AT-107 asserts. Against the upgraded SDK and a real
+      # server, which is the combination nothing else in this file produces.
+      - name: Run the contract tier against the upgraded SDK
+        run: hatch run test -m contract
+
+  atlas:
+    name: Atlas tiers
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+
+    # The two tiers a container cannot stand in for: integration needs mongot, and autoembed needs a
+    # cluster with a registered embedding model. On the schedule rather than on pull requests, because a
+    # fork's pull request receives neither secret and conftest.py would report both tiers as skipped --
+    # which a green check reads as passed. pull_request_target is the trigger that would hand a fork's code
+    # these values, and it is deliberately not among the triggers above.
+    env:
+      MONGODB_ATLAS_URI: ${{ secrets.MONGODB_ATLAS_URI }}
+      MONGODB_AUTOEMBED_URI: ${{ secrets.MONGODB_AUTOEMBED_URI }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install hatch
+        run: pip install hatch
+
+      # Both tiers in one job, because they share a cluster and the second would queue behind the first
+      # anyway. Measured at 33 minutes of wall clock, which is the other reason this is weekly.
+      - name: Run the tiers that need a cluster
+        run: hatch run test -m "integration or autoembed"

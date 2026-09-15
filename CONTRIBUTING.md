@@ -88,18 +88,21 @@ that it formats the tree in place where CI only reads it:
 hatch run prepare
 ```
 
-Then the four jobs in `.github/workflows/ci-python.yml`:
+Then the jobs in `.github/workflows/ci-python.yml`. Four gate a change; two run on the weekly cron:
 
 | Job | Runs |
 |---|---|
 | `Lint` | `hatch run format-check`, `hatch run lint`, `hatch run typecheck` |
 | `Test - Python <version>` | The default tier on 3.10, 3.11, 3.12 and 3.13. No deployment, so no secrets |
+| `Contract tier` | `hatch run test -m contract` against a `mongo:8` service container. No secret: the tier's definition is any real MongoDB, and a container is one |
 | `Coverage floors` | `hatch run cov`: 90% aggregate and 70% per module, both enforced |
-| `Latest SDK compatibility` | Weekly, against the newest published `strands-agents` rather than the pinned one |
+| `Latest SDK compatibility` | Weekly, against the newest published `strands-agents` rather than the pinned one. Typechecks, then runs `compat`, then runs `contract` |
+| `Atlas tiers` | Weekly. `hatch run test -m "integration or autoembed"` against two repository secrets |
 
-The cluster tiers do not run in CI, because CI has no credentials for a deployment. That makes the
-maintainer's local all-tiers run the only place they execute, and it is why a pull request that touches
-search behaviour should say which tiers the author ran.
+The two tiers that need a cluster run on the schedule rather than on your pull request, because a pull
+request from a fork receives no secret and the resulting skip would report as a pass. So CI will not
+exercise search behaviour on your branch. A pull request that touches it should say which tiers the
+author ran locally, with `MONGODB_URI` and `MONGODB_ATLAS_URI` pointing at a deployment of their own.
 
 ## Sending the pull request
 
