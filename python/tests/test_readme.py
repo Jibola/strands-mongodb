@@ -552,10 +552,16 @@ _TRACEABLE_IDS = frozenset(
         "REQ-E-017c",
         "REQ-E-091",
         "store search failed",
-        "strands_expires_at_ttl",
         "Storage.list()",
+        "MongoDBStorage.ensure_indexes()",
     }
 )
+"""The sources ``REQ-E-095``'s rows cite that are not package constants.
+
+``strands_expires_at_ttl`` was one of them until ``REQ-E-119`` closed it: the row it labelled said no
+code path creates the storage TTL index, and ``MongoDBStorage.ensure_indexes()`` is that code path now.
+A row citing a method rather than an index name is one a reader can act on without leaving the document.
+"""
 
 
 def _limit_rows() -> list[tuple[str, str, str]]:
@@ -997,3 +1003,221 @@ class TestTheReadmeCoversEverySubjectTheRequirementNames:
         assert f"{megabytes} MB" in section, (
             f"the limits section does not state the {megabytes} MB ceiling that MAX_DOCUMENT_BYTES sets"
         )
+
+
+def _marked_section(marker: str) -> str:
+    """Return the lines following an HTML marker comment, up to the next heading.
+
+    The marker is what makes a passage addressable. A test that searched the whole document for a
+    sentence would pass when the sentence drifted into an unrelated section, and a test that searched by
+    heading would fail the day somebody rewords the heading.
+
+    Args:
+        marker: The comment's inner text, without the ``<!--`` and ``-->``.
+
+    Returns:
+        The section body, or ``""`` when the marker is absent.
+    """
+    lines = _PACKAGE_README.read_text().splitlines()
+    try:
+        start = lines.index(f"<!-- {marker} -->")
+    except ValueError:
+        return ""
+    body: list[str] = []
+    for line in lines[start + 1 :]:
+        if line.startswith("#"):
+            break
+        body.append(line)
+    return "\n".join(body)
+
+
+def _verify_rows() -> list[tuple[str, str, str]]:
+    """Read the ensure-versus-verify table out of the package README.
+
+    Returns:
+        One ``(index kind, what ensure does, what verify does)`` triple per row, in document order.
+    """
+    rows: list[tuple[str, str, str]] = []
+    for line in _marked_section("verify").splitlines():
+        if not line.startswith("|"):
+            if rows:
+                break
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) < 3 or set("".join(cells)) <= {"-", ":"} or cells[0].startswith("Index"):
+            continue
+        rows.append((cells[0], cells[1], cells[2]))
+    return rows
+
+
+class TestTheManualVectorPathIsDocumentedAtItsRealWidth:
+    """``AT-128`` -- ``REQ-E-125``: a read half that works and no write half.
+
+    That gap was never an API defect. A `vector` keyword on `add` would be reachable only by a caller who
+    has already stepped around `MemoryManager`, and that caller can write the document. What was wrong
+    was the document: it offered `embedding_dimensions` and `similarity` as two more configuration keys
+    and never said that the field they index is one nothing in this package fills.
+
+    So both directions are asserted. The README has to *say* it, and the fact it states has to still be
+    true of the code -- the day `add` grows a vector parameter, the sentence becomes a lie and this class
+    is what notices.
+    """
+
+    def test_the_readme_names_the_field_the_index_covers(self) -> None:
+        """AT-128 -- the name comes from the package, so renaming the field fails here.
+
+        A reader who has to supply the vector needs the field name above everything else, and it appears
+        nowhere in the document today: `embedding_dimensions` is a config key, not a path.
+        """
+        section = _marked_section("manual-vectors")
+        assert section, f"no passage marked '<!-- manual-vectors -->' in {_PACKAGE_README.name}"
+        assert f"`{_indexes.VECTOR_FIELD}`" in section, (
+            f"the manual-vector passage never names {_indexes.VECTOR_FIELD!r}, the field "
+            f"_indexes.VECTOR_FIELD makes the index cover"
+        )
+
+    def test_the_readme_says_the_package_never_produces_a_vector(self) -> None:
+        """AT-128 -- the statement `REQ-E-125` asks for, read as two clauses rather than one sentence."""
+        section = _marked_section("manual-vectors").lower()
+        for clause, phrases in (
+            ("that this package indexes and queries the field", ("index", "quer")),
+            ("that this package never produces a vector", ("never",)),
+            ("that writing the field is the caller's", ("you", "caller")),
+        ):
+            assert any(phrase in section for phrase in phrases), f"the manual-vector passage does not state {clause}"
+
+    def test_add_has_no_vector_parameter_for_the_readme_to_offer(self) -> None:
+        """AT-128 -- the negative half of ``REQ-E-125``, asserted against the signature it is about.
+
+        ``REQ-E-125`` forbids presenting ``embedding_dimensions`` as something ``add`` can fill. This is
+        the load-bearing half: prose can be re-read, but the reason the prose is correct is that the
+        parameter does not exist, and if somebody adds one the document has to change with it.
+        """
+        parameters = set(inspect.signature(MongoDBMemoryStore.add).parameters)
+
+        assert not parameters & {"vector", "embedding", "embeddings"}, (
+            f"MongoDBMemoryStore.add now takes {sorted(parameters & {'vector', 'embedding', 'embeddings'})}, "
+            f"so the write half exists and the README's manual-vector passage is out of date"
+        )
+
+    def test_the_passage_sits_where_a_reader_configuring_the_manual_path_will_be(self) -> None:
+        """AT-128 -- placement, because a true sentence in the wrong section is not a statement.
+
+        The two keys that select the path are in the `MongoDBConfig` table; the consequence of selecting
+        it belongs with the search tiers, which is where a reader goes to find out what answers a query.
+        """
+        text = _PACKAGE_README.read_text()
+        search = text.index("## Search: what answers a query")
+        marker = text.index("<!-- manual-vectors -->")
+        following = text.index("\n## ", search + 1)
+
+        assert search < marker < following, (
+            "the manual-vector passage is outside the search section, where a reader who has just set "
+            "embedding_dimensions is not looking"
+        )
+
+
+class TestBothHalvesOfVerifyModeAreStated:
+    """``AT-129`` -- ``REQ-E-126``: the section said verify mode never raises, and it always could.
+
+    The sentence was wrong about both halves. ``_ensure_ordinary`` raises on a missing ordinary index and
+    always has (``REQ-E-061``), and ``_ensure_search`` raises too; what is tolerant is one level up, in
+    ``_ensure_search_tiers``, and only under ``search_type: "auto"``, where a failed tier is dropped
+    because another one may answer. A reader planning a no-DDL deployment needs to know which of their
+    indexes stops startup and which one only degrades it, and the old text told them neither.
+
+    The search half's *behaviour* is asserted in ``test_memory_store.py``, where the warning is raised;
+    this class asserts the document, plus the one fact the document promises about the ordinary half that
+    can be computed here without a deployment.
+    """
+
+    def test_the_table_covers_every_index_kind_verify_mode_treats_differently(self) -> None:
+        """AT-129 -- three behaviours, so a two-row table has folded two of them together."""
+        rows = _verify_rows()
+        assert rows, f"no table marked '<!-- verify -->' in {_PACKAGE_README.name}"
+        kinds = [kind.lower() for kind, _, _ in rows]
+
+        assert len(rows) == 3, f"verify mode has three behaviours and the table has {len(rows)}: {kinds}"
+        assert any("ordinary" in kind for kind in kinds), f"no row for ordinary indexes: {kinds}"
+        assert sum("search" in kind for kind in kinds) == 2, (
+            f"the two search rows are what separate 'auto' from a named search_type: {kinds}"
+        )
+
+    def test_the_ordinary_row_says_it_raises_and_the_auto_row_says_it_warns(self) -> None:
+        """AT-129 -- the statement itself, read per row rather than as a search of the whole section."""
+        rows = {kind.lower(): verify.lower() for kind, _, verify in _verify_rows()}
+        ordinary = next((verify for kind, verify in rows.items() if "ordinary" in kind), "")
+        auto = next((verify for kind, verify in rows.items() if "auto" in kind), "")
+        named = next((verify for kind, verify in rows.items() if "search" in kind and "auto" not in kind), "")
+
+        assert "rais" in ordinary, f"the ordinary row does not say a missing index raises: {ordinary!r}"
+        assert "warn" in auto, f"the auto search row does not say a missing index warns: {auto!r}"
+        assert "rais" in named, f"the named search_type row does not say a missing index raises: {named!r}"
+        assert "warn" not in ordinary, (
+            f"the ordinary row still describes the search half's warning, which is the confusion "
+            f"REQ-E-126 is about: {ordinary!r}"
+        )
+
+    def test_the_sentence_that_said_verify_never_raises_is_gone(self) -> None:
+        """AT-129 -- the regression direction, since a corrected table under a wrong paragraph is worse.
+
+        A reader who reaches the paragraph first stops there. Phrased against the claim rather than the
+        wording, so a reworded version of the same wrong claim fails too.
+        """
+        text = _PACKAGE_README.read_text().lower()
+        wrong = [phrase for phrase in ("never raises", "does not raise", "never fails") if phrase in text]
+
+        assert wrong == [], f"the README still claims verify mode cannot raise: {wrong}"
+
+    def test_the_ordinary_rows_promised_message_is_the_message_the_code_builds(self) -> None:
+        """AT-129 -- the fact check: the row promises a work order, and this is the work order.
+
+        Computed rather than quoted. ``_missing_ordinary_message`` is what a caller in verify mode reads,
+        and if it ever stops carrying the creation commands the row's promise is empty.
+        """
+        specs = _indexes.storage_specs()
+        message = _indexes._missing_ordinary_message("storage", "appdb.storage", specs)
+
+        assert "ensure_indexes is False" in message
+        for spec in specs:
+            assert spec.creation_command("storage") in message, (
+                f"the verify-mode message omits the command that creates {spec.name!r}, so the README's "
+                f"ordinary row promises something the package does not send"
+            )
+
+
+class TestTheTtlCaveatNamesTheMethodThatCreatesTheIndex:
+    """``AT-128``'s sibling -- ``REQ-E-119``'s documentation half, the last place that gap was recorded.
+
+    Two rows said no code path creates the storage TTL index. One of them was in the limits table, cited
+    to ``strands_expires_at_ttl``, which is how a reader was expected to find out that ``ttl_seconds``
+    expired nothing. ``ensure_indexes()`` is that code path now, so both rows name it and the citation
+    moves from an index name to the method, which a reader can call rather than read about.
+    """
+
+    def test_the_limits_row_cites_the_method(self) -> None:
+        """AT-128 -- the row is still there and its source is the method rather than the id."""
+        sources = {source for _, _, source in _limit_rows()}
+
+        assert "strands_expires_at_ttl" not in sources, "the limits table still cites the bare index name"
+        assert "MongoDBStorage.ensure_indexes()" in sources, (
+            "no limits row names ensure_indexes(), so a reader whose ttl_seconds documents are not "
+            "expiring has nothing to call"
+        )
+
+    def test_the_method_the_readme_names_is_a_method(self) -> None:
+        """AT-128 -- a citation to a name that does not resolve is worth less than no citation."""
+        assert callable(getattr(MongoDBStorage, "ensure_indexes", None)), (
+            "the README names MongoDBStorage.ensure_indexes() and the class does not have it"
+        )
+
+    def test_the_index_table_row_no_longer_says_nothing_creates_it(self) -> None:
+        """AT-128 -- the other row, in the index table, which said the same thing in different words."""
+        text = _PACKAGE_README.read_text()
+        section = text.split("### What gets created", 1)[1].split("\n### ", 1)[0]
+        ttl = next(line for line in section.splitlines() if "strands_expires_at_ttl" in line)
+
+        assert "nothing creates this one for you" not in ttl, (
+            f"the index table still says nothing creates the storage TTL index: {ttl!r}"
+        )
+        assert "ensure_indexes()" in ttl, f"the index table's TTL row does not name the method: {ttl!r}"

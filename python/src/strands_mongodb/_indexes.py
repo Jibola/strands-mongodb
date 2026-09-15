@@ -111,11 +111,20 @@ SIMILARITIES: Final[tuple[str, ...]] = ("cosine", "dotProduct", "euclidean")
 MAX_DIMENSIONS: Final[int] = 8192
 """Upper bound Atlas enforces on ``numDimensions``. Measured: outside ``[1..8192]`` is code 8."""
 
-READY_TIMEOUT_SECONDS: Final[float] = 120.0
-"""How long a search-index build is waited on. ``pymongo_search_utils``' own ``TIMEOUT``.
+READY_TIMEOUT_SECONDS: Final[float] = 300.0
+"""How long a search-index build is waited on, before a caller overrides it (``REQ-E-123``).
 
-Reimplementing their polling against the async driver (``REQ-E-066``) is not a reason to also change
-how long a caller waits, so the number is theirs.
+Was ``pymongo_search_utils``' own ``TIMEOUT`` of 120, on the reasoning that
+reimplementing their polling against the async driver (``REQ-E-066``) is no reason to change how long a
+caller waits. Two measurements against cloud Atlas retired that: two index builds in a new database on
+an idle ``strands-dev`` took **104.7s** on 2026-09-02, and a single build on the same cluster with the
+three-tier suite's collections beside it ran past **120s** on 2026-09-15, failing the README's own
+AutoEmbeddings quickstart. A budget inside the observed range is wrong in both directions, so the number
+is now a measurement with room rather than an inheritance.
+
+Raising it changes when a *failure* arrives and not when a success does: the poll interval decides the
+latter and is untouched. ``MongoDBConfig["index_ready_timeout"]`` is the per-deployment override, for
+the case no default covers -- a shared cluster where a build queues behind somebody else's.
 """
 
 POLL_INTERVAL_SECONDS: Final[float] = 0.5
@@ -287,9 +296,7 @@ def vector_mode(config: MongoDBConfig) -> VectorMode:
     if not 1 <= dimensions <= MAX_DIMENSIONS:
         raise ValueError(
             f"strands_mongodb: 'embedding_dimensions' is {dimensions}, and Atlas requires a value "
-            f"within bounds [1..{MAX_DIMENSIONS}]. Note that the -1 placeholder some guides show is "
-            f"langchain-mongodb's constructor validation rather than a wire value; the server rejects "
-            f"it."
+            f"within bounds [1..{MAX_DIMENSIONS}]. Set it to the length your embedding model produces."
         )
     if similarity not in SIMILARITIES:
         raise ValueError(

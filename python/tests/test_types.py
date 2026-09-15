@@ -140,7 +140,7 @@ class TestMemoryStoreConfigExtendsTheSdkConfig:
 class TestDatabaseIsTheOneMandatoryConnectionField:
     """AT-056b — the field set, as a test rather than a transcript."""
 
-    def test_the_config_declares_the_documented_ten_fields_plus_the_two_justified(self) -> None:
+    def test_the_config_declares_the_documented_ten_fields_plus_the_three_justified(self) -> None:
         """The documented API fixes this field set, so it is asserted rather than left to review.
 
         The wording is that the config is reproduced verbatim, which makes any addition here a
@@ -151,6 +151,13 @@ class TestDatabaseIsTheOneMandatoryConnectionField:
         manual vector index needs at creation time, and the manual path is the primary
         tested one because an ``autoEmbed`` index is rejected at creation on every deployment CI can
         reach. Without them the package can build a working vector index nowhere.
+
+        The third is from ``REQ-E-122``. ``index_ready_timeout`` is how long a caller waits for
+        a search index to become queryable, and it is a key rather than a constant because a measurement
+        found a first build on a shared cloud cluster running past the constant this package shipped:
+        a wait long enough for one deployment is a failure on another, and only the caller knows which
+        they have. This test is the departure's record, and adding a fourth key means writing the
+        paragraph that justifies it here.
         """
         assert set(MongoDBConfig.__annotations__) == {
             "database",
@@ -165,6 +172,7 @@ class TestDatabaseIsTheOneMandatoryConnectionField:
             "text_index_name",
             "embedding_dimensions",
             "similarity",
+            "index_ready_timeout",
         }
 
     def test_the_two_added_fields_are_optional_and_typed(

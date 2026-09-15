@@ -22,10 +22,12 @@ from pathlib import Path
 import pytest
 from conftest import (
     ENV_FILE_LOCATIONS,
+    HOST_UNREACHABLE,
     TIER_VARIABLES,
     _require,
     fill_tier_variables_from_env,
     parse_env_file,
+    skip_if_search_is_unreachable,
 )
 
 pytest_plugins = ["pytester"]
@@ -272,6 +274,82 @@ class TestFixtureMisuseFailsRatherThanSkips:
 
         result.assert_outcomes(errors=1, skipped=0, passed=0)
         result.stdout.fnmatch_lines(["*MONGODB_URI is unset*"])
+
+
+class TestAnUnreachableSearchProcessSkipsRatherThanFails:
+    """AT-127 / ``REQ-E-124`` — the second gate, which reports infrastructure as infrastructure.
+
+    The gate above decides whether a tier runs at all, from a variable read before collection. This one
+    covers what the variable cannot see: a deployment that is configured and reachable for everything
+    except the separate process that answers searches. That happened on 2026-09-15, and the tier report
+    it produced named six failing tests in this package, none of which had anything wrong with them.
+
+    Every claim here is about the boundary between "skip this" and "fail this", because the helper is
+    only worth having if it stays on the right side of it. A guard that skipped on any search failure
+    would be strictly worse than no guard: it would hide the regressions the tests exist to find.
+    """
+
+    @staticmethod
+    def _storage_error(code: int | None) -> Exception:
+        """Build the failure shape ``test_memory_store.py`` catches: this package's error, driver chained."""
+        from pymongo.errors import OperationFailure
+        from strands.types.exceptions import StorageError
+
+        cause = OperationFailure("Error connecting to localhost:28000 :: Connection refused", code=code)
+        error = StorageError("strands_mongodb: searching 'q' in testdb.memory failed: connection refused")
+        error.__cause__ = cause
+        return error
+
+    def test_the_documented_code_is_the_one_the_deployment_raised(self) -> None:
+        """Sourced rather than chosen: ``HostUnreachable`` is 6 in the server's error table, and 6 is
+        what the 2026-09-15 log carries."""
+        assert HOST_UNREACHABLE == 6
+
+    def test_a_chained_host_unreachable_skips_and_the_message_carries_both_halves(self) -> None:
+        """``test_memory_store.py``'s shape: this package's ``StorageError``, the driver's code chained.
+
+        ``pytest.skip`` raises ``Skipped``, which derives from ``BaseException`` rather than
+        ``Exception``, so this catches it explicitly rather than letting an ``except Exception`` in the
+        helper's caller decide. The two message assertions are ``REQ-E-124``'s: the namespace comes
+        from this package's own sentence and the host and port from the driver's, and a message
+        carrying one without the other sends the reader to the wrong place.
+        """
+        with pytest.raises(BaseException, match="search process is unreachable") as raised:
+            skip_if_search_is_unreachable(self._storage_error(HOST_UNREACHABLE))
+
+        assert raised.typename == "Skipped"
+        assert "testdb.memory" in str(raised.value)
+        assert "localhost:28000" in str(raised.value)
+
+    def test_an_unchained_host_unreachable_skips_too(self) -> None:
+        """``test_pipeline.py``'s shape, where the driver's error is not wrapped in anything.
+
+        One helper serves two files only if it reads both shapes, and this is the one a guard written
+        against a chained cause alone would miss.
+        """
+        from pymongo.errors import OperationFailure
+
+        with pytest.raises(BaseException, match="search process is unreachable") as raised:
+            skip_if_search_is_unreachable(OperationFailure("Error connecting to localhost:28000", code=6))
+
+        assert raised.typename == "Skipped"
+
+    @pytest.mark.parametrize("code", [8, 26, 31082, None], ids=["unknown-error", "namespace", "unsupported", "none"])
+    def test_every_other_failure_is_left_to_fail(self, code: int | None) -> None:
+        """The half that keeps the guard honest.
+
+        8 is ``UnknownError`` and is what a mutation to ``!=`` would let through. 26 and 31082 are both
+        real and both mean the package asked for something the deployment does not have, which is a
+        result the suite must report rather than skip. ``None`` is a network error that never reached a
+        server and therefore carries no code at all.
+        """
+        try:
+            skip_if_search_is_unreachable(self._storage_error(code))
+        except BaseException as outcome:  # noqa: BLE001 - a skip is a BaseException, and it is the defect
+            pytest.fail(
+                f"the guard skipped on code {code}: {outcome!r}. Only HostUnreachable is infrastructure, "
+                f"and a skip on anything else turns a result the suite has to report into a clean-looking run"
+            )
 
 
 class TestTheEnvFileFillsTierVariables:

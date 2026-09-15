@@ -39,7 +39,7 @@ from strands.storage.search.keyword import tokenize
 from strands.storage.storage import _NAMESPACED, StorageSearchResult, _normalize_key, _normalize_prefix
 from strands.types.exceptions import StorageError
 
-from . import _client
+from . import _client, _indexes
 from ._indexes import EXPIRES_FIELD
 
 if TYPE_CHECKING:
@@ -240,9 +240,10 @@ class MongoDBStorage:
                 expire, which is not the same as ``0``: a MongoDB TTL index with
                 ``expireAfterSeconds: 0`` deletes documents as soon as their timestamp passes
                 (``REQ-E-035``). Setting this stamps ``expires_at`` and nothing more. **Expiry needs
-                the TTL index, and no code path in this package creates it on a storage collection.**
-                ``_indexes.storage_specs()`` holds the spec an operator or a
-                later release provisions it from.
+                the TTL index, and no operation on this class creates it**: call
+                :meth:`ensure_indexes` once, at startup, or provision it out of band from the spec
+                ``_indexes.storage_specs()`` holds. Documents written before it exists expire once it
+                does, since a TTL index acts on what is already in the collection.
 
         Raises:
             KeyError: If ``config`` has no ``database``. It is ``Required`` in the ``TypedDict``, so
@@ -263,6 +264,11 @@ class MongoDBStorage:
         self._prefix = f"{normalized}/" if normalized else ""
         self._ttl_seconds = ttl_seconds
         self._config = config
+        # Read once, at construction, and handed to the one `_indexes.ensure` call this class makes
+        # (`REQ-E-122`). Nothing on this surface waits on a search build, so the value only ever
+        # travels; the key exists so that a caller who set it for a memory store does not find it
+        # silently ignored here.
+        self._index_ready_timeout: float = config.get("index_ready_timeout", _indexes.READY_TIMEOUT_SECONDS)
         # Resolved here and the result dropped on the floor, which is deliberate. The connection an
         # operation uses comes from `_connection` below, freshly, because the registry is keyed by
         # running event loop (`REQ-E-017a`) and a reference captured here would pin this instance to
@@ -521,6 +527,49 @@ class MongoDBStorage:
         )
         scoped._namespaced = _NAMESPACED
         return scoped
+
+    async def ensure_indexes(self) -> None:
+        """Create the indexes this collection needs, or report what is stopping that (``REQ-E-119``).
+
+        One index today: ``strands_expires_at_ttl`` over ``expires_at`` with ``expireAfterSeconds: 0``,
+        which is what makes ``ttl_seconds`` do anything at all. Without it a store with a TTL stamps the
+        field on every document and the documents stay forever, which is the reason this method exists.
+
+        **Explicit on purpose, and called by nothing inside this package** (``REQ-E-121``). The five
+        protocol methods are one round trip each by design, and an ``Agent`` builds its storage
+        in a code path the user never sees, so provisioning folded into the constructor or the first
+        ``write`` would be DDL issued by a process whose operator did not ask for it and may not have
+        the rights for. Call it once at startup, from code that knows it is startup::
+
+            storage = MongoDBStorage(config, ttl_seconds=3600)
+            await storage.ensure_indexes()
+
+        Idempotent, and safe to call concurrently: the warm path is a single ``index_information``
+        read, and the server accepts a repeated identical ``createIndexes`` (measured: 10 at once, one
+        index, no failures). There is no cached flag to go stale against a collection somebody dropped.
+
+        ``ensure_indexes`` in the config governs this the way it governs
+        ``MongoDBMemoryStore.initialize()``: ``False`` means verify rather than skip (``REQ-E-061``), so
+        a missing index raises with the ``createIndexes`` command that resolves it rather than leaving
+        a caller to discover the absence as documents that never expire.
+
+        Existing documents are not a problem. A TTL index acts on whatever is already in the
+        collection, so rows written before this call expire once it returns.
+
+        Raises:
+            StorageError: If an index over the same keys exists with different options, if the index is
+                absent and ``ensure_indexes`` is ``False``, or if the driver refuses the call. The
+                server's own code and message arrive chained.
+        """
+        # No `@_reporting`: that decorator names the method's second positional argument in its
+        # message and there is none here, so it would render an empty quoted key. `_indexes.ensure`
+        # already turns every driver error into a `StorageError` naming the operation and namespace.
+        await _indexes.ensure(
+            self._collection(),
+            ordinary=_indexes.storage_specs(),
+            create=self._config.get("ensure_indexes", True),
+            timeout=self._index_ready_timeout,
+        )
 
     @property
     def _target(self) -> str:

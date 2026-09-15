@@ -247,6 +247,7 @@ one connection pool.
 | `connection_string` | `str` | no | | A MongoDB URI. Required unless `client` is set; supplying neither raises. |
 | `client_args` | `dict[str, Any]` | no | `{}` | Extra keyword arguments for the client this package builds. Ignored when `client` is set. |
 | `ensure_indexes` | `bool` | no | `True` | Whether to create missing indexes. `False` verifies and reports instead. See below. |
+| `index_ready_timeout` | `float` | no | `300` | Seconds to wait for a search index to become queryable, in total across every index one call builds. Raise it on a shared deployment where a build queues behind somebody else's. |
 | `search_type` | `"auto" \| "vector" \| "text"` | no | `"auto"` | Which memory search tiers to prepare and query. |
 | `embedding_model` | `str` | no | `voyage-4-lite` | Atlas embedding model, on the AutoEmbeddings path where the deployment embeds your text. |
 | `embedding_dimensions` | `int` | no | | Vector length, on the manual path where you supply the vectors. Mutually exclusive with `embedding_model`, and requires `similarity`. |
@@ -311,6 +312,31 @@ is worth knowing before you conclude that recall is bad.
 
 `hybrid` and `regex` are not here. `SearchType` is a `Literal` of the values that actually run, so a type
 checker rejects them today rather than a runtime raising on them later.
+
+### Supplying your own vectors
+
+Setting `embedding_dimensions` and `similarity` selects the manual path, where the vector index covers an
+`embedding` field on each document instead of asking Atlas to embed `content`.
+
+<!-- manual-vectors -->
+On that path this package indexes the `embedding` field and queries it, and **never produces a vector to
+put in it**. Client-side embedding is a non-goal, so nothing here calls a model. `add()` takes content and
+metadata and has no vector parameter, and `MemoryManager` would not pass one if it had: a memory written
+through `MongoDBMemoryStore` carries no `embedding`, and the store's own vector index cannot retrieve it.
+Writing that field is yours, through the driver, against the same collection:
+
+<!-- skip: it needs a collection, an embedding model and a document that the reader supplies -->
+```python
+await collection.update_one(
+    {"_id": entry_id},
+    {"$set": {"embedding": await your_embedding_model.embed(text)}},
+)
+```
+
+So in `0.1.0` the manual path is a `MongoDBStorage` and pipeline capability rather than a supported
+`MongoDBMemoryStore` configuration: the read half works and the write half is the caller's. The
+AutoEmbeddings default is unaffected, and is the supported memory configuration — there mongot embeds the
+indexed `content` field and the document carries no vector by design.
 
 ### Reserved metadata keys
 
@@ -387,7 +413,7 @@ theirs, and they are stable: renaming one would be a breaking change.
 
 | Collection | Index | Keys | Why |
 |---|---|---|---|
-| `storage` | `strands_expires_at_ttl` | `expires_at` | Expires `ttl_seconds` documents. See the limits section: nothing creates this one for you. |
+| `storage` | `strands_expires_at_ttl` | `expires_at` | Expires `ttl_seconds` documents. `MongoDBStorage` never creates it as a side effect of a write: call `ensure_indexes()`. |
 | `memory` | `strands_scope_store_content_hash_unique` | `scope`, `store_name`, `content_hash` | Makes a duplicate `add` a no-op instead of a second copy. Partial, so documents with no hash are unaffected. |
 | `memory` | `strands_scope_store_created_at` | `scope`, `store_name`, `created_at` desc | Every non-search read is scope plus store plus recency. |
 | `memory` | `strands_expires_at_ttl` | `expires_at` | Expires memories with a TTL. |
@@ -420,16 +446,28 @@ model registered on the cluster.
 
 ### Ensure versus verify
 
-| `ensure_indexes` | `initialize()` does | A missing index means |
+`ensure_indexes: False` is verify-only rather than skip. A credential with no DDL rights still needs to
+know whether the indexes are there, and what happens when one is absent depends on which index it is:
+
+<!-- verify -->
+| Index kind | `True` (default) does | `False`, and it is missing |
 |---|---|---|
-| `True` (default) | Creates what is missing, waits for the search indexes to become queryable | Nothing. It gets created. |
-| `False` | Lists what exists and compares | A warning naming the index, and a slow or failing query later |
+| Ordinary and TTL | Creates what is missing, one `createIndexes` call per collection | Raises. The message is the list of `createIndexes` commands that fix it, one line each |
+| Search, under `search_type: "auto"` | Creates it, then polls until it is queryable | A warning naming the index, and that tier is dropped. The store starts and answers from the tier that is left; if neither is left it raises |
+| Search, under `search_type: "vector"` or `"text"` | Creates it, then polls until it is queryable | Raises. There is no second tier to fall back to, and answering from one you did not ask for changes what matches |
 
-Verify mode never raises on a missing index, which is deliberate: a store that refuses to start because
-an index is still building is worse than one that runs a slower query. It also means a `False` deployment
-with nothing provisioned looks healthy at startup and disappoints at query time, so read the warnings.
+So verify mode is not a quiet mode. A missing ordinary index stops startup with a work order, because the
+alternative is worse than a late start: the uniqueness index behind `add`'s deduplication is one of them,
+and an application that runs without it writes duplicates silently and surfaces the problem in the data
+weeks later. The one case that continues is a search index under `auto`, where the package has somewhere
+to fall back to and a store answering lexically is worth more than a store that will not start. That one
+is visible only in your logs, so read the warnings.
 
-Waiting is bounded. `initialize()` polls a new search index every 0.5 s for up to 120 s, and past that it
+`MongoDBStorage` follows the same rule through `ensure_indexes()`, which is explicit rather than part of
+any operation: its collection has one ordinary index and no search index, so `ensure_indexes: False`
+there raises with the command for `strands_expires_at_ttl` and creates nothing.
+
+Waiting is bounded. `initialize()` polls a new search index every 0.5 s for up to 300 s, and past that it
 warns and returns rather than blocking your startup forever.
 
 ### Privileges
@@ -485,11 +523,11 @@ and the last column names the requirement or the id where the detail lives.
 | Document size | 16 MB, the server's `BSON` ceiling. Checked before the write, so you get a `ValueError` naming the size instead of a driver error. Chunk, or store a pointer. | `MAX_DOCUMENT_BYTES` |
 | Storage key length | 1024 bytes, which keeps a key inside an index entry. Same early `ValueError`. | `MAX_KEY_BYTES` |
 | `list()` is unpaginated | The SDK's protocol takes a prefix and no cursor, so a prefix matching a million keys returns a million keys. Use narrower prefixes, or `namespace()`. | `Storage.list()` |
-| `ttl_seconds` on storage expires nothing | `write` stamps `expires_at` and no code path creates the storage collection's TTL index, so the documents stay. Create `strands_expires_at_ttl` yourself with the command above. | `strands_expires_at_ttl` |
+| `ttl_seconds` needs an index nothing creates implicitly | `write` stamps `expires_at`, and the documents stay until the storage collection has its TTL index. No ordinary operation creates it, so the documents stay forever if nothing does. Call `await storage.ensure_indexes()` once at startup, or run the command above. | `MongoDBStorage.ensure_indexes()` |
 | Vector dimensions | 8192 on the manual vector path, rejected at configuration time rather than by the server. | `MAX_DIMENSIONS` |
 | Results per search | 10 by default. Raise `max_search_results` on the store, or `limit` on a single query. | `DEFAULT_MAX_SEARCH_RESULTS` |
 | Vector candidates considered | 10 per result requested. Raise `oversampling_factor` for recall, lower it for latency. | `DEFAULT_OVERSAMPLING_FACTOR` |
-| Waiting for a search index | 120 s, then `initialize()` warns and returns rather than blocking your startup. The index keeps building; the first queries are the ones that miss. | `READY_TIMEOUT_SECONDS` |
+| Waiting for a search index | 300 s, then `initialize()` warns and returns rather than blocking your startup. The index keeps building; the first queries are the ones that miss. Set `index_ready_timeout` to change it. | `READY_TIMEOUT_SECONDS` |
 
 ## Examples
 

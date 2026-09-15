@@ -96,8 +96,8 @@ on those it named a code absent from the reader's own log.
 
 _NO_SEARCH_QUERY = (
     "strands_mongodb: cannot search %s because this deployment does not run Atlas Search. Its capability "
-    "probe came back with %s, and v0.1.0 ships no tier that answers without a search process, "
-    "so there is nothing to fall back to. Writes still work, which is why "
+    "probe came back with %s, and v0.1.0 ships no tier that answers without a search process, so "
+    "there is nothing to fall back to. Writes still work, which is why "
     "initialize() only warned. Point 'connection_string' at MongoDB Atlas, or at a local Atlas "
     "deployment started with 'atlas deployments setup --type local'."
 )
@@ -415,6 +415,10 @@ class MongoDBMemoryStore:
         self._database_name = connection["database"]
         self._collection_name = config.get("collection", DEFAULT_COLLECTION)
         self._ensure_indexes: bool = connection.get("ensure_indexes", True)
+        # Read once, at construction, and passed to every `_indexes.ensure` call this class makes
+        # (`REQ-E-122`). Only the search call waits on anything; the ordinary one is given the same
+        # value so the keyword has one meaning rather than two.
+        self._index_ready_timeout: float = connection.get("index_ready_timeout", _indexes.READY_TIMEOUT_SECONDS)
         self._search_type: SearchType = connection.get("search_type") or "auto"
         # The index definition is the single authority for what is filterable, so both the
         # configured filter and every per-query one are checked against the same list.
@@ -503,7 +507,12 @@ class MongoDBMemoryStore:
 
             # Ordinary indexes first, and unconditionally. The uniqueness index behind `add`'s
             # deduplication is one of them, and it is needed whether or not this deployment can search.
-            await _indexes.ensure(collection, ordinary=_indexes.memory_specs(), create=self._ensure_indexes)
+            await _indexes.ensure(
+                collection,
+                ordinary=_indexes.memory_specs(),
+                create=self._ensure_indexes,
+                timeout=self._index_ready_timeout,
+            )
 
             self._tiers = await self._ensure_search_tiers(collection) if capabilities.search else ()
             self._initialized = True
@@ -535,7 +544,12 @@ class MongoDBMemoryStore:
         available: list[ResolvedSearchType] = []
         for tier, spec in self._specs:
             try:
-                await _indexes.ensure(collection, search=(spec,), create=self._ensure_indexes)
+                await _indexes.ensure(
+                    collection,
+                    search=(spec,),
+                    create=self._ensure_indexes,
+                    timeout=self._index_ready_timeout,
+                )
             except StorageError as error:
                 if self._search_type != "auto":
                     raise

@@ -914,7 +914,7 @@ class TestSearchIndexesAgainstAFake:
 
         The test above finds ``FAILED`` on the first read, which is what a second ``initialize()`` sees.
         This is what the *first* one sees: the build starts, reports ``BUILDING``, and then fails. Both
-        paths have to raise, because waiting for a failed build to become ready is a 120 second wait for
+        paths have to raise, because waiting for a failed build to become ready is a 300 second wait for
         a status that will not change.
 
         Which is why the call is ``bounded``: this test's name is a claim about *not* waiting, and
@@ -1141,7 +1141,7 @@ class TestSearchIndexesAgainstAFake:
         assert collection.created_search_indexes == []
 
     async def test_a_build_that_never_finishes_times_out_naming_the_last_status(self) -> None:
-        """120 seconds of silence followed by a bare timeout tells the reader nothing. The status is
+        """300 seconds of silence followed by a bare timeout tells the reader nothing. The status is
         the actionable part: ``BUILDING`` at timeout is a slow build, and anything else is unexpected.
 
         The call goes through ``bounded`` for the reason recorded there: this is one of the two tests
@@ -1166,11 +1166,20 @@ class TestSearchIndexesAgainstAFake:
         assert "BUILDING" in message
         assert "vector_index" in message
 
-    async def test_the_default_timeout_and_interval_match_the_reference_helpers(self) -> None:
-        """``pymongo_search_utils`` polls with ``TIMEOUT = 120`` and ``INTERVAL = 0.5``. Reimplementing
-        those helpers against ``AsyncCollection`` (``REQ-E-066``) is not a reason to also change how
-        long a caller waits."""
-        assert _indexes.READY_TIMEOUT_SECONDS == 120
+    async def test_the_default_timeout_is_measured_and_the_interval_matches_the_reference(self) -> None:
+        """AT-125 / ``REQ-E-123``, ``INV-009``. The interval is inherited; the budget is not, any more.
+
+        ``pymongo_search_utils`` polls with ``TIMEOUT = 120`` and ``INTERVAL = 0.5``, and reimplementing
+        those helpers against ``AsyncCollection`` (``REQ-E-066``) was never a reason to change how long a
+        caller waits. Two measurements against cloud Atlas are: 104.7s for two index builds on an idle
+        ``strands-dev`` on 2026-09-02, and a 120s timeout on one build on the same cluster with the
+        three-tier suite's collections beside it on 2026-09-15. 120 sits inside the observed range, which
+        is the one place a budget must not sit.
+
+        The interval is untouched. Raising a ceiling changes when a failure arrives and not when a
+        success does, which is ``INV-009``, and the poll frequency is what decides the latter.
+        """
+        assert _indexes.READY_TIMEOUT_SECONDS == 300
         assert _indexes.POLL_INTERVAL_SECONDS == 0.5
 
     async def test_polling_yields_to_the_event_loop_between_reads(self) -> None:
@@ -1232,7 +1241,7 @@ class TestSearchIndexesAgainstAFake:
         that as "no indexes exist" would drive a create that fails the same way one call later.
 
         ``bounded`` because the wrong behaviour here is a *slow* pass into the poll loop rather than a
-        fast wrong answer: swallowing code 13 sends this call to the default 120 second timeout.
+        fast wrong answer: swallowing code 13 sends this call to the default 300 second timeout.
         """
         from strands.types.exceptions import StorageError
 
@@ -1323,7 +1332,7 @@ class TestSearchIndexesAgainstAFake:
     async def test_a_status_is_logged_when_it_changes_and_not_on_every_poll(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """A build that takes the full 120 seconds is 240 polls. Logging each one buries the operator's
+        """A build that takes the full 300 seconds is 600 polls. Logging each one buries the operator's
         own output; logging none makes a slow build indistinguishable from a hang. The line is therefore
         per transition, which is also the only signal that says which of the two is happening."""
         spec = _indexes.memory_search_specs({"database": "d"})[0]
@@ -1948,3 +1957,60 @@ class TestSearchIndexesAgainstAtlas:
             assert not isinstance(mapped, list)
             assert mapped["type"] == "string"
             assert {"indexOptions", "store", "norms"} <= set(mapped)
+
+
+class TestEveryCallSitePassesTheConfiguredBudget:
+    """AT-126 / ``REQ-E-122`` — the completeness half, which no behavioural test can express.
+
+    ``test_storage.py`` and ``test_memory_store.py`` assert that the call sites they know about carry
+    ``timeout``. Neither can assert that those are *all* of them, and the premortem's row 3 is exactly
+    that failure: a fourth call site added later, defaulting silently to the module constant, so an
+    operator who raised ``index_ready_timeout`` for a shared Atlas project finds one build still giving
+    up at 300 seconds and nothing anywhere saying why.
+
+    Source inspection rather than a runtime count, for the same reason ``test_conventions.py`` uses it:
+    a call site that no test reaches is precisely the one this has to see. The check is narrow — it
+    reads the keyword names of every ``_indexes.ensure(...)`` call in the package and nothing about
+    their values — so it stays true through any refactor that keeps the keyword.
+    """
+
+    @staticmethod
+    def _ensure_calls() -> list[tuple[str, int, set[str]]]:
+        """Every ``_indexes.ensure(...)`` call in the shipped package, with the keywords it passes.
+
+        Returns:
+            One ``(module, line, keywords)`` triple per call site, in file then line order.
+        """
+        import ast
+        from pathlib import Path
+
+        found: list[tuple[str, int, set[str]]] = []
+        source_root = Path(__file__).resolve().parent.parent / "src" / "strands_mongodb"
+        for path in sorted(source_root.glob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if not isinstance(node, ast.Call):
+                    continue
+                function = node.func
+                if (
+                    isinstance(function, ast.Attribute)
+                    and function.attr == "ensure"
+                    and isinstance(function.value, ast.Name)
+                    and function.value.id == "_indexes"
+                ):
+                    found.append((path.name, node.lineno, {kw.arg for kw in node.keywords if kw.arg}))
+        return found
+
+    def test_the_call_sites_are_the_three_the_requirement_names(self) -> None:
+        """A guard on the guard. If this fails the package grew or lost a call site, and the test below
+        is either checking something new or has quietly stopped checking anything."""
+        by_module = [module for module, _, _ in self._ensure_calls()]
+
+        assert by_module == ["memory_store.py", "memory_store.py", "storage.py"], self._ensure_calls()
+
+    def test_every_call_site_passes_a_timeout(self) -> None:
+        missing = [(module, line) for module, line, keywords in self._ensure_calls() if "timeout" not in keywords]
+
+        assert not missing, (
+            f"these _indexes.ensure call sites pass no timeout=, so index_ready_timeout does not "
+            f"reach them and they wait out the module default instead (REQ-E-122): {missing}"
+        )

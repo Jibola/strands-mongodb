@@ -21,13 +21,14 @@ import asyncio
 import datetime
 import inspect
 import sys
+import time
 import traceback
 import typing
 
 # Imported at runtime rather than under ``TYPE_CHECKING``: the fake's range matching uses it in an
 # ``isinstance`` check, which is what tells an ``_id`` equality filter from an ``_id`` range.
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 import bson
 import pytest
@@ -40,7 +41,7 @@ from strands_mongodb import storage as storage_module
 from strands_mongodb.storage import MongoDBStorage
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterable, Iterator
+    from collections.abc import AsyncIterator, Iterable, Iterator, Sequence
 
     from strands_mongodb.types import MongoDBConfig
 
@@ -113,8 +114,22 @@ class FakeAggregationCursor:
             yield document
 
 
+class FakeStorageDatabase:
+    """The database half of the fake, which exists for one attribute: ``name``.
+
+    ``_indexes._ensure_ordinary`` builds its namespace from ``collection.database.name`` and puts it in
+    every message it raises, so a fake without this raises ``AttributeError`` from inside the module
+    under test rather than the ``StorageError`` the requirement describes. Unlike ``test_indexes.py``'s
+    version there is no ``create_collection`` here: that call belongs to the search path, and the
+    storage collection has no search index at all.
+    """
+
+    def __init__(self, *, name: str = "appdb") -> None:
+        self.name = name
+
+
 class FakeStorageCollection:
-    """``AsyncCollection`` narrowed to the five methods ``storage.py`` calls (``MP-001``).
+    """``AsyncCollection`` narrowed to the methods ``storage.py`` calls (``MP-001``).
 
     Holds documents in a plain dict keyed by ``_id`` and answers a range query by comparing Python
     strings, which is close enough for *what was asked* and deliberately not offered as evidence of
@@ -130,12 +145,21 @@ class FakeStorageCollection:
         error: BaseException | None = None,
         iteration_error: BaseException | None = None,
         aggregate_result: Iterable[Mapping[str, Any]] = (),
+        database: FakeStorageDatabase | None = None,
+        indexes: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.name = name
+        self.database = database if database is not None else FakeStorageDatabase()
         self.documents: dict[str, dict[str, Any]] = {str(document["_id"]): dict(document) for document in documents}
         self._error = error
         self._iteration_error = iteration_error
         self._aggregate_result = list(aggregate_result)
+        # What the server would report today. ``_id_`` is in the default because the server creates it
+        # whether or not anybody asks, and a fake that started empty would let a test claim
+        # ``ensure_indexes()`` creates an index the server already made.
+        self.indexes: dict[str, dict[str, Any]] = (
+            dict(indexes) if indexes is not None else {"_id_": {"v": 2, "key": [("_id", 1)]}}
+        )
         self.pipelines: list[list[dict[str, Any]]] = []
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
         self.cursors: list[FakeCursor] = []
@@ -203,6 +227,25 @@ class FakeStorageCollection:
         self._record("aggregate", stages)
         self.pipelines.append(stages)
         return FakeAggregationCursor(self._aggregate_result)
+
+    async def index_information(self) -> dict[str, dict[str, Any]]:
+        self._record("index_information")
+        return {name: dict(spec) for name, spec in self.indexes.items()}
+
+    async def create_indexes(self, models: Sequence[Any]) -> list[str]:
+        self._record("create_indexes", list(models))
+        for model in models:
+            document = dict(model.document)
+            # The same two normalisations ``test_indexes.py``'s fake performs, and measured the same
+            # way on 4.17.0 rather than reasoned about: ``IndexModel.document`` holds ``key`` as a
+            # ``SON`` where the server reports a list of tuples, and it carries the name as a field
+            # where the server uses it as the entry's key. Without them a create followed by a verify
+            # reads a shape the server would never have returned, and ``AT-121``'s second call would
+            # create the index again.
+            name = document.pop("name")
+            document["key"] = list(document["key"].items())
+            self.indexes[name] = {"v": 2, **document}
+        return [model.document["name"] for model in models]
 
 
 class FakeDeleteResult:
@@ -1193,6 +1236,152 @@ def _string_lists(value: Any) -> Iterator[list[str]]:
             yield from _string_lists(item)
 
 
+class TestEnsureIndexesIsExplicitAndIdempotent:
+    """AT-121, AT-123 / ``REQ-E-119`` — the method that creates the storage TTL index.
+
+    ``ttl_seconds`` has stamped ``expires_at`` on every document it writes from the start and nothing in
+    this package has ever created the index that acts on it, so a caller who set the argument got a
+    field and no expiry. The fix is a method rather than work folded into the constructor or the first
+    ``write``: ``Storage``'s round-trip count is its design and a store built by the SDK is built
+    in a code path the user does not see, so an index creation hidden there is DDL nobody asked for.
+
+    The contract half lives in ``TestEnsureIndexesAgainstARealDeployment`` below, because whether the
+    server then *removes* the document is the server's behaviour and no fake can testify to it.
+    """
+
+    async def test_it_leaves_the_ttl_index_the_storage_specs_declare(self) -> None:
+        """The outcome ``REQ-E-119`` states: after the call, the index is there with its option set.
+
+        Asserted against the collection's own index state rather than against the ``create_indexes``
+        argument, which is the proxy. ``expireAfterSeconds: 0`` is the option that matters; without it
+        the index exists and expires nothing, which is the same user-visible failure as having no index.
+        """
+        collection = FakeStorageCollection()
+        storage = unit_storage(collection)
+
+        await storage.ensure_indexes()
+
+        assert collection.indexes["strands_expires_at_ttl"]["key"] == [(_indexes.EXPIRES_FIELD, 1)]
+        assert collection.indexes["strands_expires_at_ttl"]["expireAfterSeconds"] == 0
+
+    async def test_a_second_call_creates_nothing(self) -> None:
+        """``REQ-E-119``'s idempotence, asserted as the absence of the write rather than as a flag.
+
+        No ``_initialized`` attribute is involved and none should be: the guarantee is against the
+        server, so a second call reads the indexes and finds the spec already satisfied. A fake that
+        did not normalise ``IndexModel.document`` into the shape ``index_information`` reports would
+        pass the first assertion and fail this one, which is the point of the normalisation.
+        """
+        collection = FakeStorageCollection()
+        storage = unit_storage(collection)
+
+        await storage.ensure_indexes()
+        first = collection.names_called.count("create_indexes")
+        await storage.ensure_indexes()
+
+        assert first == 1
+        assert collection.names_called.count("create_indexes") == 1
+        assert collection.names_called.count("index_information") == 2
+
+    async def test_verify_mode_raises_with_the_command_that_would_fix_it(self) -> None:
+        """AT-123 / ``REQ-E-119`` and ``REQ-E-061`` — ``ensure_indexes: False`` is verify, not skip.
+
+        The caller this is for has no DDL rights, so the useful answer is a work order. Three claims:
+        it raises rather than returning quietly, the message names the index so a ticket can be
+        written against it, and it carries the ``createIndexes`` command so the operator does not have
+        to reconstruct one. Nothing is created on the way out.
+        """
+        collection = FakeStorageCollection()
+        storage = unit_storage(collection, config={"ensure_indexes": False})
+
+        with pytest.raises(StorageError) as raised:
+            await storage.ensure_indexes()
+
+        message = str(raised.value)
+        assert "strands_expires_at_ttl" in message
+        assert "createIndexes" in message
+        assert "create_indexes" not in collection.names_called
+
+
+class TestTheIndexReadyBudgetReachesEnsure:
+    """AT-126 / ``REQ-E-122`` — this class's half of the key, which it passes without ever waiting.
+
+    ``storage_specs()`` is one ordinary index and ``_ensure_ordinary`` has no poll loop, so the number
+    changes nothing here today. It is passed anyway, and asserted anyway, because the key is read from
+    one config that a caller may also hand to a ``MongoDBMemoryStore`` (``REQ-E-012``): a store that
+    quietly ignored it would make the same config mean two things. It also means the assertion still
+    holds if the storage collection ever gains something that builds asynchronously.
+    """
+
+    @staticmethod
+    def _recording(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+        """Replace ``_indexes.ensure`` with a spy, on the module rather than on the instance.
+
+        The module attribute is the seam the production code reaches through, so this is what a call
+        that bypassed the wiring would miss.
+        """
+        calls: list[dict[str, Any]] = []
+
+        async def spy(collection: Any, **kwargs: Any) -> None:
+            calls.append(kwargs)
+
+        monkeypatch.setattr(_indexes, "ensure", spy)
+        return calls
+
+    async def test_the_configured_budget_is_the_one_passed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = self._recording(monkeypatch)
+        storage = unit_storage(config={"index_ready_timeout": 7})
+
+        await storage.ensure_indexes()
+
+        assert [call["timeout"] for call in calls] == [7]
+
+    async def test_absence_resolves_to_the_module_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Read through the constant, so this asserts the wiring rather than restating ``AT-125``."""
+        calls = self._recording(monkeypatch)
+        storage = unit_storage()
+
+        await storage.ensure_indexes()
+
+        assert [call["timeout"] for call in calls] == [_indexes.READY_TIMEOUT_SECONDS]
+
+
+class TestNoOrdinaryOperationTouchesAnIndex:
+    """AT-124 / ``REQ-E-121``, ``INV-007`` — the guarantee that keeps ``ensure_indexes()`` explicit.
+
+    The requirement is a negative, and a negative is the thing a test suite silently stops covering.
+    The mechanism here is the fake's own call log: every driver method it offers is recorded, so this
+    walks all six ``Storage``-facing operations and asserts the log holds nothing about indexes.
+
+    It is not merely a restatement of "we did not write that code". It is what fails if a later change
+    makes ``write`` self-provisioning, which is the one plausible way somebody creates that index a
+    second time and doubles every write's round-trip count in the process.
+    """
+
+    async def test_the_six_operations_neither_read_nor_create_an_index(self) -> None:
+        collection = FakeStorageCollection(documents=[{"_id": "k", "data": b"v"}])
+        storage = unit_storage(collection, ttl_seconds=60)
+
+        await storage.write("k", b"v")
+        await storage.read("k")
+        await storage.delete("k")
+        await storage.list("")
+        await storage.search("v")
+        await storage.delete_prefix("")
+
+        assert "index_information" not in collection.names_called
+        assert "create_indexes" not in collection.names_called
+        # The positive half, so the test cannot pass by the operations having quietly done nothing.
+        assert set(collection.names_called) == {
+            "replace_one",
+            "find_one",
+            "delete_one",
+            "find",
+            "aggregate",
+            "delete_many",
+        }
+
+
 class TestTheFakeMatchesTheDriver:
     """MP-001 — the parity contract for ``FakeStorageCollection`` and ``FakeCursor``.
 
@@ -1210,6 +1399,11 @@ class TestTheFakeMatchesTheDriver:
         ("find_one", ({"_id": "k"},), {}),
         ("delete_one", ({"_id": "k"},), {}),
         ("delete_many", ({"_id": {"$gte": "a", "$lt": "b"}},), {}),
+        # ``ensure_indexes()``'s two, reached through ``_indexes.ensure`` rather than called from
+        # ``storage.py`` directly. They are here because the fake is what stands in for the driver when
+        # ``AT-121`` and ``AT-123`` run, so the same coroutine-function trap applies to them.
+        ("index_information", (), {}),
+        ("create_indexes", ([],), {}),
     )
 
     @pytest.mark.parametrize(("method", "args", "kwargs"), CALLS)
@@ -1263,6 +1457,17 @@ class TestTheFakeMatchesTheDriver:
         truthy and never raises. The fake is stricter on purpose."""
         with pytest.raises(AttributeError):
             FakeStorageCollection().definitely_not_a_method  # type: ignore[attr-defined]  # noqa: B018
+
+    def test_both_collections_expose_a_database_carrying_a_name(self) -> None:
+        """``_ensure_ordinary`` builds its namespace from ``collection.database.name``.
+
+        Two hops, both of which the fake has to offer for ``AT-121`` and ``AT-123`` to mean anything.
+        ``database`` is a property on the real class rather than a method, so this checks the attribute
+        rather than binding a signature, and the second assertion is the one that catches a fake whose
+        ``database`` is a bare string.
+        """
+        assert isinstance(self._collection_class().database, property)
+        assert FakeStorageCollection().database.name == "appdb"
 
     def test_the_delete_result_carries_the_attribute_delete_prefix_reads(self) -> None:
         """``REQ-E-031`` returns a count, and ``DeleteResult.deleted_count`` is where it comes from."""
@@ -1777,3 +1982,77 @@ class TestOneStorageServesTwoSuccessiveEventLoops:
             assert asyncio.run(storage.list("loop/")) == ["loop/one", "loop/two"]
         finally:
             asyncio.run(storage.close())
+
+
+@pytest.mark.contract
+class TestEnsureIndexesAgainstARealDeployment:
+    """AT-121b, AT-122 / ``REQ-E-119``, ``REQ-E-120`` — the server boundary no fake can stand at.
+
+    The unit tier above asserts that ``ensure_indexes()`` asks for the right index. That is the
+    mechanism. The outcome that matters is that a document written with a TTL stops
+    existing, and the thing that removes it is the server's TTL monitor: a background task in ``mongod``
+    that sweeps once a minute and is reachable from no assertion this package can make about its own
+    code. ``AT-122`` is therefore the only test in the suite that waits on wall-clock time, and it waits
+    because the alternative is asserting the index document and calling that expiry.
+    """
+
+    # The monitor's period is 60 seconds, so a document with a one-second lifetime is removed on the
+    # first sweep after it expires: under 60 seconds typically, up to 120 in the worst alignment. 180
+    # is that worst case plus a sweep, which is the smallest budget that does not turn a slow but
+    # correct deployment into a red build. The poll is coarse because the answer changes once.
+    EXPIRY_BUDGET_SECONDS: Final[float] = 180.0
+    EXPIRY_POLL_SECONDS: Final[float] = 5.0
+
+    async def test_it_creates_the_ttl_index_and_a_second_call_leaves_it_alone(
+        self, contract_uri: str, test_database_name: str, unique_collection_name: str
+    ) -> None:
+        """AT-121b. The same two claims as the unit tier, against a server that has its own opinions.
+
+        Worth running twice here rather than only against the fake because the second call is where a
+        real ``createIndexes`` would fail: the server rejects a second index over the same keys under a
+        different name, so a spec whose options did not round-trip would raise on the second pass
+        instead of quietly re-creating.
+        """
+        config: MongoDBConfig = {"connection_string": contract_uri, "database": test_database_name}
+        storage = MongoDBStorage(config, collection=unique_collection_name, ttl_seconds=60)
+        try:
+            await storage.ensure_indexes()
+            await storage.ensure_indexes()
+
+            collection = storage._collection()
+            indexes = await collection.index_information()
+        finally:
+            await storage.close()
+
+        assert "strands_expires_at_ttl" in indexes, sorted(indexes)
+        assert indexes["strands_expires_at_ttl"]["expireAfterSeconds"] == 0
+        assert [tuple(pair) for pair in indexes["strands_expires_at_ttl"]["key"]] == [(_indexes.EXPIRES_FIELD, 1)]
+
+    async def test_a_document_written_with_a_ttl_is_gone(
+        self, contract_uri: str, test_database_name: str, unique_collection_name: str
+    ) -> None:
+        """AT-122 / ``REQ-E-120`` — the outcome, not the index.
+
+        ``read`` returning ``None`` is the assertion, and it is deliberately the same signal a caller
+        gets for a key that was never written: that is what expiry looks like from outside. The write
+        is read back first so a failure at the end cannot be a write that never landed, which is the
+        one other way this could go ``None``.
+        """
+        config: MongoDBConfig = {"connection_string": contract_uri, "database": test_database_name}
+        storage = MongoDBStorage(config, collection=unique_collection_name, ttl_seconds=1)
+        try:
+            await storage.ensure_indexes()
+            await storage.write("expiring/key", b"payload")
+            assert await storage.read("expiring/key") == b"payload"
+
+            deadline = time.monotonic() + self.EXPIRY_BUDGET_SECONDS
+            while await storage.read("expiring/key") is not None:
+                assert time.monotonic() < deadline, (
+                    f"the document was still readable {self.EXPIRY_BUDGET_SECONDS:.0f}s after it "
+                    f"expired. The TTL monitor sweeps once a minute, so this is not a slow sweep: "
+                    f"either the index is absent (ensure_indexes() did not run or did nothing) or "
+                    f"the deployment has ttlMonitorEnabled set to false."
+                )
+                await asyncio.sleep(self.EXPIRY_POLL_SECONDS)
+        finally:
+            await storage.close()
