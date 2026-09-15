@@ -33,6 +33,10 @@ if TYPE_CHECKING:
 LAZY_NAMES = [
     ("MongoDBStorage", "strands_mongodb.storage"),
     ("MongoDBMemoryStore", "strands_mongodb.memory_store"),
+    # Phase 2 (`REQ-E-075`). Included because every claim in this file is about resolving a *name*,
+    # and this one resolves like the other two: same identity, same `__module__`, same revealed type.
+    # None of these tests constructs anything, which is the only thing the placeholder refuses.
+    ("MongoDBVectorSearchStrategy", "strands_mongodb.search"),
 ]
 
 
@@ -212,7 +216,7 @@ class TestAMissingExtraSurfacesAsAnImportErrorNotAMissingName:
 
 
 class TestStarImportIsTheOneEagerPath:
-    """The cost of naming the lazy classes in ``__all__``, pinned rather than discovered later."""
+    """AT-006e — the cost of naming the lazy classes in ``__all__``, pinned rather than discovered later."""
 
     def test_star_import_resolves_both_backends(self) -> None:
         """``from strands_mongodb import *`` walks ``__all__``, so it imports both modules.

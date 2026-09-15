@@ -1,0 +1,168 @@
+name: CI - Python
+
+# Four gates, none of which needs a credential. Asserted by tests/test_ci.py (AT-104 to AT-109), because
+# this file is the one part of the repository nothing else in the suite can execute: the tests read it as
+# YAML and check that it says what the requirements ask it to say.
+#
+# The contract tier is deliberately absent. It needs MONGODB_URI, and the two ways to supply one are a
+# repository secret and provisioning a deployment per job. A run here
+# reports the contract tier as skipped rather than as passed, because conftest.py's tier gate turns an
+# unset variable into a skip that names the variable.
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'python/**'
+      - '.github/workflows/ci-python.yml'
+  push:
+    branches: [ main ]
+    paths:
+      - 'python/**'
+      - '.github/workflows/ci-python.yml'
+  schedule:
+    # Weekly canary against the newest SDK release, and the only mitigation for an unpinned SDK floor. The floor
+    # here is strands-agents>=1.48.0 with no upper bound, so a new user resolves whatever is current; this
+    # is what sees a removed export or an added Protocol member before they do.
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: python
+
+jobs:
+  lint:
+    name: Lint
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install hatch
+        run: pip install hatch
+
+      # format-check, not format. `hatch run format` is `ruff format`, which rewrites the checkout and
+      # exits 0, so a job built on it reports success on unformatted code. `format-check` is
+      # `ruff format --check`, which exits 1 and changes nothing.
+      - name: Check formatting
+        run: hatch run format-check
+
+      - name: Run linter
+        run: hatch run lint
+
+      - name: Type check
+        run: hatch run typecheck
+
+  test:
+    name: Test - Python ${{ matrix.python-version }}
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Quoted, because unquoted 3.10 is the float 3.1 in YAML and setup-python would resolve it to 3.1.
+        # This list must equal the Programming Language :: Python :: classifiers in pyproject.toml, and
+        # AT-105 compares the two as sets in both directions.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install hatch
+        run: pip install hatch
+
+      # No tier variable is set, so this is the unit tier: the three tiers that need a backend skip and
+      # say which variable was missing.
+      - name: Run tests
+        run: hatch run test
+
+  coverage:
+    name: Coverage floors
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+
+    # The build tier, which builds a wheel and an sdist and resolves dependencies from PyPI. It is the one
+    # tier gate that is not a connection string, so a runner with network is all it needs. Set here rather
+    # than in the matrix job because the artifact is the same artifact on every interpreter.
+    env:
+      STRANDS_MONGODB_BUILD_TIER: '1'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install hatch
+        run: pip install hatch
+
+      # Two commands: the 90% aggregate floor and the 70% per-module floor. Deliberately not part of
+      # `test`, so this job is the only thing that enforces either. Measured at 97.01% aggregate and
+      # 89.47% for the weakest module on the unit tier alone, which is why no credential is needed.
+      - name: Enforce both coverage floors
+        run: hatch run cov
+
+  sdk-compat:
+    name: Latest SDK compatibility
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install hatch
+        run: pip install hatch
+
+      - name: Update SDK to latest
+        run: |
+          hatch run pip install --upgrade strands-agents
+          hatch run pip show strands-agents
+
+      # The load-bearing half. AT-052 asserts the store satisfies a nine-member Protocol subset by
+      # assignment under mypy, so a member added upstream surfaces here and nowhere else.
+      - name: Type check
+        run: hatch run typecheck
+
+      - name: Run the compat tier
+        run: hatch run test -m compat

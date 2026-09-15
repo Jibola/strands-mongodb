@@ -24,21 +24,30 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 class TestPublicSurface:
     """CH-001 — which names live where."""
 
-    def test_top_level_declares_both_backends_and_the_version(self) -> None:
-        """``__all__`` describes the public surface, which is now three names.
+    def test_top_level_declares_the_three_classes_and_the_version(self) -> None:
+        """``__all__`` describes the public surface, which is now four names.
 
         The scaffold declared ``["__version__"]`` alone, and this test asserted that. That
         changed deliberately: ``__all__`` is what documentation tools and
         ``--no-implicit-reexport`` read, so leaving the classes out of it would have made the root
         import an undocumented accident even after ``REQ-E-006`` made it work.
 
-        The cost is in ``test_star_import_is_the_one_eager_path`` below, asserted rather than
-        hidden.
+        ``MongoDBVectorSearchStrategy`` was added on the same reasoning. It is phase 2 and raises
+        when constructed (``REQ-E-075``), and it is still public surface: the documented API carries the name,
+        so a reader who finds it in the docs and not in ``__all__`` learns nothing about why.
+
+        The cost is in ``TestStarImportIsTheOneEagerPath`` in ``test_lazy_exports.py``, which carries
+        ``AT-006e``, asserted rather than hidden.
         """
-        assert strands_mongodb.__all__ == ["MongoDBMemoryStore", "MongoDBStorage", "__version__"]
+        assert strands_mongodb.__all__ == [
+            "MongoDBMemoryStore",
+            "MongoDBStorage",
+            "MongoDBVectorSearchStrategy",
+            "__version__",
+        ]
 
     def test_dir_lists_the_lazy_names_before_anything_has_imported_them(self) -> None:
-        """Tab completion and ``help()`` walk ``__dir__``, which does not see ``__getattr__``.
+        """AT-009 — tab completion and ``help()`` walk ``__dir__``, which does not see ``__getattr__``.
 
         Run in a subprocess so nothing in this session has already resolved the names, which would
         put them in ``globals()`` and make the assertion pass without ``__dir__`` existing at all.
@@ -46,11 +55,12 @@ class TestPublicSurface:
         source = (
             "import strands_mongodb;"
             "names = dir(strands_mongodb);"
-            "print('MongoDBStorage' in names, 'MongoDBMemoryStore' in names)"
+            "print('MongoDBStorage' in names, 'MongoDBMemoryStore' in names,"
+            "'MongoDBVectorSearchStrategy' in names)"
         )
         result = subprocess.run([sys.executable, "-c", source], capture_output=True, text=True, check=True)
 
-        assert result.stdout.strip() == "True True"
+        assert result.stdout.strip() == "True True True"
 
     def test_storage_class_lives_in_the_storage_module(self) -> None:
         """``MongoDBStorage`` is importable from ``strands_mongodb.storage``.
