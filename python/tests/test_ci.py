@@ -1,0 +1,598 @@
+"""The CI configuration, asserted by reading it, because nothing in this suite can run it.
+
+Covers ``AT-104`` through ``AT-109`` (``REQ-E-104`` to ``REQ-E-109``), and the file they describe is the only
+one in this repository that lives outside ``python/``. There is no tier here and no network: a workflow
+is a YAML document on disk, so these are unit-tier tests that read it the way ``test_packaging.py`` reads
+``pyproject.toml``.
+
+**What this file cannot tell you.** It asserts the workflow says what it should say. Whether GitHub then
+runs it, whether a runner has ``hatch``, and whether the matrix resolves are all unobservable from here, and
+the first real answer to any of them arrives on the first pull request. That limit is worth stating rather
+than implying, because a green test file about CI reads like evidence CI works.
+
+What it does catch is the failure mode that actually happened: a gate that was specified and present in no
+file, for a long stretch, while a test in this suite named the missing mechanism as another item's only
+mitigation (``AT-052``). A workflow asserted by tests cannot go missing quietly.
+"""
+
+from __future__ import annotations
+
+import ast
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+from conftest import ChecklistGate
+
+# Imported rather than reimplemented, for the reason its own docstring gives: "was this run narrowed?" has
+# one right answer, and a copy of it drifts the first time pytest grows another selection flag.
+from test_gate import _narrowing
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - exercised only on the 3.10 floor
+    tomllib = None  # type: ignore[assignment]
+
+# tests/ -> python/ -> the repository root, which is where `.github/` belongs.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = PROJECT_ROOT.parent
+WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci-python.yml"
+PYPROJECT_PATH = PROJECT_ROOT / "pyproject.toml"
+
+#: Every directory ``pyproject.toml``'s ``files`` key hands to mypy, which is also everything the matrix's
+#: oldest interpreter has to be able to compile.
+SOURCE_ROOTS = ("src", "tests", "scripts", "examples")
+
+#: The comprehension expressions. A ``comprehension`` node is the ``for`` clause inside one of these, and its
+#: ``is_async`` flag is what ``async for`` sets.
+_COMPREHENSION_TYPES = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+#: The weekly canary slot the extension template ships and ``AT-052`` is written against
+#: (``extension-template/.github/workflows/ci-python.yml``). Kept identical rather than moved to a
+#: quieter hour: the point of matching is that a maintainer who knows the template knows this file.
+CANARY_CRON = "0 6 * * 1"
+
+#: The two conformance checks the canary runs, one per protocol. Written as data
+#: here, never in a docstring in this file: the gate in ``conftest.py`` indexes ids out of docstrings, so an
+#: id in one of these would register a test about YAML as a carrier of a protocol check.
+PROTOCOL_CHECK_IDS = ("AT-034", "AT-052")
+
+
+@pytest.fixture(scope="module")
+def workflow() -> dict[str, Any]:
+    """The parsed workflow.
+
+    Fails rather than skips when the file is absent, which is the whole point: absence is the defect these
+    tests were written to catch, and a skip would have reported the same green as a passing gate.
+    """
+    assert WORKFLOW_PATH.is_file(), f"REQ-E-104: no CI configuration at {WORKFLOW_PATH}"
+    parsed = yaml.safe_load(WORKFLOW_PATH.read_text())
+    assert isinstance(parsed, dict), "the workflow did not parse as a mapping"
+    return parsed
+
+
+def _run_blocks(node: Any) -> list[str]:
+    """Every ``run:`` string anywhere in the document, found by walking rather than by regex.
+
+    A regex over the raw text would also match the word inside a comment or a step name, and the claims
+    below are about what executes.
+    """
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "run" and isinstance(value, str):
+                found.append(value)
+            else:
+                found.extend(_run_blocks(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_run_blocks(item))
+    return found
+
+
+def _values_under(node: Any, wanted: str) -> list[str]:
+    """Every string value stored under ``wanted``, at any depth."""
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == wanted:
+                if isinstance(value, str):
+                    found.append(value)
+                elif isinstance(value, dict):
+                    found.extend(str(item) for item in value.values())
+            found.extend(_values_under(value, wanted))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_values_under(item, wanted))
+    return found
+
+
+def _all_strings(node: Any) -> list[str]:
+    """Every string anywhere in the document, keys included.
+
+    Used instead of reading the raw text where the claim is about the whole file, so that a word inside a
+    ``#`` comment cannot fail a test about what the workflow does.
+    """
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(key, str):
+                found.append(key)
+            found.extend(_all_strings(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_all_strings(item))
+    elif isinstance(node, str):
+        found.append(node)
+    return found
+
+
+def _triggers(workflow: dict[str, Any]) -> dict[str, Any]:
+    """The ``on:`` block, looked up under both spellings it can arrive as.
+
+    YAML 1.1 resolves a bare ``on`` key to the boolean ``True``, so ``workflow["on"]`` raises ``KeyError``
+    against an idiomatic workflow file. GitHub's own parser has the same heritage and reads the key as the
+    trigger name anyway, so the file keeps the unquoted spelling every other workflow uses and the quirk is
+    absorbed here. Worth a helper rather than a one-line ``get``: the failure it prevents is a test that
+    looks broken while the workflow is correct.
+    """
+    for key in ("on", True):
+        if key in workflow:
+            block = workflow[key]
+            assert isinstance(block, dict), f"the triggers parsed as {type(block).__name__}, not a mapping"
+            return block
+    raise AssertionError(f"the workflow declares no triggers; its keys are {sorted(map(str, workflow))}")
+
+
+def _pyproject() -> dict[str, Any]:
+    """The manifest, parsed. Callers must gate on ``tomllib`` being importable."""
+    assert tomllib is not None, "tomllib is unavailable; the caller should have skipped"
+    return tomllib.loads(PYPROJECT_PATH.read_text())
+
+
+_NEEDS_TOMLLIB = pytest.mark.skipif(
+    tomllib is None,
+    reason="tomllib is 3.11+, and this compares the workflow against pyproject.toml",
+)
+
+
+class TestTheGatesEveryChangeMustPass:
+    """AT-104 / REQ-E-104 -- the four things a pull request has to clear before anyone reads it.
+
+    Three static gates and the unit tier. All four already exist as hatch scripts and have been run by
+    hand at the end of every change; what has never existed is anything that runs them when
+    nobody remembers to.
+    """
+
+    def test_the_three_static_gates_all_run(self, workflow: dict[str, Any]) -> None:
+        """Formatting, linting and typing, each by the script name ``pyproject.toml`` defines."""
+        runs = "\n".join(_run_blocks(workflow))
+
+        for script in ("format-check", "lint", "typecheck"):
+            assert f"hatch run {script}" in runs, f"no step runs `hatch run {script}`"
+
+    def test_nothing_runs_the_rewriting_formatter(self, workflow: dict[str, Any]) -> None:
+        """The distinction the extension template gets wrong, and the reason REQ-E-104 names the form.
+
+        ``hatch run format`` is ``ruff format``: it rewrites the files in place and exits 0, so a job built
+        on it reports success on unformatted code and leaves the changes in a runner that is about to be
+        thrown away. ``format-check`` is ``ruff format --check``, which exits 1 and changes nothing. Only
+        one of the two is a gate.
+        """
+        offenders = [block for block in _run_blocks(workflow) if re.search(r"hatch run format(?!-check)", block)]
+
+        assert offenders == [], (
+            f"these steps run the rewriting formatter instead of the checking one: {offenders}; "
+            f"`ruff format` exits 0 after rewriting, so the step can never fail"
+        )
+
+    def test_a_job_runs_the_unit_tier(self, workflow: dict[str, Any]) -> None:
+        """``hatch run test`` with no selector, which is the unit tier plus whatever tiers have variables.
+
+        No tier variable is set for this job, so `conftest.py`'s gate skips the three that need a backend
+        and the run is the 680-test unit tier. That is the tier CI can have today, and the
+        contract tier's deployment is still undecided.
+        """
+        assert any("hatch run test" in block for block in _run_blocks(workflow)), "no step runs the test suite"
+
+    def test_both_change_triggers_watch_the_package_directory(self, workflow: dict[str, Any]) -> None:
+        """A push or a pull request that touches ``python/`` runs the gates.
+
+        Asserted for both triggers rather than one: a repository that only gates pull requests gates
+        nothing on a branch that is pushed to directly, and this one is about to change owners.
+        """
+        triggers = _triggers(workflow)
+
+        for event in ("pull_request", "push"):
+            assert event in triggers, f"no {event} trigger; the file declares {sorted(map(str, triggers))}"
+            paths = triggers[event]["paths"]
+            assert any(entry.startswith("python/") for entry in paths), (
+                f"the {event} trigger watches {paths}, which does not include the package directory"
+            )
+
+    def test_the_workflow_watches_itself(self, workflow: dict[str, Any]) -> None:
+        """A path filter that omits the workflow file means changes to the gates are ungated.
+
+        Small point, and it is the one that makes the first pull request against this file testable at all.
+        """
+        triggers = _triggers(workflow)
+        relative = str(WORKFLOW_PATH.relative_to(REPO_ROOT))
+
+        for event in ("pull_request", "push"):
+            paths = triggers[event]["paths"]
+            assert relative in paths, f"the {event} trigger watches {paths}, which does not include {relative}"
+
+
+class TestTheMatrixCoversEveryVersionTheClassifiersClaim:
+    """AT-105 / REQ-E-105 -- the matrix and the classifiers, compared as sets in both directions.
+
+    Equality rather than containment. A matrix narrower than the claim ships support for an untested
+    interpreter; a matrix wider than the claim tests one the package says it does not support, and the
+    honest fix for that is a new classifier, not a quieter test.
+    """
+
+    @_NEEDS_TOMLLIB
+    def test_the_matrix_equals_the_versions_the_classifiers_claim(self, workflow: dict[str, Any]) -> None:
+        """Read from both files, so neither list can be edited alone."""
+        claimed = {
+            classifier.rsplit(" :: ", 1)[1]
+            for classifier in _pyproject()["project"]["classifiers"]
+            if classifier.startswith("Programming Language :: Python :: 3.")
+        }
+        assert claimed, "pyproject.toml claims no specific Python versions, so there is nothing to match"
+
+        matrix = {str(version) for version in workflow["jobs"]["test"]["strategy"]["matrix"]["python-version"]}
+
+        assert matrix == claimed, (
+            f"the matrix tests {sorted(matrix)} and the classifiers claim {sorted(claimed)}; "
+            f"untested but claimed: {sorted(claimed - matrix)}, tested but unclaimed: {sorted(matrix - claimed)}"
+        )
+
+    def test_every_version_in_the_matrix_is_quoted(self, workflow: dict[str, Any]) -> None:
+        """Unquoted ``3.10`` is the float ``3.1`` in YAML, and ``setup-python`` would resolve it to 3.1.
+
+        This is the one way the matrix can be wrong while looking right, and it is invisible in a diff. It
+        gets its own test rather than riding on the set comparison above, because the set comparison would
+        report it as a missing version and send the reader looking for the wrong mistake.
+        """
+        entries = workflow["jobs"]["test"]["strategy"]["matrix"]["python-version"]
+
+        unquoted = [entry for entry in entries if not isinstance(entry, str)]
+        assert unquoted == [], f"quote these, YAML read them as numbers: {unquoted}"
+
+
+class TestBothCoverageFloorsAreEnforced:
+    """AT-106 / REQ-E-106 -- the aggregate floor and the per-module floor, in the one job that measures once.
+
+    Measured before this was written: on the unit tier alone the aggregate is 97.01% and the weakest module
+    is 89.47%, against floors of 90% and 70%. So the job passes with no connection string, which is why it
+    is not waiting on a deployment decision.
+    """
+
+    def test_a_job_runs_the_coverage_gate(self, workflow: dict[str, Any]) -> None:
+        assert any("hatch run cov" in block for block in _run_blocks(workflow)), (
+            "no step runs `hatch run cov`, so neither coverage floor is enforced anywhere automatic"
+        )
+
+    @_NEEDS_TOMLLIB
+    def test_the_coverage_script_is_still_both_floors(self, workflow: dict[str, Any]) -> None:
+        """The workflow delegates, so the delegate is asserted here too.
+
+        ``hatch run cov`` is two commands. If someone drops the second, the workflow still says `cov` and
+        the per-module floor silently stops being enforced, with nothing in the diff to notice. Reading the
+        script definition is what closes that.
+        """
+        script = _pyproject()["tool"]["hatch"]["envs"]["default"]["scripts"]["cov"]
+
+        assert any("--cov-fail-under=90" in command for command in script), (
+            f"the `cov` script no longer carries the aggregate floor: {script}"
+        )
+        assert any("check_module_coverage.py" in command for command in script), (
+            f"the `cov` script no longer runs the per-module floor: {script}"
+        )
+
+    def test_the_coverage_job_measures_once_rather_than_per_interpreter(self, workflow: dict[str, Any]) -> None:
+        """Four runs of the same measurement produce one number and three copies of it."""
+        job = workflow["jobs"]["coverage"]
+
+        assert "strategy" not in job, f"the coverage job has a matrix: {job['strategy']}"
+
+
+class TestTheWeeklyCanaryAgainstTheLatestSDK:
+    """AT-107 / REQ-E-107 -- the cron named as the only mitigation for an unpinned SDK, never written.
+
+    ``AT-052``'s own docstring says the marker "selects it for the CI cron that resolves the latest published
+    ``strands-agents`` instead of the pinned one". That sentence was in the suite for a long time and the
+    cron it describes was in no file. The test was therefore running against the pinned SDK, which is the one
+    version it cannot detect drift in.
+    """
+
+    def test_the_schedule_is_the_weekly_slot_the_template_uses(self, workflow: dict[str, Any]) -> None:
+        crons = [entry["cron"] for entry in _triggers(workflow)["schedule"]]
+
+        assert crons == [CANARY_CRON], f"the schedule is {crons}, not the template's weekly {CANARY_CRON!r}"
+
+    def test_the_canary_runs_only_on_the_schedule(self, workflow: dict[str, Any]) -> None:
+        """Otherwise every pull request resolves the latest SDK and the pinned floor is never the thing tested."""
+        condition = workflow["jobs"]["sdk-compat"].get("if")
+
+        assert condition == "github.event_name == 'schedule'", (
+            f"the canary's condition is {condition!r}, so it runs outside the cron"
+        )
+
+    def test_the_change_triggered_jobs_sit_out_the_schedule(self, workflow: dict[str, Any]) -> None:
+        """The mirror of the above. A cron that also runs the pinned jobs reports nothing new, weekly."""
+        for name in ("lint", "test", "coverage"):
+            condition = workflow["jobs"][name].get("if")
+            assert condition == "github.event_name != 'schedule'", (
+                f"the {name} job's condition is {condition!r}, so the weekly cron runs it too"
+            )
+
+    def test_the_canary_upgrades_the_sdk_before_it_tests_anything(self, workflow: dict[str, Any]) -> None:
+        """Order is the assertion. Upgrading after the tests run tests the pinned version and reports green."""
+        runs = _run_blocks(workflow["jobs"]["sdk-compat"])
+
+        upgrades = [index for index, block in enumerate(runs) if "--upgrade strands-agents" in block]
+        assert upgrades, f"no step upgrades strands-agents; the canary's steps run {runs}"
+
+        selects = [index for index, block in enumerate(runs) if "-m compat" in block]
+        assert selects, f"no step selects the compat tier; the canary's steps run {runs}"
+
+        assert min(upgrades) < min(selects), (
+            f"the upgrade happens at step {min(upgrades)} and the compat tier runs at step {min(selects)}, "
+            f"so the tier ran against the pinned SDK"
+        )
+
+    def test_the_canary_typechecks_against_the_upgraded_sdk(self, workflow: dict[str, Any]) -> None:
+        """The memory store's conformance check asserts a mypy result, so mypy has to see the new version.
+
+        That check is ``AT-052``, and it is named down here rather than in the line above deliberately. The
+        gate in ``conftest.py`` indexes ids out of first paragraphs and lets a test's own declaration
+        override a class's, per id and across the whole suite. With the id in the summary line, this test
+        about a YAML file became the only carrier of ``AT-052``, and the protocol check's own class lost it.
+        Measured while auditing the release checklist: three rows cited the id and all three resolved here.
+
+        The Protocol subset is satisfied by assignment under mypy. A member added upstream surfaces there and
+        nowhere else, which makes the typecheck the load-bearing half of the canary rather than a formality.
+        """
+        runs = _run_blocks(workflow["jobs"]["sdk-compat"])
+
+        assert any("hatch run typecheck" in block for block in runs), (
+            f"the canary never typechecks, so an added Protocol member goes unreported; its steps run {runs}"
+        )
+
+
+class TestTheCompatTierSelectsBothProtocolChecks:
+    """AT-119 / REQ-E-117 -- the canary runs ``-m compat``, so a check without that marker never runs.
+
+    Two conformance checks run against the newest published SDK, one per protocol.
+    Auditing the markers found that only one of them carried it, so a job specified to catch
+    upstream drift in both protocols could only ever see it in one. The marker is the selection, which is
+    why it is asserted here rather than left to a reader of two decorator lines.
+
+    Its own class rather than a method of the canary class above, because the gate's precedence rule works
+    per id over the whole suite: inside that class this test would also have been indexed as a carrier of
+    the canary's own id, and a failure about markers would have been reported against the cron.
+    """
+
+    def test_both_protocol_checks_carry_the_marker(
+        self, checklist_gate: ChecklistGate, request: pytest.FixtureRequest
+    ) -> None:
+        """Read from the collected session rather than by grepping for a decorator line.
+
+        The question is which tests ``-m compat`` selects, and the marker as pytest resolved it is the only
+        thing that answers it. Reading the marker also covers the case a grep would miss, where the id moves
+        to a test outside the marked class.
+        """
+        if narrowing := _narrowing(request.config):
+            pytest.skip(f"this run collected a subset ({narrowing}), so an absent marker cannot be told apart")
+
+        collected = {item.nodeid: item for item in request.session.items}
+        unmarked: dict[str, list[str]] = {}
+        for identifier in PROTOCOL_CHECK_IDS:
+            carriers = checklist_gate.by_id.get(identifier, ())
+            assert carriers, f"no collected test declares {identifier}, so the canary has nothing to select"
+            missing = [
+                node
+                for node in carriers
+                if node not in collected or collected[node].get_closest_marker("compat") is None
+            ]
+            if missing:
+                unmarked[identifier] = sorted(missing)
+
+        assert unmarked == {}, (
+            f"tests carrying a protocol-check id that '-m compat' does not select, so the weekly canary "
+            f"never runs them against the newest published SDK: {unmarked}"
+        )
+
+
+class TestNoCredentialReachesACommandLine:
+    """AT-108 / REQ-E-108 -- a rule written while there is nothing to break it.
+
+    There is no secret in this workflow today, so both tests below pass on an empty set. That is the point of
+    writing them now: the change a real deployment eventually forces is the one that introduces one, and the
+    person making it should get a failing test rather than a masked value in a public build log.
+    """
+
+    def test_no_command_or_step_name_interpolates_a_secret(self, workflow: dict[str, Any]) -> None:
+        """GitHub echoes a step's command above its output, and masking there is best effort."""
+        for scope, values in (("run", _run_blocks(workflow)), ("name", _values_under(workflow, "name"))):
+            offenders = [value for value in values if "secrets." in value]
+            assert offenders == [], f"these {scope} values interpolate a secret: {offenders}"
+
+    def test_every_secret_reference_sits_under_env(self, workflow: dict[str, Any]) -> None:
+        """The positive form of the rule: a secret may appear, in exactly one kind of place.
+
+        Checked against the parsed document rather than the file's text, so a secret named in a comment
+        cannot fail a test about what the workflow does.
+        """
+        referenced = [value for value in _all_strings(workflow) if "secrets." in value]
+        permitted = set(_values_under(workflow, "env"))
+
+        stray = [value for value in referenced if value not in permitted]
+        assert stray == [], f"these secret references are not env values: {stray}"
+
+    def test_every_tier_variable_the_workflow_sets_is_set_under_env(self, workflow: dict[str, Any]) -> None:
+        """No `export` in a shell line, which is how a value ends up in a log with no masking at all.
+
+        Covers the four names `conftest.py` and `test_packaging.py` read between them, whether or not this
+        workflow sets any of them today. It sets one.
+        """
+        tier_variables = (
+            "MONGODB_URI",
+            "MONGODB_ATLAS_URI",
+            "MONGODB_AUTOEMBED_URI",
+            "STRANDS_MONGODB_BUILD_TIER",
+        )
+        commands = _run_blocks(workflow)
+        environments = set(_values_under(workflow, "env"))
+
+        for name in tier_variables:
+            in_commands = [block for block in commands if name in block]
+            assert in_commands == [], f"{name} appears in a command rather than under env:: {in_commands}"
+
+        assert any("STRANDS_MONGODB_BUILD_TIER" in key for key in _all_strings(workflow)), (
+            "no job switches the build tier on"
+        )
+        assert environments, "the workflow declares no env: block at all"
+
+
+class TestTheBuildTierRunsSomewhere:
+    """AT-109 / REQ-E-109 -- the last tier in the suite with nothing that runs it.
+
+    ``test_packaging.py:66`` turns it off by default because it builds a wheel and an sdist and resolves
+    dependencies from PyPI. The variable is the one tier gate that is not a connection string, so a runner
+    with network is all it needs and there is no deployment decision to wait for.
+    """
+
+    def test_exactly_one_job_switches_the_build_tier_on(self, workflow: dict[str, Any]) -> None:
+        """One, because the artifact is the same artifact on every interpreter."""
+        enabling = [
+            name for name, job in workflow["jobs"].items() if "STRANDS_MONGODB_BUILD_TIER" in (job.get("env") or {})
+        ]
+
+        assert len(enabling) == 1, f"the build tier is switched on in {enabling}, and it should be in exactly one"
+
+    def test_the_build_tier_is_not_in_the_matrix_job(self, workflow: dict[str, Any]) -> None:
+        """Four wheels built from one commit, and three of them discarded unread."""
+        matrix_job = workflow["jobs"]["test"]
+
+        assert "STRANDS_MONGODB_BUILD_TIER" not in (matrix_job.get("env") or {}), (
+            "the matrix job builds the same artifact once per interpreter"
+        )
+
+    def test_the_tier_is_switched_on_with_a_value_the_gate_reads_as_set(self, workflow: dict[str, Any]) -> None:
+        """The gate is ``not os.environ.get(...)``, so an empty string reads as off and a skip looks like a pass."""
+        values = [
+            job["env"]["STRANDS_MONGODB_BUILD_TIER"]
+            for job in workflow["jobs"].values()
+            if "STRANDS_MONGODB_BUILD_TIER" in (job.get("env") or {})
+        ]
+
+        assert values, "no job switches the build tier on"
+        for value in values:
+            assert str(value).strip(), f"the build tier is set to {value!r}, which the gate reads as unset"
+
+
+class TestNothingNeedsMoreThanTheOldestInterpreterInTheMatrix:
+    """AT-110 / REQ-E-110 — the floor's grammar, checked from whatever interpreter is running.
+
+    ``AT-105`` asserts the matrix equals the classifiers, which claim 3.10 as the floor. This asserts the
+    weaker-looking thing that actually broke: that the tree can be *parsed* there. An audit found an
+    ``async for`` comprehension nested inside a plain one at ``test_examples.py:384``, legal from 3.11 and a
+    ``SyntaxError`` on 3.10, sitting inside a triple-quoted string that a child interpreter runs. No linter
+    parses that string and no type checker sees it, so the first thing to compile it was Python 3.10 itself.
+
+    **Why the obvious guard is not the one used here.** ``ast.parse(source, feature_version=(3, 10))`` reads
+    like the answer and is not: measured on 3.14, it accepts the nested form, because ``feature_version``
+    gates a short list of constructs and this is not among them. The floor's grammar is not reachable from a
+    newer interpreter through the standard library, so this checks the one construct structurally instead.
+
+    That is the honest limit. It catches this construct and no other, and the 3.10 leg of the matrix stays
+    the only thing that would find a different one. Which is an argument for keeping the matrix.
+    """
+
+    @staticmethod
+    def _has_async_clause(comprehension: ast.expr) -> bool:
+        generators = getattr(comprehension, "generators", [])
+        return any(generator.is_async for generator in generators)
+
+    @classmethod
+    def _rejected_by_the_floor(cls, tree: ast.AST) -> list[int]:
+        """Line numbers of comprehensions Python 3.10 refuses to compile.
+
+        The rule is exact rather than conservative, measured on 3.10.11 against all four shapes: an
+        asynchronous comprehension is rejected when the comprehension enclosing it is synchronous, because
+        that outer comprehension is its own synchronous scope. Enclosed by an *asynchronous* comprehension it
+        is accepted, and unenclosed inside an ``async def`` it is accepted.
+        """
+        offenders: list[int] = []
+
+        def visit(node: ast.AST, enclosing: ast.expr | None) -> None:
+            if isinstance(node, _COMPREHENSION_TYPES):
+                if cls._has_async_clause(node) and enclosing is not None and not cls._has_async_clause(enclosing):
+                    offenders.append(node.lineno)
+                enclosing = node
+            for child in ast.iter_child_nodes(node):
+                visit(child, enclosing)
+
+        visit(tree, None)
+        return offenders
+
+    def test_the_detector_matches_what_the_floor_actually_rejects(self) -> None:
+        """The sweep below reports nothing once the tree is clean, so this is what keeps it from being vacuous.
+
+        All four shapes were compiled on 3.10.11 to fix the rule. Only the first is an error there.
+        """
+        # Joined at runtime rather than written whole, because the sweep below walks the string literals in
+        # this file too and this one is precisely what it looks for. Explicit ``+`` rather than adjacency:
+        # adjacent literals are folded during parsing, so the sweep would see one string and flag it. Each
+        # half alone is a ``SyntaxError``, which the sweep skips.
+        rejected = "async def m():\n    return [[e async for e in s()] " + "for _ in r()]\n"
+        accepted = (
+            "async def m():\n"
+            "    a = [[e async for e in s()] async for _ in t()]\n"
+            "    b = [e async for e in s()]\n"
+            "    c = [[e for e in s()] for _ in r()]\n"
+            "    return a, b, c\n"
+        )
+
+        assert self._rejected_by_the_floor(ast.parse(rejected)) == [2]
+        assert self._rejected_by_the_floor(ast.parse(accepted)) == []
+
+    def test_no_module_uses_a_construct_the_floor_rejects(self) -> None:
+        """Every ``.py`` file mypy is pointed at, parsed as itself."""
+        for root in SOURCE_ROOTS:
+            for path in sorted((PROJECT_ROOT / root).rglob("*.py")):
+                offenders = self._rejected_by_the_floor(ast.parse(path.read_text()))
+
+                assert not offenders, f"{path.relative_to(PROJECT_ROOT)} lines {offenders} will not compile on 3.10"
+
+    def test_no_embedded_script_uses_a_construct_the_floor_rejects(self) -> None:
+        """And every multi-line string in those files that happens to be Python, which is the half that broke.
+
+        Prose docstrings mostly fail to parse and are skipped, so the count is not the point; the three script
+        constants handed to ``python -c`` are (``test_examples.py``, ``test_extras.py``, ``test_tier_gating.py``).
+        The detector's own test above is what proves a clean sweep means something.
+        """
+        for root in SOURCE_ROOTS:
+            for path in sorted((PROJECT_ROOT / root).rglob("*.py")):
+                for node in ast.walk(ast.parse(path.read_text())):
+                    if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+                        continue
+                    if "\n" not in node.value:
+                        continue
+                    try:
+                        embedded = ast.parse(node.value)
+                    except SyntaxError:
+                        continue
+
+                    offenders = self._rejected_by_the_floor(embedded)
+
+                    assert not offenders, (
+                        f"{path.relative_to(PROJECT_ROOT)}: the string at line {node.lineno} will not compile "
+                        f"on 3.10, at its own lines {offenders}"
+                    )
