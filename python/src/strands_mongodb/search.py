@@ -13,8 +13,10 @@ The two modules that do need ``pymongo`` guard their imports with ``missing_extr
 The absence here is deliberately unlike ``add_messages`` on ``MongoDBMemoryStore`` (``REQ-E-044``),
 which has to be genuinely missing because the SDK feature-detects it and would route calls into a stub
 that raises. Nothing in ``strands`` detects a ``SearchStrategy``: every shipped backend calls
-``KeywordSearchStrategy()`` inline, and no parameter, setter or registry accepts one. So a
-class that raises misleads nobody except the caller who constructed it, and that caller is told why.
+``KeywordSearchStrategy()`` inline for its own default, and since 1.56.0 three of them also accept one
+through a ``search_strategy`` parameter. Neither route reaches this class, because
+``__init__`` raises before there is an instance to pass. So a class that raises misleads nobody except
+the caller who constructed it, and that caller is told why.
 """
 
 from __future__ import annotations
@@ -67,6 +69,27 @@ class MongoDBVectorSearchStrategy:
         Args:
             config: Connection and deployment settings, shared with the two implemented surfaces.
             collection: Collection the strategy would search.
+
+        Raises:
+            NotImplementedError: Always, in v0.1.0.
+        """
+        raise NotImplementedError(_PHASE_2)
+
+    async def index(self, storage: Storage, key: str, data: bytes, **kwargs: Any) -> None:
+        """Index a single entry for future searches.
+
+        Unreachable for the same reason ``search`` is, and declared for a different one. ``index`` was
+        added to ``SearchStrategy`` by ``strands-agents`` 1.56.0, after this class was written, for
+        strategies that maintain an index incrementally rather than searching on the fly. A placeholder
+        that satisfies the protocol it was published against but not the one a user installs is a
+        published name that lies about what it is, which is the failure ``REQ-E-075`` exists to avoid
+        (``REQ-E-130``).
+
+        Args:
+            storage: The storage backend the entry belongs to.
+            key: The storage key being written.
+            data: The raw bytes being stored.
+            **kwargs: Strategy-specific options for forward compatibility.
 
         Raises:
             NotImplementedError: Always, in v0.1.0.

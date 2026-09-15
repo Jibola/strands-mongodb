@@ -21,7 +21,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import pytest
 from strands.storage.search.types import SearchStrategy
@@ -37,6 +37,54 @@ if TYPE_CHECKING:
 SRC = Path(strands_mongodb.__file__).parent
 
 CONFIG: MongoDBConfig = {"database": "phase2", "connection_string": "mongodb://127.0.0.1:27017"}
+
+
+def _protocol_members(protocol: type) -> dict[str, Any]:
+    """The protocol's own declared methods, read off the class rather than copied into this file.
+
+    ``vars`` rather than ``dir``, so the ``Protocol`` machinery every protocol inherits stays out, and
+    a leading-underscore filter so ``__init__`` -- which ``Protocol`` supplies and which no
+    implementation is expected to match -- stays out with it. What is left is the member set an
+    implementation has to declare, as of the release installed right now.
+    """
+    return {
+        name: member
+        for name, member in vars(protocol).items()
+        if inspect.isfunction(member) and not name.startswith("_")
+    }
+
+
+def _accepted(method: Any) -> list[Any]:
+    """Parameter annotations with SDK type variables replaced by what they are bound to (``REQ-E-131``).
+
+    ``strands-agents`` 1.56.0 made ``SearchStrategy`` generic and rewrote ``storage: Storage`` as
+    ``storage: S``, where ``S`` is bound to ``Storage`` and defaults to it. Unparameterised, the
+    protocol therefore accepts exactly what it accepted before, and a comparison of annotations *as
+    written* reported that as drift. Resolving the variable is narrower than dropping the comparison:
+    a renamed parameter, a widened ``query``, or a bound narrowed to one concrete backend all still
+    fail, because all three change what phase 2 has to fill.
+    """
+    namespace = getattr(method, "__globals__", {})
+    return [_bound_to(p.annotation, namespace) for p in inspect.signature(method).parameters.values()]
+
+
+def _bound_to(annotation: Any, namespace: dict[str, Any]) -> Any:
+    """``annotation`` itself, unless it names a type variable, in which case its default or bound.
+
+    Both halves of the default lookup go through ``getattr`` because PEP 696 defaults landed in 3.13
+    and this package supports 3.10. ``has_default`` guards the interpreter the test runs on;
+    ``__default__`` through ``getattr`` guards the type checker, which is pinned at the *oldest*
+    supported version and so reads a ``TypeVar`` that has no such attribute.
+    """
+    declared = namespace.get(annotation) if isinstance(annotation, str) else None
+    if not isinstance(declared, TypeVar):
+        return annotation
+    has_default = getattr(declared, "has_default", None)
+    if has_default is not None and has_default():
+        substitute = getattr(declared, "__default__", None)
+    else:
+        substitute = declared.__bound__
+    return getattr(substitute, "__name__", annotation)
 
 
 class TestTouchingThePlaceholderNamesThePhase:
@@ -82,34 +130,53 @@ class TestTouchingThePlaceholderNamesThePhase:
 
 
 class TestTheSignaturePhaseTwoHasToFill:
-    """AT-075 — the unreachable method's only job is to be type checked."""
+    """AT-075 / AT-133 — the unreachable methods' only job is to be type checked."""
 
-    def test_search_matches_the_sdk_protocol_signature(self) -> None:
-        """Compared against ``SearchStrategy.search`` itself, so SDK drift lands here.
+    def test_the_protocol_declares_the_two_members_this_class_declares(self) -> None:
+        """A guard on the guard below, which iterates and so passes vacuously on an empty set.
 
-        Nothing can hold an instance of this class, so this method cannot be called and cannot be
-        tested by calling it. What it can do is record the shape phase 2 has to fill, and the way to
-        keep that record honest is to read the Protocol rather than to copy it into an assertion.
-        A release that renames ``storage`` or widens ``query`` fails this test on the day it is
-        installed, which is cheaper than discovering it while implementing the tier.
+        ``_protocol_members`` reads ``vars``, and ``vars`` sees nothing if a future release moves the
+        members onto a base class or generates them. This test is what turns that from a green run
+        into a red one, and it names both members so the diff says which arrived or left.
         """
-        ours = inspect.signature(MongoDBVectorSearchStrategy.search)
-        theirs = inspect.signature(SearchStrategy.search)
+        assert sorted(_protocol_members(SearchStrategy)) == ["index", "search"]
 
-        assert [(p.name, p.kind) for p in ours.parameters.values()] == [
-            (p.name, p.kind) for p in theirs.parameters.values()
-        ]
-        assert [p.annotation for p in ours.parameters.values()] == [p.annotation for p in theirs.parameters.values()]
-        assert ours.return_annotation == theirs.return_annotation
+    def test_every_protocol_member_matches_the_sdk_signature(self) -> None:
+        """AT-133 — compared against ``SearchStrategy`` itself, so SDK drift lands here.
 
-    def test_search_is_a_coroutine_function(self) -> None:
+        Nothing can hold an instance of this class, so these methods cannot be called and cannot be
+        tested by calling them. What they can do is record the shape phase 2 has to fill, and the way
+        to keep that record honest is to read the Protocol rather than to copy it into an assertion.
+
+        Stated over the member *set* rather than over ``search``, which is the lesson of the release
+        that prompted it. ``strands-agents`` 1.56.0 added ``index`` to this protocol, and a test that
+        compared one method's signature could not see a second method appear: it took a mypy snippet
+        in a sibling test to say so, in a message about a missing protocol member rather than about
+        this package. A member added upstream now fails here, by name, on the day it is installed
+        (``REQ-E-130``).
+        """
+        for name, theirs in sorted(_protocol_members(SearchStrategy).items()):
+            ours = getattr(MongoDBVectorSearchStrategy, name, None)
+            assert ours is not None, f"SearchStrategy declares {name!r} and this class does not"
+
+            mine, yours = inspect.signature(ours), inspect.signature(theirs)
+            assert [(p.name, p.kind) for p in mine.parameters.values()] == [
+                (p.name, p.kind) for p in yours.parameters.values()
+            ], f"{name}: parameter names or kinds are not the protocol's"
+            assert _accepted(ours) == _accepted(theirs), f"{name}: accepts something other than the protocol does"
+            assert mine.return_annotation == yours.return_annotation, (
+                f"{name}: returns something other than the protocol does"
+            )
+
+    def test_every_protocol_member_is_a_coroutine_function(self) -> None:
         """Async is part of the contract, and a signature comparison does not see it.
 
         ``inspect.signature`` reports the same parameters for ``def`` and ``async def``. Every method
         on both SDK contracts is a coroutine, so a placeholder declared ``def`` would pin
         the wrong shape while passing the test above.
         """
-        assert inspect.iscoroutinefunction(MongoDBVectorSearchStrategy.search)
+        for name in _protocol_members(SearchStrategy):
+            assert inspect.iscoroutinefunction(getattr(MongoDBVectorSearchStrategy, name)), f"{name} is not async"
 
     def test_an_instance_type_checks_as_a_search_strategy(
         self, run_mypy: Callable[[str], subprocess.CompletedProcess[str]]
