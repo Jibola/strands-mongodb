@@ -366,8 +366,8 @@ class TestDriverAttributionReachesTheServer:
 
     ``REQ-E-013`` originally named ``append_client_metadata``. That function is real, but it lives in
     ``pymongo_search_utils``, which the ``[storage]`` extra does not install, and ``_client.py`` is
-    shared with ``storage.py``. Its entire body is a ``callable()`` guard around
-    ``client.append_metadata``, so these tests assert the guarded call and the metadata it produces.
+    shared with ``storage.py``. Its entire body is a call to ``client.append_metadata``, so these tests
+    assert that call and the metadata it produces.
     """
 
     def test_a_client_we_construct_carries_the_attribution(self) -> None:
@@ -465,8 +465,9 @@ class TestDriverAttributionReachesTheServer:
         declared floor is ``>=4.14.0`` rather than a runtime probe: attribution is bookkeeping a caller
         did not ask for, and a package has no business narrating its own bookkeeping to them.
 
-        Asserted on the installed driver rather than on the specifier, because the two are different
-        promises: the specifier binds a resolver, and this is the fact the code depends on.
+        Asserted on the installed driver rather than on the specifier, which
+        ``test_pymongo_floor_is_4_14_on_both_runtime_extras`` covers. Both are needed: the specifier is a
+        promise to a resolver, and this is the fact the code depends on.
         """
         injected: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/")
 

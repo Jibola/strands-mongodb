@@ -99,12 +99,12 @@ dev = [
     "opentelemetry-sdk>=1.30.0",
 ]
 
-# TODO(github-org): confirm the GitHub org before the first upload to PyPI. These URLs are
-# published in the package metadata and must resolve.
 [project.urls]
-Homepage = "https://github.com/mongodb-labs/strands-mongodb"
-Repository = "https://github.com/mongodb-labs/strands-mongodb"
-Issues = "https://github.com/mongodb-labs/strands-mongodb/issues"
+# The repository these point at is the one PyPI's trusted publisher is bound to, and the one a reader
+# lands on from the PyPI sidebar. `mongodb`, not `mongodb-labs`: the package is supported, not a lab.
+Homepage = "https://github.com/mongodb/strands-mongodb"
+Repository = "https://github.com/mongodb/strands-mongodb"
+Issues = "https://github.com/mongodb/strands-mongodb/issues"
 
 [tool.hatch.version]
 source = "vcs"

@@ -391,6 +391,23 @@ class TestCoreMetadata:
         assert floors, requirements
         assert all(">=1.48.0" in r for r in floors), floors
 
+    @pytest.mark.parametrize("extra", ["storage", "memory"])
+    def test_pymongo_floor_is_4_14_on_both_runtime_extras(self, dist_metadata: PackageMetadata, extra: str) -> None:
+        """4.14.0 is the first release carrying ``AsyncMongoClient.append_metadata``.
+
+        The floor is what makes :func:`_client._attribute_injected_client` a plain call. Below 4.14 the
+        attribute still resolves -- ``AsyncMongoClient.__getattr__`` hands back a ``Database`` of that
+        name -- so an unguarded call raises ``TypeError`` rather than failing to import. A guard would
+        make that silent, and a silent no-op is exactly what the floor exists to rule out.
+
+        It was ``>=4.12.0``, inherited from ``pymongo-search-utils`` 0.3.0's own floor rather than chosen.
+        Nothing here needs 4.12, and 4.14.0 supports Python 3.9 upward, which clears our 3.10 floor.
+        """
+        requirements = [r for r in (dist_metadata.get_all("Requires-Dist") or []) if f"extra == '{extra}'" in r]
+        floors = [r for r in requirements if r.startswith("pymongo") and not r.startswith("pymongo-search-utils")]
+        assert floors, requirements
+        assert all(">=4.14.0" in r for r in floors), floors
+
     def test_version_is_derived_from_a_git_tag_not_a_file(self, manifest: dict[str, Any]) -> None:
         """``CH-006``'s version half, asserted against the manifest.
 
