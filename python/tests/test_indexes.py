@@ -125,10 +125,12 @@ class TestVectorModeIsResolvedFromTheConfig:
 class TestTheVectorIndexDefinition:
     """AT-071 / REQ-E-071 — filter fields are declared at creation time, in both modes.
 
-    ``REQ-E-071`` is a security requirement wearing an indexing hat. Atlas does not error on a
-    pre-filter over an undeclared path; it returns unfiltered results, which on the memory path
-    is another customer's memories. ``_filter.validate`` is the second guard for the same failure, and
-    it can only reject what this definition failed to declare.
+    ``REQ-E-071`` is an availability requirement wearing an indexing hat, and it was first written as a
+    security one. It assumed a pre-filter over an undeclared path returns unfiltered results, meaning
+    another customer's memories. Measured on mongot 8.3.8, the server rejects it with code 8. So
+    failing to declare ``scope`` here breaks every scoped query rather than widening it, since this
+    package filters by ``scope`` on all of them. Declaring both fields is still required; what changes is
+    which way it fails. ``_filter.validate`` remains the guard that names the config key to edit.
     """
 
     def test_the_autoembed_definition_matches_the_confirmed_wire_shape(self) -> None:
@@ -1337,6 +1339,96 @@ class TestSearchIndexesAgainstAFake:
         assert sum("READY" in message for message in statuses) == 1, statuses
 
 
+class TestTheCapabilityProbeAgainstAFake:
+    """AT-053d / ``REQ-E-053a`` — the three server codes that mean "this deployment has no Atlas Search".
+
+    Added after the probe was found to accept one code and raise on the other two. Until then
+    every assertion about it lived in the contract tier, so it was exercised against one deployment per
+    run and never against two in the same run, which is how a constant measured on `mongo:8` came to be
+    treated as the condition itself. These run against a fake, so all three codes and one unrecognised
+    code are driven through the probe in a run that needs no deployment at all.
+
+    The codes and the four deployments they were measured on are in `REQ-E-053a`. What each test below
+    asserts is the branch, not the number: `False` and the code for a deployment without search, `True`
+    for one with it, and `StorageError` for anything the set does not name.
+    """
+
+    async def test_a_deployment_that_lists_its_search_indexes_supports_search(self) -> None:
+        """The ordinary answer, and the one that carries no code: nothing failed, so nothing was seen."""
+        collection: Any = FakeAsyncCollection()
+
+        support = await _indexes.search_support(collection)
+
+        assert support.available is True
+        assert support.code is None
+
+    @pytest.mark.parametrize("code", [31082, 115, 6047401])
+    async def test_each_measured_code_degrades_and_reports_itself(self, code: int) -> None:
+        """All three, because the deployment that answers 115 is as real as the one that answers 31082.
+
+        The code comes back rather than being discarded, so the warning `initialize()` logs can name the
+        one in the operator's own log instead of the one this package happened to measure first.
+        """
+        collection: Any = FakeAsyncCollection()
+        collection.list_search_indexes = raiser(operation_failure(code, "no search here"))
+
+        support = await _indexes.search_support(collection)
+
+        assert support.available is False
+        assert support.code == code
+
+    async def test_a_code_outside_the_measured_set_raises_rather_than_reading_as_no_search(self) -> None:
+        """Code 13 is a wrong password, and reporting it as a deployment without Atlas Search would send
+        the caller to buy a cluster they already have. The closed set is what keeps that legible."""
+        from strands.types.exceptions import StorageError
+
+        collection: Any = FakeAsyncCollection()
+        collection.list_search_indexes = raiser(operation_failure(13, "not authorized"))
+
+        with pytest.raises(StorageError, match="probing Atlas Search support"):
+            await _indexes.search_support(collection)
+
+    async def test_the_code_create_search_index_answers_with_is_not_in_the_set(self) -> None:
+        """Code 59 means the same thing on 6.0.28 and 7.0.40, and is deliberately not matched here.
+
+        It arrives at `create_search_index`, which never runs until this probe has already cleared the
+        deployment, so matching it would be a claim about a call this package cannot reach in that state.
+        Asserting the exclusion keeps it a decision rather than an oversight.
+        """
+        from strands.types.exceptions import StorageError
+
+        collection: Any = FakeAsyncCollection()
+        collection.list_search_indexes = raiser(operation_failure(59, "no such command"))
+
+        with pytest.raises(StorageError):
+            await _indexes.search_support(collection)
+
+    async def test_a_collection_that_does_not_exist_still_answers_the_question(self) -> None:
+        """Code 26 is not a failed probe. An absent collection has no search indexes, and the *call*
+        worked, which is what was being asked. A fresh database must not fail its first `initialize()`."""
+        collection: Any = FakeAsyncCollection()
+        collection.list_search_indexes = raiser(operation_failure(26, "ns does not exist"))
+
+        support = await _indexes.search_support(collection)
+
+        assert support.available is True
+        assert support.code is None
+
+    async def test_a_probe_that_never_reached_the_server_raises(self) -> None:
+        """A `PyMongoError` that is not an `OperationFailure` has no `code` to compare against the set,
+        so it needs the second handler. Comparing one would raise `AttributeError` from inside the
+        handler and lose the cause, which is the same two-handler argument as the read path above."""
+        from strands.types.exceptions import StorageError
+
+        collection: Any = FakeAsyncCollection()
+        collection.list_search_indexes = raiser(network_failure())
+
+        with pytest.raises(StorageError) as caught:
+            await _indexes.search_support(collection)
+
+        assert "socket timed out" in str(caught.value.__cause__)
+
+
 class TestTheFakesMatchTheDriver:
     """MP-001, MP-002 — the parity contract for both fakes in this file.
 
@@ -1624,14 +1716,40 @@ MANUAL_VECTOR_CONFIG: MongoDBConfig = {
 }
 
 
+def _reported_version(index: Mapping[str, Any]) -> int:
+    """The definition version from a ``$listSearchIndexes`` document, under whichever key carries it.
+
+    The two deployments differ in the key *and* in the value shape, which the first version of this
+    helper got half right. An Atlas CLI local deployment sends ``latestVersion`` as a bare integer. Cloud
+    Atlas 8.0.30 sends ``latestDefinitionVersion`` as a subdocument,
+    ``{"createdAt": datetime(...), "version": 0}``, and neither sends the other's key.
+    Reading either one directly is a ``KeyError`` on the other cluster, and
+    reading the cloud one as a number is the ``TypeError`` that closed the 2026-09-01 run.
+
+    Args:
+        index: One document from ``list_search_indexes()``.
+
+    Returns:
+        The version, as an integer, from whichever of the two shapes arrived.
+    """
+    for key in ("latestVersion", "latestDefinitionVersion"):
+        if key in index:
+            reported = index[key]
+            # `dict` rather than `Mapping`: the name is imported under `TYPE_CHECKING` only, and the
+            # driver hands back plain dicts, so the narrower check is also the one that exists at runtime.
+            return int(reported["version"] if isinstance(reported, dict) else reported)
+    raise AssertionError(f"no definition version key in {sorted(index)}")
+
+
 @pytest.mark.integration
 class TestSearchIndexesAgainstAtlas:
     """AT-062a/b/c, AT-066, AT-068 — the asynchronous build, which is what no fake can prove.
 
     Every test here uses the manual-vector mode. That is not a convenience: an ``autoEmbed`` definition
     fails at **creation** on an Atlas local deployment with code 8, *"CanonicalModel: voyage-4-lite not
-    registered yet, supported models are: []"*, so the default mode is unreachable here and the
-    ``autoembed`` tier exists for it.
+    registered yet, supported models are: []"*, and ``MONGODB_ATLAS_URI`` is the variable that may name
+    such a deployment. A cloud cluster with a registered model accepts the definition, which is what the
+    separate ``autoembed`` tier and ``MONGODB_AUTOEMBED_URI`` exist to require rather than hope for.
     """
 
     async def test_a_missing_search_index_is_created_and_reaches_ready(
@@ -1679,16 +1797,21 @@ class TestSearchIndexesAgainstAtlas:
         """The warm path, which is what every ``initialize()`` after the first one runs. Re-issuing an
         identical definition is in fact accepted by the server, both while building and after ready, so
         this asserts the module does not issue it: a create that succeeds is still a round trip and
-        still a write permission the caller may not have."""
+        still a write permission the caller may not have.
+
+        The version is what makes the assertion sharp rather than a name comparison that any two runs
+        satisfy, and it is read through ``_reported_version`` because the two deployments spell the key
+        differently."""
         collection = atlas_database[unique_collection_name]
         specs = _indexes.memory_search_specs(MANUAL_VECTOR_CONFIG)
         await _indexes.ensure(collection, search=specs, create=True)
-        before = [(index["name"], index["latestVersion"]) async for index in await collection.list_search_indexes()]
+        before = [(index["name"], _reported_version(index)) async for index in await collection.list_search_indexes()]
 
         await _indexes.ensure(collection, search=specs, create=True)
 
-        after = [(index["name"], index["latestVersion"]) async for index in await collection.list_search_indexes()]
+        after = [(index["name"], _reported_version(index)) async for index in await collection.list_search_indexes()]
         assert after == before
+        assert before, "nothing was listed, so an unchanged listing proves nothing"
 
     async def test_verify_only_reports_a_missing_search_index_with_its_command(
         self, atlas_database: Any, unique_collection_name: str
@@ -1794,16 +1917,22 @@ class TestSearchIndexesAgainstAtlas:
 
         assert documents[0]["latestDefinition"] == spec.definition
 
-    async def test_the_text_definition_comes_back_rewritten_which_is_why_covering_is_not_equality(
+    async def test_the_text_definition_is_covered_whether_or_not_the_server_rewrites_it(
         self, atlas_database: Any, unique_collection_name: str
     ) -> None:
         """The other half, and the reason ``REQ-E-069`` exists.
 
         This test began as one equality assertion over ``specs[0]`` and passed. The same assertion over
-        ``specs[1]`` fails: mongot collapses the one-element list into the object it held and adds
-        ``indexOptions``, ``store`` and ``norms``. Both facts are asserted here so the asymmetry is a
-        measurement rather than a remark, and so a server that ever stops rewriting is a visible change
-        rather than a silently loosened comparison.
+        ``specs[1]`` failed on mongot 8.3.8, which collapses the one-element list into the object it held
+        and adds ``indexOptions``, ``store`` and ``norms``. Atlas 8.0.30 returns the same definition
+        verbatim, so the rewrite is a property of the deployment rather than of the index type,
+        and equality would pass on one cluster and fail on the other for
+        identical package code.
+
+        Containment is therefore asserted unconditionally, because it is what ``ensure`` rests on. The
+        rewrite is asserted in the branch where it happens, naming the three keys mongot adds, so a
+        deployment that changes its mind about normalising is a visible change rather than a silently
+        loosened comparison.
         """
         collection = atlas_database[unique_collection_name]
         spec = _indexes.memory_search_specs(MANUAL_VECTOR_CONFIG)[1]
@@ -1811,8 +1940,11 @@ class TestSearchIndexesAgainstAtlas:
 
         reported = [index async for index in await collection.list_search_indexes(spec.name)][0]["latestDefinition"]
 
-        assert reported != spec.definition
-        mapped = reported["mappings"]["fields"]["content"]
-        assert not isinstance(mapped, list)
-        assert mapped["type"] == "string"
         assert _indexes._definition_gap(spec.definition, reported) is None
+        mapped = reported["mappings"]["fields"]["content"]
+        if reported == spec.definition:
+            assert mapped == [{"type": "string"}]
+        else:
+            assert not isinstance(mapped, list)
+            assert mapped["type"] == "string"
+            assert {"indexOptions", "store", "norms"} <= set(mapped)
