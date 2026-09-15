@@ -33,7 +33,7 @@ except ImportError as error:  # pragma: no cover - exercised in a subprocess by 
 if TYPE_CHECKING:
     from strands_mongodb.types import MongoDBConfig
 
-__all__ = ["close", "resolve"]
+__all__ = ["Capabilities", "close", "resolve"]
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,31 @@ _RETRY_WRITES_DISABLED = (
     "Nothing is corrupted either way. Remove retryWrites=false to restore the behavior this package "
     "was designed around."
 )
+
+
+@dataclass
+class Capabilities:
+    """What a deployment can do, probed once and cached on its connection.
+
+    A record rather than a bare ``bool`` on ``_Connection``, for two reasons that both come from the
+    field it replaces being ``Any | None``. ``None`` has to keep meaning *not probed yet*, and
+    ``bool | None`` makes that a three-state flag whose ``if capabilities:`` reads as "has search" while
+    also being false for "unknown". And search support is the first of these, not the last: hybrid
+    search and ``$rerank`` are v0.2.0 and are probed the same way.
+
+    Attributes:
+        search: Whether the deployment runs Atlas Search. A property of the deployment rather than of a
+            collection, which is why one probe serves every store on the connection
+            (``REQ-E-065``).
+        no_search_code: The server error code that said so, or ``None``. Set only when ``search`` is
+            ``False``, and cached here for the same reason ``search`` is: the code is seen once, by the
+            probe, and ``search()`` needs it on every later call to name it in what it raises. Three
+            codes mean this and they differ by server version and build, so the one this deployment used
+            is not derivable from anything else on hand (``REQ-E-053a``).
+    """
+
+    search: bool
+    no_search_code: int | None = None
 
 
 @dataclass
@@ -77,7 +102,7 @@ class _Connection:
     owned: bool
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     loop: asyncio.AbstractEventLoop | None = None
-    capabilities: Any | None = None
+    capabilities: Capabilities | None = None
 
     def get_lock(self) -> asyncio.Lock:
         """Return a lock usable on the running event loop, replacing it if the loop changed.
@@ -110,9 +135,45 @@ class _Connection:
         return self.lock
 
 
+#: A connection identity paired with the event loop that connection serves (``REQ-E-017a``). ``None``
+#: means no loop: either a client built by synchronous code that has not bound itself yet, or an
+#: injected one, which is never split per loop.
+_RegistryKey = tuple[str, asyncio.AbstractEventLoop | None]
+
 # Keyed by the digest from `_identity`, never by a connection string (REQ-E-014). Process-global, so
-# every store built from one config shares one pool.
-_REGISTRY: dict[str, _Connection] = {}
+# every store built from one config shares one pool per event loop.
+_REGISTRY: dict[_RegistryKey, _Connection] = {}
+
+
+def _running_loop() -> asyncio.AbstractEventLoop | None:
+    """Return the running event loop, or ``None`` when there is none.
+
+    ``resolve`` is synchronous and is called from both worlds: from a coroutine, and from
+    ``MongoDBStorage.__init__`` at module level. Only the first has a loop to key on.
+
+    Returns:
+        The running loop, or ``None`` outside one.
+    """
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
+def _reap_closed_loops() -> None:
+    """Drop every registry entry whose event loop has closed (``REQ-E-017a``).
+
+    Called before building a client, which is the only moment the registry can grow. Swept across the
+    whole registry rather than one identity, because such an entry is unusable by anyone: pymongo
+    refuses the client from any other loop, and we cannot close it either, since ``close()`` sends
+    ``endSessions`` on the loop that is gone. Keeping it would leak an entry per loop for the life of
+    the process.
+
+    The client itself is dropped rather than closed, deliberately. It holds sockets that only its dead
+    loop's selector can reach, so the file descriptors are released when the object is collected.
+    """
+    for key in [key for key, _ in _REGISTRY.items() if key[1] is not None and key[1].is_closed()]:
+        del _REGISTRY[key]
 
 
 def _package_version() -> str:
@@ -218,14 +279,18 @@ def _attribute_injected_client(client: AsyncMongoClient[Any]) -> None:
 
 
 def resolve(config: MongoDBConfig) -> _Connection:
-    """Return the shared connection for a config, creating it on first use.
+    """Return the shared connection for a config and the running loop, creating it on first use.
+
+    One pool per connection identity is ``REQ-E-012``, and ``REQ-E-017a`` bounds it per event loop:
+    ``AsyncMongoClient`` binds to the loop of its first operation, so a single client cannot serve a
+    synchronous ``Agent``, which runs every entry point on a loop of its own.
 
     Args:
         config: The configuration to resolve. Only the connection fields are read.
 
     Returns:
-        The registered connection. The same object for every config with the same connection
-        identity, so callers must not mutate it.
+        The registered connection. The same object for every config with the same connection identity
+        resolved on the same loop, so callers must not mutate it.
 
     Raises:
         ValueError: If neither ``client`` nor ``connection_string`` is set. Raised before any client
@@ -233,8 +298,18 @@ def resolve(config: MongoDBConfig) -> _Connection:
             us: pymongo reads a schemeless string as a hostname, so the failure would otherwise be a
             server-selection timeout against ``localhost``.
     """
-    key = _identity(config)
-    existing = _REGISTRY.get(key)
+    identity = _identity(config)
+
+    injected = config.get("client")
+    if injected is not None:
+        # REQ-E-017a's carve-out: one slot, keyed on no loop at all. We did not build this client, so
+        # there is no second copy to build, and REQ-E-010 forbids closing the one we have. A caller
+        # who drives an injected client from two loops gets pymongo's own RuntimeError, which names
+        # the object they own.
+        return _register(identity, None, injected, owned=False, attribute=True)
+
+    running = _running_loop()
+    existing = _REGISTRY.get((identity, running))
     if existing is not None:
         # Returning here is what keeps REQ-E-016's warning to one line per connection rather than one
         # per store, and a Storage is resolved once per SDK subsystem that consumes it. Reapplying the
@@ -242,24 +317,56 @@ def resolve(config: MongoDBConfig) -> _Connection:
         # re-warning would not be.
         return existing
 
-    injected = config.get("client")
-    if injected is not None:
-        _attribute_injected_client(injected)
-        _warn_if_retries_disabled(injected)
-        _REGISTRY[key] = _Connection(client=injected, owned=False)
-        return _REGISTRY[key]
+    if running is not None:
+        # Adoption (REQ-E-017a). A client built with no loop running has not bound itself to anything,
+        # so the first loop that asks for it takes it over. Building a second here instead would leave
+        # the first open, unused, and never closed, in the ordinary case of constructing a store at
+        # import time and using it on one loop.
+        adopted = _REGISTRY.pop((identity, None), None)
+        if adopted is not None:
+            _REGISTRY[(identity, running)] = adopted
+            return adopted
+
+    _reap_closed_loops()
 
     # `driver=` reaches pymongo through `**kwargs` rather than a named parameter, so nothing type
     # checks it. AT-013a asserts the resulting pool metadata instead of the call.
-    connection_string = config["connection_string"]
     client: AsyncMongoClient[Any] = AsyncMongoClient(
-        connection_string,
+        config["connection_string"],
         driver=_driver_info(),
         **(config.get("client_args") or {}),
     )
+    return _register(identity, running, client, owned=True, attribute=False)
+
+
+def _register(
+    identity: str,
+    loop: asyncio.AbstractEventLoop | None,
+    client: AsyncMongoClient[Any],
+    *,
+    owned: bool,
+    attribute: bool,
+) -> _Connection:
+    """Put a client in the registry under one identity and loop, warning at most once about it.
+
+    Args:
+        identity: The connection identity from :func:`_identity`.
+        loop: The loop this client serves, or ``None`` for the loop-independent slot.
+        client: The client to register.
+        owned: Whether we built it, which decides whether :func:`close` may close it.
+        attribute: Whether to attach Strands attribution, which only an injected client needs.
+
+    Returns:
+        The registered connection, existing or new.
+    """
+    existing = _REGISTRY.get((identity, loop))
+    if existing is not None:
+        return existing
+    if attribute:
+        _attribute_injected_client(client)
     _warn_if_retries_disabled(client)
-    _REGISTRY[key] = _Connection(client=client, owned=True)
-    return _REGISTRY[key]
+    _REGISTRY[(identity, loop)] = _Connection(client=client, owned=owned)
+    return _REGISTRY[(identity, loop)]
 
 
 async def close(config: MongoDBConfig) -> None:
@@ -273,18 +380,38 @@ async def close(config: MongoDBConfig) -> None:
     Idempotent, and safe on a config that was never resolved. This gets called from a ``finally`` and
     again from an ``atexit``.
 
+    Every slot for the identity is released, not just the running loop's (``REQ-E-017a``). Nothing in
+    the public API names a loop, so a caller who closes a config once and finds another loop's pool
+    still registered has a leak no further call could reach.
+
     Args:
         config: The configuration whose connection to release.
     """
     try:
-        key = _identity(config)
+        identity = _identity(config)
     except ValueError:
         # Nothing was ever registered for a config this broken, so there is nothing to release and no
         # reason to raise from a teardown path.
         return
 
-    connection = _REGISTRY.pop(key, None)
-    if connection is None:
-        return
-    if connection.owned:
-        await connection.client.close()
+    running = asyncio.get_running_loop()
+    for key in [key for key in _REGISTRY if key[0] == identity]:
+        # Popped with a default because the snapshot above can go stale before this line reaches the end
+        # of it (`REQ-E-017c`). There is an `await` inside this loop, so anything that removes a slot
+        # gets a turn: a second concurrent `close()` for the same config, which is what three stores
+        # closing under one `gather` do, or the reap in `resolve()`. Either way the slot is gone because
+        # somebody released it, which is the outcome this call wanted.
+        connection = _REGISTRY.pop(key, None)
+        if connection is None or not connection.owned:
+            continue
+        loop = key[1]
+        if loop is None or loop is running:
+            await connection.client.close()
+        elif not loop.is_closed():
+            # Another live loop's client. Its `close()` sends `endSessions` over sockets that belong to
+            # that loop, so it has to run there. Scheduled and not waited on: this loop may be the one
+            # that loop is waiting for, and a teardown path must not be able to deadlock.
+            asyncio.run_coroutine_threadsafe(connection.client.close(), loop)
+        # A closed loop's client is dropped and not closed. Nothing can close it: `close()` needs the
+        # loop the sockets belong to, and the `RuntimeError` pymongo raises instead is not a
+        # `PyMongoError`, so it escapes the driver's own handling.

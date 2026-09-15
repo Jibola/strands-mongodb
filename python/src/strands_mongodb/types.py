@@ -126,9 +126,10 @@ class MongoDBConfig(TypedDict, total=False):
         similarity: Distance metric for the manual path: ``"cosine"``, ``"dotProduct"`` or
             ``"euclidean"``. No default, because the right metric is a property of the caller's
             embeddings and the wrong one returns plausible neighbours that are the wrong neighbours.
-        filter_fields: Extra document fields to declare filterable in the vector index. Atlas returns
-            unfiltered results rather than an error when a query filters on an undeclared field, so
-            these have to be known at index-creation time.
+        filter_fields: Extra document fields to declare filterable in the vector index. A query
+            filtering on an undeclared path is rejected by the server, measured as code 8 on mongot
+            8.3.8, so these have to be known at index-creation time and adding one later means
+            recreating the index.
         vector_index_name: Name of the Atlas Vector Search index.
         text_index_name: Name of the Atlas Search full-text index.
     """

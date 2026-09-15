@@ -27,6 +27,8 @@ from strands_mongodb.memory_store import MongoDBMemoryStore
 from strands_mongodb.storage import MongoDBStorage
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from strands_mongodb.types import MongoDBConfig, MongoDBMemoryStoreConfig
 
 # Port 1 is reserved and never listening, so anything that reaches the network here fails loudly
@@ -345,21 +347,33 @@ class TestOwnershipSurvivesTheStoreBoundary:
         await storage.close()
 
     async def test_closing_one_instance_releases_the_connection_the_others_share(self) -> None:
-        """The sharp edge of ``REQ-E-012``, asserted rather than left to be discovered.
+        """The scope of ``REQ-E-012``, asserted rather than left to be discovered.
 
         One registry entry per connection identity means ``close()`` is per-config, not per-instance:
-        the second storage here is left holding a closed client. That is the documented behavior, and
-        it is why ``close()`` belongs at process shutdown rather than in a per-request ``finally``
-        around one store of several. A reference-counted alternative would be possible.
+        the pool the second storage was using is gone once the first one closes. That is why ``close()``
+        belongs at process shutdown rather than in a per-request ``finally`` around one store of several.
+
+        What the sibling sees afterwards changed late. Until ``REQ-E-017b`` it held the closed
+        client on an attribute and its next operation raised ``InvalidOperation``; now it resolves per
+        operation, finds the entry gone, and opens a new pool. So this asserts the pool was released and
+        the sibling is not bricked, which is strictly the better half of the trade. The half
+        still open is the reverse: that new pool has no owner who will close it.
         """
         connection = _storage_config()
         first = MongoDBStorage(connection, collection="sessions")
         second = MongoDBStorage(connection, collection="transcripts")
+        shared = second._connection.client
 
         await first.close()
 
-        assert await _is_closed(second._connection.client)
         assert _client._REGISTRY == {}
+        assert await _is_closed(shared)
+        replacement = second._connection.client
+        try:
+            assert replacement is not shared
+            assert not await _is_closed(replacement)
+        finally:
+            await second.close()
 
 
 class TestTheCollectionAndOptionsTheCallerAsksFor:
@@ -426,7 +440,15 @@ class TestOneConfigAcrossTwoEventLoops:
     """
 
     def test_two_asyncio_run_calls_sharing_one_config_both_succeed(self) -> None:
-        """The second invocation must not inherit a lock bound to the first one's closed loop."""
+        """The second invocation must not inherit a lock bound to the first one's closed loop.
+
+        This test asserted the opposite of its closing line until late: it required the second run to
+        reuse the first run's *client*, on the reading of ``REQ-E-012`` that one identity means one pool
+        for the life of the process. ``REQ-E-017a`` bounds that per loop, because pymongo binds a client
+        to the loop of its first operation and refuses it everywhere else. Reuse across a closed loop is
+        the defect, not the requirement. The lock claim above it is unchanged and is still the reason the
+        contention exists here.
+        """
         config = _storage_config()
 
         async def invocation() -> AsyncMongoClient[Any]:
@@ -442,7 +464,81 @@ class TestOneConfigAcrossTwoEventLoops:
         first = asyncio.run(invocation())
         second = asyncio.run(invocation())
 
-        assert first is second, "the point is that the second run reuses the first run's connection"
+        assert first is not second, "a client bound to the first run's closed loop cannot serve the second"
+
+
+class TestOneStoreInstanceAcrossTwoEventLoops:
+    """AT-091c / REQ-E-017b — the event-loop boundary, with the store built once instead of once per loop.
+
+    The class above builds a fresh ``MongoDBStorage`` inside each ``asyncio.run``, so a per-loop registry
+    is enough to satisfy it. That is what let the first version of ``REQ-E-017a`` look complete while the
+    contract tier still raised: both constructors cached the resolved connection on the instance, so a
+    store that *outlives* its first loop never asked the registry again.
+
+    Nothing here connects. ``resolve`` builds an ``AsyncMongoClient`` without I/O, and identity of the
+    client object is the whole assertion, so an unreachable address is the right target: it keeps the
+    test in the unit tier and makes a regression fail in milliseconds.
+    ``tests/test_storage.py::TestOneStorageServesTwoSuccessiveEventLoops`` is the same claim against a
+    deployment, where the wrong answer raises instead of comparing unequal.
+    """
+
+    @staticmethod
+    def _client_seen_on_a_fresh_loop(read: Callable[[], AsyncMongoClient[Any]]) -> AsyncMongoClient[Any]:
+        """Run ``read`` on its own loop and return the client it saw."""
+
+        async def body() -> AsyncMongoClient[Any]:
+            return read()
+
+        return asyncio.run(body())
+
+    def test_a_storage_reads_the_client_for_the_loop_it_is_running_on(self) -> None:
+        """One instance, two loops, two clients, and the second one is live."""
+        storage = MongoDBStorage(_storage_config())
+
+        first = self._client_seen_on_a_fresh_loop(lambda: storage._connection.client)
+        second = self._client_seen_on_a_fresh_loop(lambda: storage._connection.client)
+
+        assert first is not second
+
+    def test_a_memory_store_reads_the_client_for_the_loop_it_is_running_on(self) -> None:
+        """The same on the memory surface, which resolves from the nested ``config`` key."""
+        store = MongoDBMemoryStore(**_store_config())
+
+        first = self._client_seen_on_a_fresh_loop(lambda: store._connection.client)
+        second = self._client_seen_on_a_fresh_loop(lambda: store._connection.client)
+
+        assert first is not second
+
+    def test_the_collection_handle_follows_the_client_rather_than_outliving_it(self) -> None:
+        """``_collection()`` is the only path the operations take, so it is the one that has to move.
+
+        A ``_connection`` property with a collection still captured at construction would pass the two
+        tests above and fail every write, which is exactly the shape of the defect this started from.
+        """
+        storage = MongoDBStorage(_storage_config())
+
+        first = self._client_seen_on_a_fresh_loop(lambda: storage._collection().database.client)
+        second = self._client_seen_on_a_fresh_loop(lambda: storage._collection().database.client)
+
+        assert first is not second
+
+    def test_construction_still_refuses_a_config_it_cannot_resolve(self) -> None:
+        """The eager resolution ``__init__`` throws away is what keeps ``REQ-E-015`` at construction.
+
+        Dropping the call and letting the property do all the work would move this ``ValueError`` to the
+        first ``write``, which is a worse place to learn that a config was never usable.
+        """
+        with pytest.raises(ValueError):
+            MongoDBStorage({"database": "appdb"})  # type: ignore[typeddict-item]
+
+    def test_one_loop_still_sees_one_client_across_many_operations(self) -> None:
+        """Per operation is per *loop*, not per call. A new pool per call would be a resource leak."""
+        storage = MongoDBStorage(_storage_config())
+
+        async def read_thrice() -> set[int]:
+            return {id(storage._connection.client) for _ in range(3)}
+
+        assert len(asyncio.run(read_thrice())) == 1
 
 
 class TestTheHooksThatMustStayAbsent:
