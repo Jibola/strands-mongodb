@@ -537,18 +537,28 @@ _COMMUNITY_STORE_INDEX = {
 #: see is the ``autoembed`` case below, since that package embeds server-side and so will they.
 _FOREIGN_INDEXES = (
     pytest.param(_LEGACY_INDEX, "definition.fields is absent", id="tools-memory"),
-    pytest.param(_COMMUNITY_STORE_INDEX, "nothing reported at definition.fields covers it", id="community-memory"),
+    pytest.param(
+        _COMMUNITY_STORE_INDEX,
+        "nothing reported at definition.fields covers it",
+        id="community-memory",
+        marks=pytest.mark.autoembed,
+    ),
 )
 
 #: The same two without their expected substrings, for the test that asserts on the deployment's index set
 #: rather than on the message.
 _FOREIGN_INDEXES_ONLY = (
     pytest.param(_LEGACY_INDEX, id="tools-memory"),
-    pytest.param(_COMMUNITY_STORE_INDEX, id="community-memory"),
+    pytest.param(_COMMUNITY_STORE_INDEX, id="community-memory", marks=pytest.mark.autoembed),
 )
 
-#: Manual-vector mode, so this runs on the ``integration`` tier rather than needing a registered
-#: embedding model. The collision is about the index *name*, and the name is the same either way.
+#: Manual-vector mode: the specs *under test* need no registered embedding model, and the collision is
+#: about the index *name*, which is the same either way. That is why the class sits on ``integration``.
+#:
+#: It is not the whole tier story, and reading it as such was a bug (``AT-132``). A tier has to cover the
+#: setup as well as the assertion, and one of the two foreign indexes these tests plant *first* is itself
+#: an ``autoEmbed`` definition naming a model. Planting it needs that model registered however little the
+#: assertion afterwards cares, so that parameter carries ``autoembed`` on top of the class marker.
 _MANUAL_VECTOR_CONFIG: MongoDBConfig = {
     "database": "unused",
     "embedding_dimensions": 4,
@@ -619,6 +629,50 @@ class TestTheIndexNameCollisionFailsLoudly:
         assert after == {_indexes.DEFAULT_VECTOR_INDEX_NAME}, (
             f"expected the foreign index alone and nothing else, found {sorted(after)}"
         )
+
+
+class TestEveryForeignIndexIsGatedByWhatPlantingItNeeds:
+    """``AT-132`` / ``REQ-E-129`` — a tier covers the setup, not only the assertion.
+
+    Found by running the integration tier against an Atlas CLI local deployment, which ``conftest.py``
+    names as a supported target for ``MONGODB_ATLAS_URI``. Both ``[community-memory]`` parameters of
+    ``TestTheIndexNameCollisionFailsLoudly`` failed there with ``CanonicalModel: voyage-4-lite not
+    registered yet, supported models are: []`` — raised by ``create_search_index`` while planting the
+    foreign index, long before the assertion the tier had been chosen for.
+
+    The reasoning that put them on ``integration`` was sound about the specs under test and silent about
+    the fixture, so the whole integration tier could not be run clean on its own documented deployment.
+    This grades the wiring instead of the reasoning: a parameter whose index embeds server-side is gated
+    on ``autoembed``, and one that does not is not. Needs no deployment, so it runs everywhere.
+    """
+
+    @staticmethod
+    def _embeds_server_side(index: dict[str, Any]) -> bool:
+        """Report whether planting ``index`` requires a registered embedding model.
+
+        Args:
+            index: A search index definition as it would be handed to ``create_search_index``.
+
+        Returns:
+            ``True`` if any declared field asks the deployment to embed, which is what needs the model.
+        """
+        return any(field.get("type") == "autoEmbed" for field in index["definition"].get("fields", ()))
+
+    @pytest.mark.parametrize("params", [_FOREIGN_INDEXES, _FOREIGN_INDEXES_ONLY], ids=["with-message", "index-set"])
+    def test_a_server_side_index_is_gated_on_autoembed_and_a_manual_one_is_not(self, params: tuple[Any, ...]) -> None:
+        """AT-132 -- the marker on each parameter matches what planting that parameter costs.
+
+        Both directions, because an over-gated parameter is a test that silently stops running and is
+        just as wrong as one that fails.
+        """
+        for param in params:
+            index = param.values[0]
+            gated = any(mark.name == "autoembed" for mark in param.marks)
+            needs_model = self._embeds_server_side(index)
+            assert gated == needs_model, (
+                f"{param.id}: planting it {'needs' if needs_model else 'does not need'} a registered "
+                f"embedding model, but it is {'gated on' if gated else 'not gated on'} autoembed"
+            )
 
 
 @pytest.mark.autoembed
