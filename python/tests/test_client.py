@@ -1,4 +1,4 @@
-"""Connection resolution, ownership and lifecycle: ``REQ-E-010`` through ``REQ-E-017``.
+"""Connection resolution, ownership and lifecycle: ``REQ-E-010`` through ``REQ-E-017a``.
 
 Everything here is about the client, not about queries, so almost none of it needs a database.
 ``AsyncMongoClient`` construction performs no I/O and validates nothing (verified on pymongo 4.17.0:
@@ -13,17 +13,30 @@ faked without asserting the fake.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import Status, StatusCode
 from pymongo import AsyncMongoClient
 from pymongo.driver_info import DriverInfo
+from strands.types.exceptions import StorageError
 
 from strands_mongodb import _client
+from strands_mongodb.memory_store import MongoDBMemoryStore
+from strands_mongodb.storage import MongoDBStorage
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator, Sequence
+
+    from opentelemetry.sdk.trace import ReadableSpan
+
     from strands_mongodb.types import MongoDBConfig
 
 # A password that no other string in the suite contains, so a sweep for it cannot match by accident.
@@ -673,6 +686,262 @@ class TestThePasswordNeverLeavesTheConfig:
         self.assert_no_leak(*(value for value in vars(_client).values() if not callable(value)))
 
 
+# Port 1 is reserved and never listening, and 50 ms is what makes "cannot connect" fast enough to run in
+# the unit tier instead of waiting out pymongo's 30-second default. The shape is ``test_storage.py``'s
+# ``UNREACHABLE`` carrying ``LEAKY_URI``'s password, because ``AT-117`` needs both properties at once: a
+# config that holds a secret, and calls that reach their own error handling rather than stopping at
+# validation.
+LEAKY_UNREACHABLE = "mongodb://appuser:SUPERSECRET@127.0.0.1:1/?serverSelectionTimeoutMS=50"
+
+
+def _rendered(span: ReadableSpan) -> str:
+    """Return every string a span carries, joined, ready for a substring scan.
+
+    Written from the ``ReadableSpan`` surface rather than from the setters, so a value reaches the scan the
+    same way whatever route put it there. Verified against opentelemetry-sdk 1.44.0: ``attributes`` and an
+    event's ``attributes`` are both ``None`` on a span that never set any, and ``status.description`` is
+    ``None`` until a status carries one.
+
+    ``resource.attributes`` is deliberately not read. Those come from the host's ``Resource``, which this
+    package never touches, and they carry a ``service.instance.id`` that changes per process.
+
+    Args:
+        span: A finished span, as the exporter received it.
+
+    Returns:
+        One string holding the span's name, its status description, its instrumentation scope, and the
+        keys and values of its own attributes, of every event, and of every link.
+    """
+    parts = [span.name, str(span.status.description or "")]
+    parts += [f"{key}={value!r}" for key, value in (span.attributes or {}).items()]
+    for event in span.events:
+        parts.append(event.name)
+        parts += [f"{key}={value!r}" for key, value in (event.attributes or {}).items()]
+    for link in span.links:
+        parts += [f"{key}={value!r}" for key, value in (link.attributes or {}).items()]
+    if span.instrumentation_scope is not None:
+        parts.append(span.instrumentation_scope.name)
+    return "\n".join(parts)
+
+
+def _assert_no_span_leaks(spans: Sequence[ReadableSpan]) -> None:
+    """Assert no span renders the password.
+
+    Args:
+        spans: The finished spans to scan.
+
+    Raises:
+        AssertionError: Naming the offending span, without reproducing the password: a failure here is
+            read in CI output, which is one of the places the password must not reach.
+    """
+    for span in spans:
+        assert "SUPERSECRET" not in _rendered(span), f"span {span.name!r} leaked the password"
+
+
+@pytest.fixture
+def exported_spans() -> Iterator[InMemorySpanExporter]:
+    """Put an in-memory exporter behind the *global* tracer provider, and take it out again.
+
+    Global, because that is the only provider package code would ever reach:
+    ``trace.get_tracer(__name__)`` and ``trace.get_current_span()`` both read it, so a provider kept local
+    to this test would leave a leak writing somewhere nobody was watching.
+
+    Two paths, because both states occur. A fresh interpreter has a ``ProxyTracerProvider`` and takes
+    ``set_tracer_provider``; a suite that already configured tracing has a real one and takes another
+    processor. Measured on 1.44.0: importing ``strands`` does not install a provider, so the first path is
+    the one the unit tier takes.
+
+    ``set_tracer_provider`` cannot be undone, so teardown shuts the exporter down and leaves the provider
+    in place. A shut-down ``InMemorySpanExporter`` records nothing, and no other test in this suite emits
+    or reads a span.
+    """
+    exporter = InMemorySpanExporter()
+    processor = SimpleSpanProcessor(exporter)
+    provider = trace.get_tracer_provider()
+    if isinstance(provider, TracerProvider):
+        provider.add_span_processor(processor)
+    else:
+        installed = TracerProvider()
+        installed.add_span_processor(processor)
+        trace.set_tracer_provider(installed)
+    try:
+        yield exporter
+    finally:
+        processor.shutdown()
+
+
+class TestNoSpanCarriesThePassword:
+    """AT-117 / REQ-E-114 — the fourth surface a password can reach, and the only one no test had looked at.
+
+    ``REQ-E-114`` asks that a config holding an inline password survive ``repr()``, ``str()``, log output and OTel
+    span attributes. The first three are closed: ``TestThePasswordNeverLeavesTheConfig`` above covers
+    construction, the registry, debug logging, exception messages and tracebacks, ``test_storage.py`` and
+    ``test_memory_store.py`` extend the sweep across the five storage methods and the four memory methods,
+    and both of those pass the store instances themselves as subjects, which is what covers ``repr``. No
+    test in the suite had ever created a span.
+
+    Measured before writing this: ``src/strands_mongodb/`` contains no occurrence of ``opentelemetry``,
+    ``otel``, ``span`` or ``tracer``. The package emits no spans of its own, and that is deliberate rather
+    than pending, since a partner package must not bring an OTel dependency or configure
+    exporters of its own.
+
+    So this is a tripwire for a leak that does not exist yet, which is the case for writing it now. A
+    package that may not configure an exporter, and later wants to record an operation name and a duration,
+    has one place to put them: the span already current on the calling thread. Whoever adds that line will
+    have the config in scope, and will be adding it to a module whose tests are all about queries.
+    """
+
+    @pytest.mark.parametrize("surface", ["name", "attribute", "event", "status"])
+    def test_the_scan_catches_a_span_leaking_on_any_surface(
+        self, surface: str, exported_spans: InMemorySpanExporter
+    ) -> None:
+        """The positive control, one span per surface, each leaking in exactly one place.
+
+        Without this the test below is close to vacuous: the package emits no spans, so a scan that read
+        the wrong field, or an exporter that received nothing, would pass just as well as a clean package.
+        Parametrized rather than one span leaking four ways, because a single span carrying the password in
+        every field passes against a scan that only reads one of them.
+        """
+        tracer = trace.get_tracer("at117.control")
+
+        with tracer.start_as_current_span("leak-SUPERSECRET" if surface == "name" else "control") as span:
+            if surface == "attribute":
+                span.set_attribute("connection_string", LEAKY_UNREACHABLE)
+            elif surface == "event":
+                span.add_event("connection resolved", {"uri": LEAKY_UNREACHABLE})
+            elif surface == "status":
+                span.set_status(Status(StatusCode.ERROR, f"cannot reach {LEAKY_UNREACHABLE}"))
+
+        finished = exported_spans.get_finished_spans()
+        assert len(finished) == 1, "the control needs exactly one span, or it is testing the wrong one"
+        with pytest.raises(AssertionError, match="leaked the password"):
+            _assert_no_span_leaks(finished)
+
+    async def test_exercising_the_package_emits_no_span_that_carries_the_password(
+        self, exported_spans: InMemorySpanExporter
+    ) -> None:
+        """Both stores and the client, driven from inside an enclosing span, on a leaky config.
+
+        The enclosing span is what a host application supplies: an agent invocation is already inside one
+        by the time a store is called. It is also what makes this assertion non-empty, and it is the span a
+        future ``trace.get_current_span().set_attribute(...)`` in this package would write to.
+
+        Every call fails, and that is the surface worth covering. A store built once at start-up and
+        failing on every call afterwards is the shape ``REQ-E-014`` exists for, and a failure is when a
+        package is most tempted to say which connection it was talking about.
+
+        Measured on opentelemetry-sdk 1.44.0: the exercise exports exactly one span, the enclosing one.
+        The count is not asserted, because instrumentation arriving later is a change to review rather than
+        a failure of this requirement, and ``REQ-E-114`` is about what a span carries.
+
+        Six calls rather than all nine public methods, and the reason is a measurement: a call against a
+        closed port costs 0.500s whatever the URI asks for, because pymongo's server selection cannot
+        conclude before one heartbeat interval and ``MIN_HEARTBEAT_INTERVAL`` is 0.5s. Verified with raw
+        pymongo at ``serverSelectionTimeoutMS`` of both 50 and 10: 0.504s each time. So the list keeps one
+        call per distinct path, a find, an upsert, an aggregation, the index path and both memory
+        directions, and drops ``delete``, ``list`` and ``delete_prefix``, which are variants of paths
+        already here. That is 3.0s of the unit tier instead of 4.5s.
+        """
+        tracer = trace.get_tracer("at117.host")
+        config: MongoDBConfig = {"database": "appdb", "connection_string": LEAKY_UNREACHABLE}
+        storage = MongoDBStorage(config, collection="at117")
+        store = MongoDBMemoryStore(
+            name="at117",
+            config=config,
+            collection="at117_memory",
+            scope="at117",
+            writable=True,
+        )
+
+        try:
+            with tracer.start_as_current_span("host.agent.invocation"):
+                _client.resolve(config)
+                for call in ("read", "search"):
+                    with contextlib.suppress(StorageError):
+                        await getattr(storage, call)("session/at117")
+                with contextlib.suppress(StorageError):
+                    await storage.write("session/at117", b'{"kind": "snapshot"}')
+                with contextlib.suppress(StorageError):
+                    await store.initialize()
+                with contextlib.suppress(StorageError):
+                    await store.add("a memory this test writes")
+                with contextlib.suppress(StorageError):
+                    await store.search("memory")
+                store.get_tools()
+        finally:
+            await storage.close()
+            await store.close()
+
+        finished = exported_spans.get_finished_spans()
+        assert finished, "no span was exported, so this test proved nothing"
+        _assert_no_span_leaks(finished)
+
+    @pytest.mark.contract
+    async def test_the_succeeding_path_emits_no_span_that_carries_the_password(
+        self,
+        contract_uri: str,
+        test_database_name: str,
+        unique_collection_name: str,
+        exported_spans: InMemorySpanExporter,
+    ) -> None:
+        """The same exercise where every call works, which is the half the failing path cannot cover.
+
+        The instrumentation a later version would add records an operation name, a duration and a result count.
+        Two of those three are only known once a call has succeeded, so a leak could plausibly live on a
+        line that a failing exercise never reaches. This is that line's coverage.
+
+        Same recipe as ``test_memory_store.py``'s succeeding half: an injected client that reaches the real
+        deployment, alongside a ``connection_string`` that still holds a secret. Nothing else produces a
+        config that both works and carries a password, and that combination is what ``REQ-E-014`` and
+        ``REQ-E-114`` are both about.
+
+        ``search`` is allowed to fail. A deployment without a search process refuses it, and this test is
+        about spans rather than about search tiers.
+        """
+        client: AsyncMongoClient[Any] = AsyncMongoClient(contract_uri)
+        # The real host, reached with the real client, described by a URI carrying a password the server
+        # would reject. Written inline rather than borrowing `test_memory_store.py`'s helper: reaching
+        # across modules for two lines ties their collection order together.
+        scheme, _, rest = contract_uri.partition("://")
+        config: dict[str, Any] = {
+            "client": client,
+            "connection_string": f"{scheme}://appuser:SUPERSECRET@{rest.partition('@')[2] or rest}",
+            "database": test_database_name,
+        }
+        storage = MongoDBStorage(config, collection=unique_collection_name)  # type: ignore[arg-type]
+        store = MongoDBMemoryStore(
+            name="at117",
+            config=config,  # type: ignore[arg-type]
+            collection=f"{unique_collection_name}_memory",
+            scope="at117",
+            writable=True,
+        )
+        tracer = trace.get_tracer("at117.host")
+
+        try:
+            with tracer.start_as_current_span("host.agent.invocation"):
+                await storage.write("session/at117", b'{"kind": "snapshot"}')
+                await storage.read("session/at117")
+                await storage.list("session/")
+                with contextlib.suppress(StorageError):
+                    await storage.search("snapshot")
+                await storage.delete("session/at117")
+                with contextlib.suppress(StorageError):
+                    await store.add("a memory this test writes")
+                with contextlib.suppress(StorageError):
+                    await store.search("memory")
+        finally:
+            await storage.close()
+            await store.close()
+            # `close()` never closes an injected client (`REQ-E-010`), which is the asymmetry that lets
+            # this config hold a secret at all.
+            await client.close()
+
+        finished = exported_spans.get_finished_spans()
+        assert finished, "no span was exported, so this test proved nothing"
+        _assert_no_span_leaks(finished)
+
+
 class TestTheLockFollowsTheEventLoop:
     """AT-017 / REQ-E-017 — the event-loop boundary, and a failure mode worse than the requirement implies.
 
@@ -725,8 +994,11 @@ class TestTheLockFollowsTheEventLoop:
         """The realistic shape: each invocation resolves the config for itself and hits the cache.
 
         The cache hit is what makes this interesting. A fresh resolution would return a fresh lock and
-        never exercise the rebinding, so an implementation that rebinds nothing would pass. Sharing
-        the entry across loops is exactly what ``REQ-E-012`` requires.
+        never exercise the rebinding, so an implementation that rebinds nothing would pass.
+
+        Both resolutions here run with no loop running, which is why they still share one entry:
+        ``REQ-E-017a`` splits the registry per running loop, and neither of these calls has one. The
+        entry a caller shares across loops is the loop-free slot, not a loop's own.
         """
         config: MongoDBConfig = {"database": "appdb", "connection_string": "mongodb://127.0.0.1:1/"}
 
@@ -766,3 +1038,220 @@ class TestTheLockFollowsTheEventLoop:
         first, second = asyncio.run(two_views())
 
         assert first is second
+
+
+class TestTheClientFollowsTheEventLoop:
+    """AT-091 / REQ-E-017a — the event-loop boundary again, on the half ``AT-017`` left alone.
+
+    ``AT-017`` rebinds the lock and stops there, and the class above it says so in its own name. The
+    client is the other per-loop object and the one that actually raises: measured on pymongo 4.17.0,
+    ``AsyncMongoClient`` records the running loop on its first operation and every later operation from
+    a different loop raises ``RuntimeError: Cannot use AsyncMongoClient in different event loop``.
+
+    Why the whole existing suite passed with this broken: every fixture is function-scoped, and every
+    test that builds a store closes it, which pops the registry entry before the next loop asks for one.
+    The failure needs a store that **outlives** one loop, which is what a synchronous ``Agent`` is and
+    what no test had.
+
+    These assertions are on the registry rather than on a write, because the observable difference is
+    which client comes back. ``AT-091b`` in ``test_storage.py`` makes the same claim against a real
+    deployment, where the wrong answer is a ``RuntimeError`` instead of a failed identity check.
+    """
+
+    CONFIG: MongoDBConfig = {"database": "appdb", "connection_string": "mongodb://127.0.0.1:1/"}
+
+    @staticmethod
+    def _resolve_on_a_fresh_loop(config: MongoDBConfig) -> Any:
+        """Resolve a config inside its own ``asyncio.run``, then let that loop close.
+
+        ``asyncio.run`` is the point rather than an implementation detail: it creates a loop, runs, and
+        closes it, which is exactly what ``strands/_async.py`` does for every synchronous entry point.
+
+        Args:
+            config: The config to resolve.
+
+        Returns:
+            The connection that was resolved on that now-dead loop.
+        """
+
+        async def body() -> Any:
+            return _client.resolve(config)
+
+        return asyncio.run(body())
+
+    def test_two_successive_loops_get_two_clients(self) -> None:
+        """The requirement. One client cannot serve both, so resolving twice must not share one."""
+        first = self._resolve_on_a_fresh_loop(self.CONFIG)
+        second = self._resolve_on_a_fresh_loop(self.CONFIG)
+
+        assert first.client is not second.client
+
+    def test_the_dead_loops_entry_is_dropped_rather_than_accumulated(self) -> None:
+        """The registry's bound. Ten loops must not leave ten entries in a process-global dict."""
+        for _ in range(10):
+            self._resolve_on_a_fresh_loop(self.CONFIG)
+
+        assert len(_client._REGISTRY) == 1, sorted(str(key) for key in _client._REGISTRY)
+
+    def test_one_loop_still_shares_one_client_across_many_resolutions(self) -> None:
+        """``REQ-E-012`` unchanged, which is the thing a per-loop key could plausibly break.
+
+        Resolving inside one loop has to keep returning the same connection, or every store in an
+        ordinary async application opens its own pool.
+        """
+
+        async def resolve_thrice() -> list[Any]:
+            return [_client.resolve(self.CONFIG) for _ in range(3)]
+
+        connections = asyncio.run(resolve_thrice())
+
+        assert len({id(connection.client) for connection in connections}) == 1
+
+    def test_a_client_built_outside_any_loop_is_adopted_rather_than_replaced(self) -> None:
+        """The ``None`` slot, and the reason it exists.
+
+        Construction from module-level code has no running loop to key on, and the client it builds is
+        unbound until its first operation. Handing that client to the first loop that asks keeps the
+        common arrangement, construct at import and use on one loop, at one pool. Building a second
+        would leave the first open, unused, and never closed.
+        """
+        before = _client.resolve(self.CONFIG)
+
+        async def resolve_inside() -> Any:
+            return _client.resolve(self.CONFIG)
+
+        after = asyncio.run(resolve_inside())
+
+        assert after.client is before.client
+        assert len(_client._REGISTRY) == 1
+
+    def test_two_live_loops_each_get_their_own_client(self) -> None:
+        """The case that is not sequential, and the one the storage example hits.
+
+        ``SnapshotSessionManager.initialize`` is a synchronous hook that runs its read on a fresh loop
+        in a worker thread while the caller's loop is still running. Both loops are alive at once, so
+        replacing one entry with the other would hand a live loop a client bound elsewhere.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        async def outer() -> tuple[Any, Any, Any]:
+            mine = _client.resolve(self.CONFIG)
+
+            def in_a_worker() -> Any:
+                async def body() -> Any:
+                    return _client.resolve(self.CONFIG)
+
+                return asyncio.run(body())
+
+            with ThreadPoolExecutor() as executor:
+                theirs = executor.submit(in_a_worker).result()
+            # Resolved again after the worker's loop closed: the caller's own loop must still get its
+            # own client back, not the one the worker built and abandoned.
+            return mine, theirs, _client.resolve(self.CONFIG)
+
+        mine, theirs, again = asyncio.run(outer())
+
+        assert theirs.client is not mine.client
+        assert mine.client is again.client
+
+    def test_an_injected_client_is_never_split_across_loops(self) -> None:
+        """The carve-out. We cannot build a second copy of a client we were handed.
+
+        A caller who injects one client and drives it from two loops gets pymongo's ``RuntimeError``,
+        and that is the right owner for the mistake. What this package must not do is quietly open a
+        second pool the caller never asked for and cannot close.
+        """
+        injected: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/")
+        config: MongoDBConfig = {"database": "appdb", "client": injected}
+
+        first = self._resolve_on_a_fresh_loop(config)
+        second = self._resolve_on_a_fresh_loop(config)
+
+        assert first.client is injected
+        assert second.client is injected
+        assert len(_client._REGISTRY) == 1
+
+    def test_close_releases_every_loops_slot_for_the_identity(self) -> None:
+        """``close()`` is per config, and a per-loop key must not turn that into per config per loop.
+
+        A caller who closes once and finds a pool still registered has a leak no further call can reach,
+        because nothing in the public API names a loop. Synchronous, like the tests above it, because a
+        closing loop is half of what is being asserted and pytest-asyncio would supply the loop instead.
+        """
+        self._resolve_on_a_fresh_loop(self.CONFIG)
+
+        async def resolve_then_close() -> None:
+            _client.resolve(self.CONFIG)
+            assert len(_client._REGISTRY) >= 1
+            await _client.close(self.CONFIG)
+
+        asyncio.run(resolve_then_close())
+
+        assert _client._REGISTRY == {}
+
+
+class TestConcurrentClosesOnOneIdentity:
+    """AT-091d / REQ-E-017c — three stores shutting down at once, which is the ordinary shape.
+
+    ``examples/memory_recall.py write`` ends with
+    ``asyncio.gather(curator.close(), writable.close(), curated.close())``. Three stores, one connection
+    identity, one call each. That raised ``KeyError`` against the live cluster and never once in the
+    suite, because every test until now closed one config at a time.
+
+    Reproducing it needs two things at the same time: more than one slot for the identity, which
+    ``REQ-E-017a`` introduced, and a real suspension inside the first caller's ``client.close()``, which
+    is what lets the second caller run and drop a slot the first one still has on its list. A dead loop's
+    slot is the cheapest second slot, and the closed client below is the cheapest way to make one.
+    """
+
+    CONFIG: MongoDBConfig = {"database": "appdb", "connection_string": "mongodb://127.0.0.1:1/"}
+
+    @staticmethod
+    def _slot_for_a_dead_loop() -> None:
+        """Leave one entry behind whose loop has closed, without going through ``resolve``.
+
+        A plain ``asyncio.run`` that resolves and returns would leave exactly this, and ``resolve``
+        reaps it on the next miss. Built by hand so the reap cannot race the test into passing.
+        """
+        dead = asyncio.new_event_loop()
+        dead.close()
+        client: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/")
+        identity = _client._identity(TestConcurrentClosesOnOneIdentity.CONFIG)
+        _client._REGISTRY[(identity, dead)] = _client._Connection(client=client, owned=True)
+
+    def test_three_concurrent_closes_release_every_slot_without_raising(self) -> None:
+        """The failure this reproduces is a ``KeyError`` from a teardown path, which is the worst place."""
+
+        async def body() -> None:
+            _client.resolve(self.CONFIG)
+            self._slot_for_a_dead_loop()
+            assert len(_client._REGISTRY) == 2
+
+            await asyncio.gather(*(_client.close(self.CONFIG) for _ in range(3)))
+
+        asyncio.run(body())
+
+        assert _client._REGISTRY == {}
+
+    def test_a_slot_removed_mid_iteration_is_treated_as_already_released(self) -> None:
+        """The same hazard from the other direction: ``resolve``'s reap, not a second ``close``.
+
+        ``close()`` snapshots the identity's keys and then suspends on the first client's ``endSessions``.
+        Anything that removes a slot during that window has to leave the rest of the iteration standing.
+        """
+
+        async def body() -> None:
+            _client.resolve(self.CONFIG)
+            self._slot_for_a_dead_loop()
+            keys = list(_client._REGISTRY)
+
+            closing = asyncio.ensure_future(_client.close(self.CONFIG))
+            # One turn of the loop is enough: `close()` reaches its first `await` and the entry the
+            # snapshot's second key names is still there for this line to take.
+            await asyncio.sleep(0)
+            _client._REGISTRY.pop(keys[-1], None)
+            await closing
+
+        asyncio.run(body())
+
+        assert _client._REGISTRY == {}
