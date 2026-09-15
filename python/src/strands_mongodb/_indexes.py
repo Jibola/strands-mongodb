@@ -35,7 +35,7 @@ import logging
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple
 
 from strands_mongodb._extras import missing_extra
 from strands_mongodb._filter import BAKED_IN_FILTER_FIELDS
@@ -63,7 +63,9 @@ __all__ = [
     "IndexSpec",
     "POLL_INTERVAL_SECONDS",
     "READY_TIMEOUT_SECONDS",
+    "SEARCH_UNSUPPORTED_CODES",
     "SearchIndexSpec",
+    "SearchSupport",
     "VectorMode",
     "declared_filter_fields",
     "drop_index_command",
@@ -71,6 +73,7 @@ __all__ = [
     "memory_search_specs",
     "memory_specs",
     "readiness",
+    "search_support",
     "storage_specs",
     "text_index_definition",
     "vector_index_definition",
@@ -122,8 +125,53 @@ _READY_STATUS: Final[str] = "READY"
 _FAILED_STATUS: Final[str] = "FAILED"
 _NAMESPACE_EXISTS: Final[int] = 48
 
+SEARCH_UNSUPPORTED_CODES: Final[frozenset[int]] = frozenset({31082, 115, 6047401})
+"""Server error codes meaning "this deployment has no Atlas Search", as ``list_search_indexes()`` reports.
+
+A set rather than one code, because four deployments answer this probe with three different numbers
+(``REQ-E-053a`` holds the table). Measured 2026-09-02, on the ``list_search_indexes()`` surface:
+
+* **31082** on ``mongo:8``, reported version 8.3.8 with ``modules: []``. Every search surface on that
+  deployment answers with this one, which is why it was long the only member here.
+* **115**, ``CommandNotSupported``, on ``mongod`` 7.0.12 with ``modules: ['enterprise']``. That build
+  carries mongot support and has none configured, so its query stages answer 31082 while its
+  search-index commands answer this.
+* **6047401** on ``mongo:6`` 6.0.28 and ``mongo:7`` 7.0.40, both ``modules: []``, *"$listSearchIndexes
+  stage is only allowed on MongoDB Atlas"*.
+
+Ordinary index creation and every CRUD path work normally on all four. Two things the readings settle.
+The message is not a candidate key, since it differs between the four deployments and between surfaces
+on one of them, and neither is ``codeName``: the same numeric 31082 is ``SearchNotEnabled`` on 8.3.8 and
+``Location31082`` on 7.0.12. The number is the stable part.
+
+Code 59, ``CommandNotFound``, means the same thing at ``create_search_index`` on 6.0.28 and 7.0.40, and
+is deliberately absent. That call runs only after :func:`search_support` has cleared the deployment, so
+a member matching it would be unreachable. ``AT-053d`` asserts the exclusion so it stays a decision.
+"""
+
+_COLLECTION_ABSENT: Final[int] = 26
+"""Server error code for a namespace that does not exist. Not an error when reading indexes."""
+
 Readiness = Literal["ready", "building", "failed"]
 """The three states ``REQ-E-062`` distinguishes, because the remedy differs between them."""
+
+
+class SearchSupport(NamedTuple):
+    """What :func:`search_support` found, which is an answer and the evidence for it.
+
+    Two fields rather than a ``bool`` because ``REQ-E-053a`` asks the warning and the later query failure
+    to name *the server's own code*, and the only place that code exists is inside the probe. Returning
+    it means an operator on 7.0.40 reads 6047401 in the message and can match it against their own log,
+    where a fixed 31082 sent them looking for an error their server never emitted.
+
+    Attributes:
+        available: Whether the deployment runs Atlas Search.
+        code: The server error code that said it does not, or ``None``. Set only when ``available`` is
+            ``False``, which is the invariant every reader of this record may assume.
+    """
+
+    available: bool
+    code: int | None = None
 
 
 def readiness(status: str) -> Readiness:
@@ -535,6 +583,59 @@ def memory_search_specs(config: MongoDBConfig) -> tuple[SearchIndexSpec, ...]:
     )
 
 
+async def search_support(collection: AsyncCollection[Any]) -> SearchSupport:
+    """Report whether this deployment can run Atlas Search at all, and on what evidence.
+
+    ``REQ-E-053a``. Asked before :func:`ensure` is given a ``search`` set, so a deployment without
+    mongot gets its ordinary indexes and a warning instead of a failure. The alternative, letting
+    ``createSearchIndexes`` fail and treating a member of :data:`SEARCH_UNSUPPORTED_CODES` as benign
+    wherever it turns up, would also swallow the code on a deployment that has mongot and is
+    misconfigured, which is ``REQ-E-061``'s condition and has a different remedy.
+
+    ``list_search_indexes`` is the probe rather than a ``buildInfo`` read of ``modules``, because what
+    the caller needs to know is whether the *call* works. ``mongo:8`` reports version 8.3.8 with an
+    empty ``modules`` list and no search, an Atlas CLI local deployment reports the same empty list and
+    has search, so the version document cannot distinguish them. The reading that settles it is
+    ``mongod`` 7.0.12, which reports ``modules: ['enterprise']`` and has no search: on the four measured
+    deployments the module list does not merely fail to separate them, it points the wrong way.
+
+    Named for what it returns rather than ``search_available``, which it replaced. The old
+    name invited ``if await search_available(...)``, and a two-field record is always truthy, so keeping
+    it would have turned every caller into a silent always-has-search bug.
+
+    Args:
+        collection: The collection whose deployment to probe. Need not exist.
+
+    Returns:
+        :class:`SearchSupport`. ``available`` is ``True`` if the deployment answers the call, ``False``
+        if it answers with one of :data:`SEARCH_UNSUPPORTED_CODES`, in which case ``code`` carries the
+        one it used.
+
+    Raises:
+        StorageError: If the call fails for any other reason, including authentication. A probe that
+            reported ``False`` on a bad password would send the caller looking for the wrong problem.
+    """
+    try:
+        cursor = await collection.list_search_indexes()
+        async for _ in cursor:
+            break
+    except OperationFailure as error:
+        if error.code in SEARCH_UNSUPPORTED_CODES:
+            return SearchSupport(available=False, code=error.code)
+        # An absent collection has no indexes, which answers the question asked here: the call worked.
+        if error.code != _COLLECTION_ABSENT:
+            raise StorageError(
+                f"strands_mongodb: probing Atlas Search support on "
+                f"{collection.database.name}.{collection.name} failed: {error}"
+            ) from error
+    except PyMongoError as error:
+        raise StorageError(
+            f"strands_mongodb: probing Atlas Search support on "
+            f"{collection.database.name}.{collection.name} failed: {error}"
+        ) from error
+    return SearchSupport(available=True)
+
+
 async def ensure(
     collection: AsyncCollection[Any],
     *,
@@ -717,7 +818,7 @@ async def _read_search_index(collection: AsyncCollection[Any], name: str, namesp
         # A collection that does not exist has no indexes, which is the answer rather than an error.
         # `list_indexes` already normalises this for ordinary indexes; the aggregate behind
         # `$listSearchIndexes` is not documented to, so it is normalised here.
-        if error.code != 26:
+        if error.code != _COLLECTION_ABSENT:
             raise StorageError(
                 f"strands_mongodb: reading search index {name!r} on {namespace} failed: {error}"
             ) from error
