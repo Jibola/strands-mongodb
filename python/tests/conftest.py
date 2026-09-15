@@ -47,7 +47,7 @@ import textwrap
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator, MutableMapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 import pytest
 
@@ -537,6 +537,57 @@ def atlas_uri() -> str:
 def autoembed_uri() -> str:
     """Connection string for a cluster with a registered Atlas embedding model."""
     return _require("MONGODB_AUTOEMBED_URI")
+
+
+HOST_UNREACHABLE: Final[int] = 6
+"""``HostUnreachable``, the server error code that says a process in the deployment did not answer.
+
+Measured on 2026-09-15 against an Atlas CLI local deployment: ``$vectorSearch`` raised
+``OperationFailure('Error connecting to localhost:28000 (127.0.0.1:28000) :: caused by ::
+Connection refused', 6)``. The 28000 is mongot, which the CLI runs as a separate process beside
+``mongod``, so the database answered every other call in the same run and only search failed.
+"""
+
+
+def skip_if_search_is_unreachable(error: BaseException) -> None:
+    """Skip the running test if ``error`` is the deployment's search process refusing connections.
+
+    ``REQ-E-124``. The problem this solves is a real one, and it cost a whole tier report: mongot was
+    down, every search-shaped test failed, and the report read as though this package had broken
+    searching. A failure the operator has to fix is not a failure the suite should assert on, and a
+    skip that names the process is the difference between "go restart mongot" and an afternoon.
+
+    **Deliberately narrow, in two ways.** It matches one code, and code 6 means a process in the
+    deployment did not answer at all -- not that it answered badly. And it is called from the two
+    search helpers alone, so a write or an index call that fails for the same reason still fails.
+    Widening either would turn a package regression into a skip, which is worse than the failure it
+    is avoiding.
+
+    The code is looked for on the error **and** on its cause, because the two callers hold different
+    shapes of the same failure: ``test_memory_store.py`` goes through this package and catches a
+    ``StorageError`` carrying the driver's error chained, while ``test_pipeline.py`` drives the driver
+    directly and catches the ``OperationFailure`` itself. One chain walk reads both.
+
+    Args:
+        error: The exception a search call raised. Anything else returns, so the caller re-raises.
+
+    Raises:
+        Skipped: via ``pytest.skip``, when ``error`` or its cause carries code 6.
+    """
+    if not any(getattr(link, "code", None) == HOST_UNREACHABLE for link in (error, error.__cause__)):
+        return
+    # Both links, rather than whichever one was caught. This package's error names the namespace and
+    # the operation; the driver's names the host and port that refused, which is the process to go and
+    # restart. `REQ-E-124` asks for both, and building the message from the chain rather than trusting
+    # the wrapper to have embedded its cause is what makes that true of every caller.
+    chain = [str(error)]
+    if error.__cause__ is not None and str(error.__cause__) not in chain[0]:
+        chain.append(str(error.__cause__))
+    pytest.skip(
+        f"this deployment's search process is unreachable, so the failure is infrastructure rather "
+        f"than a package regression and asserting on it would report the wrong thing: "
+        f"{' :: caused by :: '.join(chain)}"
+    )
 
 
 async def _drop_database(uri: str, database: str) -> None:

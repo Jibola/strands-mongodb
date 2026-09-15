@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 from bson import ObjectId
+from conftest import skip_if_search_is_unreachable
 from pymongo import AsyncMongoClient
 from pymongo.errors import DuplicateKeyError, OperationFailure
 from strands.memory import MemoryManager
@@ -1269,6 +1270,8 @@ class _SetupRecorder:
         probes: The collection name for each capability probe.
         ordinary: One entry per ordinary ``ensure`` call, holding the spec names it carried.
         search: The name of each search index that was created, in creation order.
+        timeouts: The ``timeout`` keyword of every call, ordinary and search alike, in call order.
+            ``None`` for a call that passed none, which is the failure ``AT-126`` exists to catch.
         failing: Index names to refuse.
         available: What the capability probe answers.
     """
@@ -1277,6 +1280,7 @@ class _SetupRecorder:
         self.probes: list[str] = []
         self.ordinary: list[tuple[str, ...]] = []
         self.search: list[str] = []
+        self.timeouts: list[float | None] = []
         self.failing = failing
         self.available = available
 
@@ -1309,12 +1313,14 @@ class _SetupRecorder:
             collection: Ignored; the specs are the claim.
             ordinary: Ordinary index specs.
             search: Search index specs, one per call from ``_ensure_search_tiers``.
-            **kwargs: ``create``, ``timeout`` and ``interval``, none of which is asserted here.
+            **kwargs: ``create``, ``timeout`` and ``interval``. ``timeout`` is recorded for
+                ``AT-126``; the other two are not asserted here.
 
         Raises:
             StorageError: If a search spec's name is in :attr:`failing`, which is how the real function
                 reports a build the server refused.
         """
+        self.timeouts.append(kwargs.get("timeout"))
         if ordinary:
             self.ordinary.append(tuple(spec.name for spec in ordinary))
         for spec in search:
@@ -1344,6 +1350,42 @@ def _patch_setup(
     monkeypatch.setattr(_indexes, "search_support", recorder.probe)
     monkeypatch.setattr(_indexes, "ensure", recorder.ensure)
     return recorder
+
+
+class TestTheIndexReadyBudgetComesFromTheConfig:
+    """AT-126 / ``REQ-E-122`` — the memory store's half of one config key, at both call sites.
+
+    ``initialize()`` calls ``_indexes.ensure`` once for the ordinary specs and once per search tier, and
+    only the search calls wait on anything. That asymmetry is the trap: a change that threads the key
+    through the call that obviously needs it leaves the other one on the module default, and nothing
+    observable differs until somebody raises the budget and finds half of it ignored. Both calls are
+    asserted here, and ``test_indexes.py`` asserts that the set of call sites is the set checked.
+
+    The default case matters as much as the override. ``REQ-E-123`` raised the module constant to 300
+    seconds, and a store that read the key with a hard-coded fallback of its own would keep the old
+    number alive in a second place.
+    """
+
+    async def test_every_call_carries_the_configured_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _patch_setup(monkeypatch)
+        store = _store(config=_connection_config(index_ready_timeout=7))
+
+        await store.initialize()
+
+        # One ordinary call plus one per search tier, all of them carrying the caller's number rather
+        # than the module's. `set` rather than a positional check: which tiers run is `AT-078`'s claim.
+        assert len(recorder.timeouts) == 1 + len(recorder.search)
+        assert set(recorder.timeouts) == {7}
+
+    async def test_absence_resolves_to_the_module_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Read through ``_indexes.READY_TIMEOUT_SECONDS`` rather than compared to a literal, so this
+        keeps testing the wiring rather than restating ``AT-125``."""
+        recorder = _patch_setup(monkeypatch)
+        store = _store()
+
+        await store.initialize()
+
+        assert set(recorder.timeouts) == {_indexes.READY_TIMEOUT_SECONDS}
 
 
 class TestWhatInitializeDecides:
@@ -2435,7 +2477,14 @@ async def _answered(
     results: list[Any] = []
     deadline = time.monotonic() + budget
     while True:
-        results = list(await store.search(query))
+        try:
+            results = list(await store.search(query))
+        except StorageError as error:
+            # `REQ-E-124`. Around the search call alone, and only for the one code that means mongot
+            # never answered. Every caller below reaches search through this helper, so this is the
+            # whole of the memory store's exposure; anything that fails elsewhere still fails.
+            skip_if_search_is_unreachable(error)
+            raise
         if len(results) >= expected or time.monotonic() >= deadline:
             return results
         await asyncio.sleep(0.5)

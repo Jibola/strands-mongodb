@@ -23,8 +23,9 @@ import time
 from typing import TYPE_CHECKING, Any, Final
 
 import pytest
+from conftest import skip_if_search_is_unreachable
 from pymongo import AsyncMongoClient
-from pymongo.errors import OperationFailure
+from pymongo.errors import OperationFailure, PyMongoError
 
 from strands_mongodb import _indexes, _pipeline
 
@@ -608,7 +609,13 @@ async def _until_answered(
     results: list[Any] = []
     deadline = time.monotonic() + budget
     while True:
-        results = await (await collection.aggregate(pipeline)).to_list()
+        try:
+            results = await (await collection.aggregate(pipeline)).to_list()
+        except PyMongoError as error:
+            # `REQ-E-124`. This helper drives the driver directly, so the code is on the error itself
+            # rather than on a cause; the guard reads both, which is why one helper serves both files.
+            skip_if_search_is_unreachable(error)
+            raise
         if results or time.monotonic() >= deadline:
             return results
         await asyncio.sleep(0.5)

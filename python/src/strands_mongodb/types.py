@@ -114,6 +114,11 @@ class MongoDBConfig(TypedDict, total=False):
             ``client`` is supplied, since that client is already configured.
         ensure_indexes: Whether to create missing indexes on ``initialize()``. Defaults to ``True``.
             Verification always runs, so ``False`` means verify-only rather than skip.
+        index_ready_timeout: Seconds to wait for a search index to report ``READY``, in total across
+            every index one call creates. Defaults to ``_indexes.READY_TIMEOUT_SECONDS``, which is a
+            measurement against a development cluster and cannot cover the case this key exists for: a
+            shared deployment where a build queues behind somebody else's. Raising it changes
+            when a failure arrives, not when a success does.
         search_type: Tier to search with. Defaults to ``"auto"``, which resolves to the best tier the
             deployment supports and warns when it lands below vector.
         embedding_model: Atlas embedding model name for the AutoEmbeddings path, both in the index
@@ -139,6 +144,7 @@ class MongoDBConfig(TypedDict, total=False):
     connection_string: str
     client_args: dict[str, Any]
     ensure_indexes: bool
+    index_ready_timeout: float
     search_type: SearchType
     embedding_model: str
     embedding_dimensions: int
