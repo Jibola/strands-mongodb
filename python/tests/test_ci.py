@@ -193,8 +193,8 @@ class TestTheGatesEveryChangeMustPass:
         """``hatch run test`` with no selector, which is the unit tier plus whatever tiers have variables.
 
         No tier variable is set for this job, so `conftest.py`'s gate skips the three that need a backend
-        and the run is the 680-test unit tier. That is the tier CI can have today, and the
-        contract tier's deployment is still undecided.
+        and the run is the 680-test unit tier. The contract tier has a job of its own, beside this one, with
+        a service container and ``MONGODB_URI`` pointed at it.
         """
         assert any("hatch run test" in block for block in _run_blocks(workflow)), "no step runs the test suite"
 
@@ -268,8 +268,8 @@ class TestBothCoverageFloorsAreEnforced:
     """AT-106 / REQ-E-106 -- the aggregate floor and the per-module floor, in the one job that measures once.
 
     Measured before this was written: on the unit tier alone the aggregate is 97.01% and the weakest module
-    is 89.47%, against floors of 90% and 70%. So the job passes with no connection string, which is why it
-    is not waiting on a deployment decision.
+    is 89.47%, against floors of 90% and 70%. So the job passes with no connection string, which is why the
+    floors were enforceable before any tier had a deployment.
     """
 
     def test_a_job_runs_the_coverage_gate(self, workflow: dict[str, Any]) -> None:
@@ -364,6 +364,33 @@ class TestTheWeeklyCanaryAgainstTheLatestSDK:
             f"the canary never typechecks, so an added Protocol member goes unreported; its steps run {runs}"
         )
 
+    def test_the_canary_runs_the_contract_tier_against_the_upgraded_sdk(self, workflow: dict[str, Any]) -> None:
+        """The clause of this item that was unmet for eight tasks, and the reason it was unmet is gone.
+
+        The canary is specified to run the contract tier beside both protocol checks. ``REQ-E-107``
+        deferred that clause on the grounds that the tier "would cost the contract tier a deployment",
+        which was true of the two deployments considered then -- a repository secret and a provisioned
+        cluster. A service container is neither, so the clause is now free and the deferral no longer
+        has a reason behind it.
+
+        Asserted after the upgrade for the same reason the compat selector is: a tier that runs before
+        ``pip install --upgrade`` tests the pinned SDK and reports green about the wrong version.
+        """
+        job = workflow["jobs"]["sdk-compat"]
+        runs = _run_blocks(job)
+
+        assert "MONGODB_URI" in (job.get("env") or {}), (
+            "the canary sets no MONGODB_URI, so every contract test in it skips and the cron reports a pass"
+        )
+
+        upgrades = [index for index, block in enumerate(runs) if "--upgrade strands-agents" in block]
+        selects = [index for index, block in enumerate(runs) if "-m contract" in block]
+        assert selects, f"the canary never selects the contract tier; its steps run {runs}"
+        assert min(upgrades) < min(selects), (
+            f"the upgrade happens at step {min(upgrades)} and the contract tier runs at step {min(selects)}, "
+            f"so the tier ran against the pinned SDK"
+        )
+
 
 class TestTheCompatTierSelectsBothProtocolChecks:
     """AT-119 / REQ-E-117 -- the canary runs ``-m compat``, so a check without that marker never runs.
@@ -409,12 +436,140 @@ class TestTheCompatTierSelectsBothProtocolChecks:
         )
 
 
+class TestTheContractTierRunsOnEveryChange:
+    """AT-130 / REQ-E-127 -- the tier a service container satisfies, gated on every change rather than on a secret.
+
+    ``conftest.py`` defines the tier as "any real MongoDB, including a plain ``mongod``", and this package
+    opens no transaction, no session and no change stream, so nothing in it needs a replica set. A GitHub
+    Actions service container is therefore a real MongoDB by the tier's own definition, and it needs no
+    secret, no provisioning step and no access list.
+
+    The value of running it here is arrival time. The first run that pointed ``MONGODB_URI`` at a plain
+    deployment found one class relying on the wider tier; that finding is worth having on a pull request
+    rather than much later, and this job is what makes it arrive there.
+    """
+
+    @staticmethod
+    def _jobs_setting(workflow: dict[str, Any], variable: str) -> dict[str, dict[str, Any]]:
+        """Every job whose ``env:`` block sets ``variable``, keyed by job name."""
+        return {name: job for name, job in workflow["jobs"].items() if variable in (job.get("env") or {})}
+
+    def test_every_job_setting_the_contract_variable_runs_the_tier(self, workflow: dict[str, Any]) -> None:
+        """Both halves, because either alone is a job that reports green without asserting anything.
+
+        A job that sets the variable and never selects the tier runs the unit tier twice. A job that selects
+        the tier with no variable set reports every contract test as skipped, which a green check reads as
+        passed -- the exact failure ``tests/test_tier_gating.py`` spends five of its six classes on.
+
+        Two jobs set it: the one that gates a change, and the weekly canary, which runs the same tier
+        against the newest published SDK. Asserted over all of them rather than over a count, so a third
+        cannot arrive half-wired.
+        """
+        setting = self._jobs_setting(workflow, "MONGODB_URI")
+        assert setting, "no job sets MONGODB_URI, so the contract tier runs nowhere"
+
+        silent = {name: _run_blocks(job) for name, job in setting.items()}
+        silent = {name: runs for name, runs in silent.items() if not any("-m contract" in block for block in runs)}
+        assert silent == {}, f"these jobs set MONGODB_URI and never select the tier it is for: {silent}"
+
+    def test_every_deployment_is_a_service_container_rather_than_a_credential(self, workflow: dict[str, Any]) -> None:
+        """The half that makes this free, and the half a future edit is most likely to undo.
+
+        A maintainer who wanted the tier run against a cluster would reach for a repository secret, which
+        puts a live credential in a repository this package is moving out of. The container is the answer
+        that needs no such decision, so the image is asserted rather than left as a comment.
+        """
+        for name, job in self._jobs_setting(workflow, "MONGODB_URI").items():
+            services = job.get("services") or {}
+            images = [service.get("image", "") for service in services.values()]
+            assert any(image.split(":")[0] == "mongo" for image in images), (
+                f"the {name} job declares no MongoDB service container; its services are {services}"
+            )
+
+            uri = job["env"]["MONGODB_URI"]
+            assert "secrets." not in uri, (
+                f"the {name} job reaches for a credential rather than the container beside it: {uri!r}"
+            )
+            assert "localhost" in uri or "127.0.0.1" in uri, (
+                f"the {name} job's connection string is {uri!r}, which does not point at that container"
+            )
+
+    def test_the_tier_gates_a_change_rather_than_only_the_cron(self, workflow: dict[str, Any]) -> None:
+        """Pull requests are specified to gate on this tier, so weekly alone is the wrong cadence.
+
+        The canary runs it too, and that is a different claim: weekly against the newest SDK, which is
+        ``AT-107``'s subject rather than this one's. What this asserts is that a change does not merge
+        without it.
+        """
+        conditions = {name: job.get("if") for name, job in self._jobs_setting(workflow, "MONGODB_URI").items()}
+
+        assert "github.event_name != 'schedule'" in conditions.values(), (
+            f"no job runs the contract tier on a change; the jobs that set MONGODB_URI are {conditions}"
+        )
+
+
+class TestTheTiersThatNeedAClusterRunOnlyOnTheSchedule:
+    """AT-131 / REQ-E-128 -- the other half, where a secret is unavoidable and a pull request is the wrong trigger.
+
+    ``integration`` needs mongot and ``autoembed`` needs a cluster with a registered embedding model, so
+    neither can be stood up by a container. Both therefore run against a repository secret, on the cron, for
+    two reasons that point the same way: a pull request from a fork receives no secret, so the tiers would
+    skip on exactly the contributions that most need checking and report the skip as a pass; and they cost
+    33 minutes of wall clock against a cloud cluster when measured, which is not a gate anybody keeps.
+
+    The trigger is what this class asserts, rather than the intent behind it.
+    """
+
+    #: The two variables that can only be satisfied by a cluster, and so can only arrive as secrets.
+    CLUSTER_VARIABLES = ("MONGODB_ATLAS_URI", "MONGODB_AUTOEMBED_URI")
+
+    def test_every_job_holding_a_cluster_secret_runs_only_on_the_schedule(self, workflow: dict[str, Any]) -> None:
+        """One condition per job rather than per variable: a second job is as exposed as a second key."""
+        holders = {
+            name: job
+            for name, job in workflow["jobs"].items()
+            if any(variable in (job.get("env") or {}) for variable in self.CLUSTER_VARIABLES)
+        }
+        assert holders, f"no job supplies {self.CLUSTER_VARIABLES}, so neither tier runs anywhere"
+
+        wrong = {
+            name: job.get("if") for name, job in holders.items() if job.get("if") != "github.event_name == 'schedule'"
+        }
+        assert wrong == {}, f"these jobs hold a cluster secret outside the cron: {wrong}"
+
+    def test_both_cluster_tiers_are_actually_selected(self, workflow: dict[str, Any]) -> None:
+        """A secret supplied and a marker never selected is a credential in a repository for nothing."""
+        holders = [
+            job
+            for job in workflow["jobs"].values()
+            if any(variable in (job.get("env") or {}) for variable in self.CLUSTER_VARIABLES)
+        ]
+        runs = "\n".join(block for job in holders for block in _run_blocks(job))
+
+        for marker in ("integration", "autoembed"):
+            assert marker in runs, f"no step in a cluster job selects the {marker} tier; they run {runs!r}"
+
+    def test_no_trigger_hands_a_fork_the_secrets(self, workflow: dict[str, Any]) -> None:
+        """``pull_request_target`` runs a fork's pull request with the base repository's secrets.
+
+        It is the one trigger that would defeat everything above, and it is easy to reach for: it is what
+        somebody adds when they want a fork's pull request to see a check that needs a secret. Asserted on
+        the trigger list rather than left to review.
+        """
+        triggers = sorted(str(key) for key in _triggers(workflow))
+
+        assert "pull_request_target" not in triggers, (
+            f"the workflow triggers on {triggers}, and pull_request_target runs a fork's code with our secrets"
+        )
+
+
 class TestNoCredentialReachesACommandLine:
     """AT-108 / REQ-E-108 -- a rule written while there is nothing to break it.
 
-    There is no secret in this workflow today, so both tests below pass on an empty set. That is the point of
-    writing them now: the change a real deployment eventually forces is the one that introduces one, and the
-    person making it should get a failing test rather than a masked value in a public build log.
+    Written while there was no secret in the file, so the tests below passed on an empty set for two tasks.
+    That was the point of writing them then: the change that eventually introduced one -- the scheduled
+    Atlas job two classes above -- should meet a failing test rather than put a masked value in a public
+    build log. The set is no longer empty, so a rule about a hypothetical is now a rule about two keys.
     """
 
     def test_no_command_or_step_name_interpolates_a_secret(self, workflow: dict[str, Any]) -> None:
@@ -465,7 +620,7 @@ class TestTheBuildTierRunsSomewhere:
 
     ``test_packaging.py:66`` turns it off by default because it builds a wheel and an sdist and resolves
     dependencies from PyPI. The variable is the one tier gate that is not a connection string, so a runner
-    with network is all it needs and there is no deployment decision to wait for.
+    with network is all it needs and it never waited on a deployment decision at all.
     """
 
     def test_exactly_one_job_switches_the_build_tier_on(self, workflow: dict[str, Any]) -> None:
