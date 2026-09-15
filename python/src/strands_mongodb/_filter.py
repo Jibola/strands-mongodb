@@ -66,9 +66,13 @@ def _reject_operator_keys(value: Any) -> None:
 def _reject_undeclared_fields(caller_filter: Mapping[str, Any], declared: Collection[str]) -> None:
     """Raise if the filter names a path the index did not declare filterable (``REQ-E-049``).
 
-    Atlas does not error on a pre-filter over an undeclared path. It returns unfiltered results,
-    so the failure this prevents is not an exception a caller could catch: it is a predicate that
-    quietly stopped applying, which on the memory path means a scope filter that stopped narrowing.
+    It was assumed Atlas answers a pre-filter over an undeclared path with unfiltered results rather than an
+    error, which made this guard the only thing between a caller and silently cross-scope reads.
+    Measured on mongot 8.3.8, it is code 8, ``Path 'x' needs to be indexed as filter``. The
+    guard stays for a smaller but real reason: the server names the path and stops there, while a caller
+    who typed a field name needs the config key to edit, the index rebuild it implies, and the list of
+    what is filterable now. It also fails before the round trip rather than after it. ``REQ-E-071``
+    records the correction; unverified on Atlas proper, so the loud behaviour is not assumed everywhere.
 
     Top-level keys only, and that is exact rather than approximate. ``_reject_operator_keys`` has
     already rejected ``$and`` and ``$or``, so no caller filter can place a field path below the top
@@ -90,9 +94,9 @@ def _reject_undeclared_fields(caller_filter: Mapping[str, Any], declared: Collec
     available = ", ".join(sorted(declared)) or "none"
     raise ValueError(
         f"strands_mongodb: filter field(s) {', '.join(repr(field) for field in undeclared)} are not "
-        f"declared filterable on this index, and Atlas returns unfiltered results rather than an error "
-        f"for an undeclared field. Filterable here: {available}. Add the field to 'filter_fields' in "
-        f"MongoDBConfig and recreate the index to filter on it."
+        f"declared filterable on this index, and the server rejects a filter over an undeclared path. "
+        f"Filterable here: {available}. Add the field to 'filter_fields' in MongoDBConfig and recreate "
+        f"the index to filter on it."
     )
 
 
@@ -115,12 +119,11 @@ def validate(caller_filter: Mapping[str, Any], *, declared_fields: Iterable[str]
 
 
 def compose(
-    caller_filter: Mapping[str, Any] | None,
-    *,
+    *caller_filters: Mapping[str, Any] | None,
     scope: str,
     store_name: str,
 ) -> dict[str, Any]:
-    """Compose a caller filter with the scope predicate as a conjunction (``REQ-E-051``).
+    """Compose caller filters with the scope predicate as a conjunction (``REQ-E-051``).
 
     ``$and`` rather than a merged dict, and that is the requirement rather than a style preference.
     ``{**scope_predicate, **caller_filter}`` lets a caller key of the same name win, and the key whose
@@ -130,26 +133,35 @@ def compose(
     matches 0 documents. A contradictory caller term yields nothing rather than yielding their term,
     which is what makes conjunction sufficient here and lets the tests assert on the emitted dict.
 
+    Variadic because a memory store has **two** caller filters and they arrive from different places:
+    the one configured on the store, which applies to every query, and the one on a single
+    ``MongoDBSearchQuery``. Merging the pair before composing is not available, since the merge would
+    have to be a ``$and`` of its own and :func:`validate` rejects a ``$``-prefixed key at any depth. Two
+    terms in one conjunction is the same predicate either way, and each stays a plain field-to-value
+    mapping that the guards can still read.
+
     Does not validate. Callers run :func:`validate` first, because the two have different arguments and
     a caller with no declared-field set to hand should still be able to compose.
 
     Args:
-        caller_filter: The caller's filter, already validated. ``None`` and ``{}`` both add no term.
+        *caller_filters: Caller filters, already validated, in the order they should appear.
+            ``None`` and ``{}`` both add no term, so a call site with nothing to add passes either.
         scope: This store's scope. Never taken from caller input (``REQ-E-046``); an absent scope
             resolves to a sentinel upstream, never to unfiltered (``REQ-E-048``).
         store_name: This store's name, isolating it from other stores in the same collection.
 
     Returns:
-        A ``$and`` predicate with the scope term first, then the store term, then the caller's filter
-        if it has anything in it. Deep-copied, so the caller's dict and the returned predicate share no
+        A ``$and`` predicate with the scope term first, then the store term, then every caller filter
+        that has anything in it. Deep-copied, so the caller's dicts and the returned predicate share no
         structure in either direction.
     """
     terms: list[dict[str, Any]] = [
         {"scope": {"$eq": scope}},
         {"store_name": {"$eq": store_name}},
     ]
-    if caller_filter:
-        # Deep, not shallow. A caller who mutates a nested value after composing must not be able to
-        # alter a query that is already in flight.
-        terms.append(copy.deepcopy(dict(caller_filter)))
+    for caller_filter in caller_filters:
+        if caller_filter:
+            # Deep, not shallow. A caller who mutates a nested value after composing must not be able
+            # to alter a query that is already in flight.
+            terms.append(copy.deepcopy(dict(caller_filter)))
     return {"$and": terms}

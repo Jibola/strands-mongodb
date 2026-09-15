@@ -144,12 +144,13 @@ class TestOperatorKeysAreRejectedAtAnyDepth:
 
 
 class TestUndeclaredFieldsAreRejectedBeforeQuerying:
-    """AT-049 / REQ-E-049 — the check that exists because Atlas does not do it.
+    """AT-049 / REQ-E-049 — the check that exists to name the remedy, not to be the only one.
 
-    The expectation was that a query pre-filtering on a path the index did not declare does not error. It returns
-    unfiltered results. So the failure is not an exception a caller can catch, it is a filter that
-    quietly stopped applying, which on the memory path means one customer's scope predicate stopped
-    narrowing.
+    It was assumed that a query pre-filtering on a path the index did not declare returns unfiltered
+    results rather than erroring, which would make this guard the only thing between a caller and
+    cross-scope reads. Measured on mongot 8.3.8, the server rejects it with code 8, ``Path 'x' needs to be
+    indexed as filter``; ``REQ-E-071`` records the correction. The guard still earns its place: it fails
+    before the round trip, and it names the config key and the index rebuild that a code 8 does not.
     """
 
     def test_an_undeclared_field_raises_naming_the_field(self) -> None:
