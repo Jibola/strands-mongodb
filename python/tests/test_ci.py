@@ -1,9 +1,13 @@
 """The CI configuration, asserted by reading it, because nothing in this suite can run it.
 
-Covers ``AT-104`` through ``AT-109`` (``REQ-E-104`` to ``REQ-E-109``), and the file they describe is the only
-one in this repository that lives outside ``python/``. There is no tier here and no network: a workflow
-is a YAML document on disk, so these are unit-tier tests that read it the way ``test_packaging.py`` reads
-``pyproject.toml``.
+Covers ``AT-104`` through ``AT-109`` (``REQ-E-104`` to ``REQ-E-109``), plus ``AT-130``, ``AT-131`` and
+``AT-138``. There is no tier here and no network: a workflow is a YAML document on disk, so these are
+unit-tier tests that read it the way ``test_packaging.py`` reads ``pyproject.toml``.
+
+``AT-138`` is the odd one out and reads in the opposite direction. The others ask what the workflow says;
+it asks what this suite reads, and then whether the workflow's path filters cover the answer. That answer
+is not a list held here -- it is walked out of the test modules, because a file joins it the moment
+somebody writes a ``Path`` expression naming it, and nothing about writing one prompts opening a workflow.
 
 **What this file cannot tell you.** It asserts the workflow says what it should say. Whether GitHub then
 runs it, whether a runner has ``hatch``, and whether the matrix resolves are all unobservable from here, and
@@ -159,6 +163,137 @@ _NEEDS_TOMLLIB = pytest.mark.skipif(
 )
 
 
+#: Every module the suite collects, walked for the paths it names. ``conftest.py`` is included: it reads
+#: ``.env`` from two locations, and one of them is above the package directory.
+_TEST_MODULES = sorted(Path(__file__).resolve().parent.glob("*.py"))
+
+#: The prefix the trigger has watched since the workflow was written. A path under it needs nothing from
+#: ``AT-138``; a path outside it is what this is about.
+_PACKAGE_DIRECTORY = "python"
+
+#: Paths outside ``python/`` the walk is known to find today, checked as a subset of what it returns so
+#: that a walk which silently resolved nothing cannot pass as a clean result. Not an equality: adding a
+#: read should fail the test below, which demands the trigger be extended, rather than this one.
+_READ_AT_LEAST = (
+    ".github/workflows/ci-python.yml",
+    ".github/workflows/release-python.yml",
+    "AGENTS.md",
+    "CONTRIBUTING.md",
+    ".gitignore",
+)
+
+
+def _glob_to_regex(pattern: str) -> str:
+    """One GitHub path filter, as the regular expression it stands for.
+
+    Two wildcards with different reach, which is the whole reason this is not ``fnmatch``: ``*`` stops at a
+    separator and ``**`` crosses them, so ``python/*`` and ``python/**`` are different filters and only the
+    second one watches ``python/tests/test_ci.py``.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "*":
+            crosses = pattern[index + 1 : index + 2] == "*"
+            out.append(".*" if crosses else "[^/]*")
+            index += 2 if crosses else 1
+        elif char == "?":
+            out.append("[^/]")
+            index += 1
+        else:
+            out.append(re.escape(char))
+            index += 1
+    return "".join(out)
+
+
+def _watched(path: str, patterns: list[str]) -> bool:
+    """Whether a trigger declaring ``patterns`` runs on a change to ``path``.
+
+    A directory is asked about through a probe child rather than about itself, because a filter is written
+    about files: ``docs/**`` matches ``docs/guide.md`` and does not match the string ``docs``. Anything the
+    walk names that is not a directory on disk is asked about directly.
+    """
+    probed = f"{path}/a-file-underneath" if (REPO_ROOT / path).is_dir() else path
+    return any(re.fullmatch(_glob_to_regex(pattern), probed) for pattern in patterns)
+
+
+def _paths_named_by(module: Path) -> set[str]:
+    """Every repository-relative path one test module names, resolved from its syntax rather than run.
+
+    The module is parsed, its module-level names are resolved to paths, and every complete ``/`` chain
+    anywhere in it is evaluated against them. Four forms carry all of it: ``Path(__file__)``, ``.resolve()``,
+    ``.parent``, and ``/`` with a string on the right.
+
+    Two results are dropped rather than returned, and both are dropped because no trigger could watch them.
+    A chain that walks above the repository root -- ``test_migration.py`` reaches a checkout beside this one
+    -- resolves to nothing. So does the root itself, which is a directory a name is built from and not a
+    file anything reads.
+
+    Returns:
+        Repository-relative paths, slash-separated, with no leading slash.
+    """
+    tree = ast.parse(module.read_text())
+    here = (_PACKAGE_DIRECTORY, "tests", module.name)
+    known: dict[str, tuple[str, ...] | None] = {}
+
+    def evaluate(node: ast.AST) -> tuple[str, ...] | None:
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            left = evaluate(node.left)
+            right = node.right
+            if left is None or not isinstance(right, ast.Constant) or not isinstance(right.value, str):
+                return None
+            return left + tuple(part for part in right.value.split("/") if part)
+        if isinstance(node, ast.Attribute) and node.attr == "parent":
+            base = evaluate(node.value)
+            return None if not base else base[:-1]
+        if isinstance(node, ast.Call):
+            called = node.func
+            if isinstance(called, ast.Attribute) and called.attr == "resolve":
+                return evaluate(called.value)
+            is_this_file = (
+                isinstance(called, ast.Name)
+                and called.id == "Path"
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "__file__"
+            )
+            return here if is_this_file else None
+        if isinstance(node, ast.Name):
+            return known.get(node.id)
+        return None
+
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                if isinstance(target, ast.Name):
+                    known[target.id] = evaluate(statement.value)
+        elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+            known[statement.target.id] = evaluate(statement.value) if statement.value else None
+
+    chains = [node for node in ast.walk(tree) if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)]
+    # The left operand of a longer chain is a prefix of it. `_ROOT / ".github"` is a step towards a file
+    # rather than a path anything opens, and demanding the trigger watch `.github` would be a different
+    # requirement than the one REQ-E-138 states.
+    partial = {id(node.left) for node in chains}
+    resolved = {evaluate(node) for node in chains if id(node) not in partial}
+    return {"/".join(parts) for parts in resolved if parts}
+
+
+def _paths_outside_the_package() -> set[str]:
+    """Every path the suite names that ``python/**`` does not already cover.
+
+    One exemption, and it is derived rather than listed: a path ``.gitignore`` accounts for cannot be in a
+    commit, so no change to it can trigger anything. ``conftest.py`` names ``.env`` beside the repository
+    root, and a contributor creates that file or does not.
+    """
+    ignored = (REPO_ROOT / ".gitignore").read_text()
+    named: set[str] = set()
+    for module in _TEST_MODULES:
+        named |= _paths_named_by(module)
+    return {path for path in named if path.split("/")[0] != _PACKAGE_DIRECTORY and Path(path).name not in ignored}
+
+
 class TestTheGatesEveryChangeMustPass:
     """AT-104 / REQ-E-104 -- the four things a pull request has to clear before anyone reads it.
 
@@ -226,6 +361,64 @@ class TestTheGatesEveryChangeMustPass:
             assert relative in paths, f"the {event} trigger watches {paths}, which does not include {relative}"
 
 
+class TestTheTriggerWatchesEverythingTheSuiteReads:
+    """``AT-138`` / ``REQ-E-138`` -- the files this suite asserts about that no change trigger watched.
+
+    ``release-python.yml`` arrived with eighteen tests that read it, in one pull request. CI ran, because
+    the tests are under ``python/``. The next change to the workflow alone runs nothing: it matches
+    neither declared filter, and its own trigger is a pushed tag. A pull request with no checks looks the
+    same as one whose checks passed.
+
+    The same was already true of ``AGENTS.md``, ``CONTRIBUTING.md`` and ``.gitignore``. ``AT-113`` resolves
+    every command, variable, marker, version and path those documents name against the repository, and
+    could only ever have caught a stale claim on some later change that happened to touch ``python/``.
+
+    The list is found rather than held. A file enters the suite's reach when somebody writes one ``Path``
+    expression in a test module, and nothing about writing it prompts opening the workflow -- so a curated
+    list would be extended by exactly the person who forgot to extend the filter.
+    """
+
+    def test_the_walk_finds_the_files_the_suite_is_known_to_read(self) -> None:
+        """AT-138 -- the vacuity guard: a walk that resolved nothing would pass the test below.
+
+        A subset rather than an equality. Adding a read is supposed to fail the trigger test, which names
+        the fix, rather than this one, which would only say the constant is out of date.
+        """
+        found = _paths_outside_the_package()
+        missing = [path for path in _READ_AT_LEAST if path not in found]
+        assert missing == [], f"the walk did not resolve paths the suite reads: {missing}. It found {sorted(found)}"
+
+    def test_both_change_triggers_watch_every_file_the_suite_reads(self, workflow: dict[str, Any]) -> None:
+        """AT-138 -- ``REQ-E-138``: a file the suite makes a claim about, and no job to check the claim.
+
+        Both triggers, for the reason the package-directory test gives: a repository that gates only pull
+        requests gates nothing on a branch pushed to directly.
+        """
+        triggers = _triggers(workflow)
+        found = sorted(_paths_outside_the_package())
+
+        for event in ("pull_request", "push"):
+            patterns = triggers[event]["paths"]
+            unwatched = [path for path in found if not _watched(path, patterns)]
+            assert unwatched == [], (
+                f"the {event} trigger watches {patterns}, so a change to {unwatched} runs no test -- "
+                "and the suite asserts something about each of them"
+            )
+
+    def test_the_matcher_reads_a_filter_the_way_github_does(self) -> None:
+        """AT-138 -- the test above passes on everything if the matcher answers yes to everything.
+
+        The two wildcards and the boundary between them, plus the prefix that looks like a match and is a
+        different directory.
+        """
+        assert _watched("AGENTS.md", ["AGENTS.md"])
+        assert _watched("python/tests/test_ci.py", ["python/**"])
+        assert not _watched("AGENTS.md", ["python/**"])
+        assert not _watched("python-notes/x.md", ["python/**"]), "`python/**` is not a prefix match on the name"
+        assert not _watched("a/b/c.md", ["a/*/x.md"]), "`*` does not cross a separator"
+        assert not _watched("AGENTS.md", []), "an empty filter watches nothing"
+
+
 class TestTheMatrixCoversEveryVersionTheClassifiersClaim:
     """AT-105 / REQ-E-105 -- the matrix and the classifiers, compared as sets in both directions.
 
@@ -267,9 +460,11 @@ class TestTheMatrixCoversEveryVersionTheClassifiersClaim:
 class TestBothCoverageFloorsAreEnforced:
     """AT-106 / REQ-E-106 -- the aggregate floor and the per-module floor, in the one job that measures once.
 
-    Measured before this was written: on the unit tier alone the aggregate is 97.01% and the weakest module
-    is 89.47%, against floors of 90% and 70%. So the job passes with no connection string, which is why the
-    floors were enforceable before any tier had a deployment.
+    Measured in CI on the unit tier alone: the aggregate is 98.10% and the weakest module is 89.47%,
+    against floors of 90% and 70%. So the job passes with no connection string, which is why the
+    floors were enforceable before any tier had a deployment. In CI rather than locally, because the
+    aggregate moves by a line or two with the interpreter -- 3.14 reaches 98.18% -- and the number
+    worth writing down is the one the gate actually reads.
     """
 
     def test_a_job_runs_the_coverage_gate(self, workflow: dict[str, Any]) -> None:

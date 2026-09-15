@@ -15,13 +15,31 @@ on:
   pull_request:
     branches: [ main ]
     paths:
+      # Every file the suite asserts something about, which is more than the package directory and is
+      # checked rather than remembered: `AT-138` walks the test modules for the paths they name and fails
+      # when one of them is not watched here. A pull request that touches only an unwatched file runs no
+      # job at all, and a pull request with no checks looks exactly like one whose checks passed.
       - 'python/**'
       - '.github/workflows/ci-python.yml'
+      - '.github/workflows/release-python.yml'
+      - 'AGENTS.md'
+      - 'CONTRIBUTING.md'
+      - 'README.md'
+      - '.gitignore'
   push:
     branches: [ main ]
     paths:
+      # Every file the suite asserts something about, which is more than the package directory and is
+      # checked rather than remembered: `AT-138` walks the test modules for the paths they name and fails
+      # when one of them is not watched here. A pull request that touches only an unwatched file runs no
+      # job at all, and a pull request with no checks looks exactly like one whose checks passed.
       - 'python/**'
       - '.github/workflows/ci-python.yml'
+      - '.github/workflows/release-python.yml'
+      - 'AGENTS.md'
+      - 'CONTRIBUTING.md'
+      - 'README.md'
+      - '.gitignore'
   schedule:
     # Weekly canary against the newest SDK release, and the only mitigation for an unpinned SDK floor. The floor
     # here is strands-agents>=1.48.0 with no upper bound, so a new user resolves whatever is current; this
@@ -176,8 +194,10 @@ jobs:
         run: pip install hatch
 
       # Two commands: the 90% aggregate floor and the 70% per-module floor. Deliberately not part of
-      # `test`, so this job is the only thing that enforces either. Measured at 97.01% aggregate and
-      # 89.47% for the weakest module on the unit tier alone, which is why no credential is needed.
+      # `test`, so this job is the only thing that enforces either. Measured at 98.10% aggregate and
+      # 89.47% for the weakest module on the unit tier alone, which is why no credential is needed. The
+      # aggregate is printed by this step on every run, and the run is the authority: a number written
+      # into a comment is one nothing checks, and this one had already been stale for two changes.
       - name: Enforce both coverage floors
         run: hatch run cov
 
