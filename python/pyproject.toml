@@ -82,6 +82,21 @@ dev = [
     "pytest-cov>=5.0.0,<8.0.0",
     "ruff>=0.11.0,<1.0.0",
     "mypy>=1.15.0,<2.0.0",
+    # tests/test_ci.py parses .github/workflows/ci-python.yml, and asserting on YAML as text is what
+    # AT-099 had to settle for. PyYAML is already importable in the development venv as a
+    # runtime dependency of strands-agents, which is not a reason to import it: they can drop it in any
+    # release, and the failure would be an ImportError in a test about workflow structure.
+    "pyyaml>=6.0.0",
+    # PyYAML ships no inline annotations, so mypy reports `import-untyped` on `import yaml` without this.
+    # Declared rather than silenced with an override: the stubs are what let the workflow tests be checked
+    # at the same strictness as everything else.
+    "types-PyYAML>=6.0.0",
+    # tests/test_client.py builds a real span pipeline for AT-117 / REQ-E-114 (the fourth surface a password can reach).
+    # Same reason as PyYAML above: importable today only because strands-agents pins it. The floor matches
+    # theirs, and `InMemorySpanExporter` has been at opentelemetry.sdk.trace.export.in_memory_span_exporter
+    # across that range. This adds nothing to any runtime extra: a partner package must not bring
+    # its own OTel dependency, and `dependencies`, `storage`, `memory` and `all` are all unchanged.
+    "opentelemetry-sdk>=1.30.0",
 ]
 
 # TODO(github-org): confirm the GitHub org before the first upload to PyPI. These URLs are
@@ -112,7 +127,7 @@ fallback_version = "0.0.0"
 packages = ["src/strands_mongodb"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "tests", "README.md", "LICENSE", "NOTICE", "pyproject.toml"]
+include = ["src", "tests", "examples", "README.md", "MIGRATION.md", "LICENSE", "NOTICE", "pyproject.toml"]
 
 [tool.hatch.envs.default]
 features = ["all"]
@@ -122,6 +137,9 @@ dependencies = [
     "pytest-cov>=5.0.0,<8.0.0",
     "ruff>=0.11.0,<1.0.0",
     "mypy>=1.15.0,<2.0.0",
+    "pyyaml>=6.0.0",
+    "types-PyYAML>=6.0.0",
+    "opentelemetry-sdk>=1.30.0",
 ]
 
 [tool.hatch.envs.default.scripts]
@@ -145,7 +163,7 @@ prepare = ["format", "lint", "typecheck", "test"]
 line-length = 120
 # scripts/ is included because check_module_coverage.py gates a release. A release gate that ruff
 # never sees is a release gate nobody maintains.
-include = ["src/**/*.py", "tests/**/*.py", "scripts/**/*.py"]
+include = ["src/**/*.py", "tests/**/*.py", "scripts/**/*.py", "examples/**/*.py"]
 
 [tool.ruff.lint]
 select = [
@@ -153,7 +171,18 @@ select = [
     "F", # pyflakes
     "I", # isort
     "B", # flake8-bugbear
+    # The SDK's own enforcement for one house convention: %s placeholders in log calls, never an
+    # f-string, so a handler can format lazily and a log aggregator sees one message shape. All ten log
+    # calls in this package already passed it, which made a passing tree a coincidence rather than a gate.
+    "G", # flake8-logging-format
 ]
+
+[tool.ruff.lint.isort]
+# `_support` is `examples/_support.py`, imported by the sibling scripts that live beside it. The
+# examples are run as scripts rather than as a package, so the import is bare and ruff has no `src`
+# entry that would let it infer first-party. Without this it sorts into the third-party block, above
+# `strands_mongodb`, and every example file reports I001.
+known-first-party = ["_support"]
 
 [tool.mypy]
 python_version = "3.10"
@@ -162,7 +191,7 @@ warn_unused_configs = true
 ignore_missing_imports = true
 # Tests are checked too. An unawaited coroutine or a fixture returning the wrong type is how a test
 # passes while asserting nothing, and `mypy src` alone never sees it. `scripts/` gates a release.
-files = ["src", "tests", "scripts"]
+files = ["src", "tests", "scripts", "examples"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -180,6 +209,9 @@ markers = [
     "integration: needs Atlas or an Atlas CLI local deployment with mongot. Gated on MONGODB_ATLAS_URI.",
     "autoembed: needs a cluster with a registered Atlas embedding model. Gated on MONGODB_AUTOEMBED_URI.",
     "compat: resolves the latest published strands-agents rather than the pinned one. CI cron only.",
+    "gate: the release-gate assertion. Reordered to run last, so it sees every other outcome.",
+    "example: runs a shipped examples/ script as a subprocess. Carries a tier marker for its backend.",
+    "build: builds a wheel from this tree and installs it into an empty venv. Needs network, no deployment. Gated on STRANDS_MONGODB_BUILD_TIER.",
 ]
 
 [tool.coverage.run]

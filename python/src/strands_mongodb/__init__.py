@@ -7,7 +7,10 @@ Two surfaces, each behind its own install extra:
 - :mod:`strands_mongodb.memory_store` -- ``MongoDBMemoryStore``, implementing the SDK's
   ``strands.memory.MemoryStore`` protocol. Install with ``pip install 'strands-mongodb[memory]'``.
 
-Both classes are reachable from here, resolved on first attribute access rather than at import
+A third name, ``MongoDBVectorSearchStrategy``, is declared and belongs to phase 2: constructing it
+raises ``NotImplementedError`` naming the phase. It needs no extra, because it needs nothing.
+
+All three are reachable from here, resolved on first attribute access rather than at import
 time. Importing this package must never pull a dependency the caller did not ask for: a
 ``[storage]``-only install can ``import strands_mongodb`` and use ``MongoDBStorage`` without ever
 executing the memory module, which would fail on ``pymongo_search_utils``.
@@ -24,6 +27,7 @@ if TYPE_CHECKING:
     # without these the lazily exported names would resolve to `object` and every downstream use
     # would lose its types. Never executed at runtime, which is the point.
     from strands_mongodb.memory_store import MongoDBMemoryStore
+    from strands_mongodb.search import MongoDBVectorSearchStrategy
     from strands_mongodb.storage import MongoDBStorage
 
 try:
@@ -32,11 +36,16 @@ except PackageNotFoundError:
     # Imported from a source tree that was never installed.
     __version__ = "0.0.0+unknown"
 
-__all__ = ["MongoDBMemoryStore", "MongoDBStorage", "__version__"]
+__all__ = ["MongoDBMemoryStore", "MongoDBStorage", "MongoDBVectorSearchStrategy", "__version__"]
 
 _LAZY: Final[dict[str, str]] = {
     "MongoDBStorage": "strands_mongodb.storage",
     "MongoDBMemoryStore": "strands_mongodb.memory_store",
+    # Phase 2 (`REQ-E-075`): declared, and raises when constructed. Listed here for the same reason
+    # as the other two, since the published API surface carries the name, and it costs nothing extra
+    # to resolve:
+    # `search.py` imports nothing at runtime.
+    "MongoDBVectorSearchStrategy": "strands_mongodb.search",
 }
 
 

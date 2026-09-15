@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import NoReturn
 
+__all__ = ["missing_extra"]
+
 
 def missing_extra(extra: str, error: ImportError, *, module: str) -> NoReturn:
     """Re-raise an import failure as a message naming the extra that fixes it.
