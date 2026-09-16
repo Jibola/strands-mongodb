@@ -44,7 +44,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 from pymongo import AsyncMongoClient, monitoring
@@ -62,6 +62,7 @@ from strands_mongodb.types import (
     MongoDBConfig,
     MongoDBMemoryStoreConfig,
     MongoDBSearchQuery,
+    ResolvedSearchType,
 )
 
 # tests/ -> python/ -> the repository root, which holds the landing-page README.
@@ -1320,4 +1321,52 @@ class TestTheReadmeSaysWhichSurfaceCreatesTheTtlIndex:
 
         assert "initialize()" in memory, (
             f"the memory TTL row does not say initialize() creates it, which is the whole point: {memory!r}"
+        )
+
+
+class TestTheLandingPageDescribesThePackageAsItIs:
+    """``AT-161`` / ``REQ-E-155`` -- the root README's status block, which nothing checked.
+
+    ``test_the_landing_page_points_at_the_reference`` is the only assertion this file made about the
+    root document, and it checks that the file links to the reference rather than anything it says. So
+    the landing page accumulated claims that were true when written and were not revisited when the
+    package moved: that a store with a ``ttl_seconds`` never expires anything, which stopped being true
+    when ``MongoDBStorage.ensure_indexes()`` arrived; and that ``search()`` spans a vector tier and a
+    text tier, which the ``hybrid`` tier made two-thirds of the answer.
+
+    It is the first page a reader of the public repository sees, and it was telling them a shipped
+    feature silently does nothing. ``AT-158`` holds the *package* README to the TTL story; this holds
+    the landing page to the same one, and to the tier list the package actually implements.
+
+    Both assertions read the claim out of the source rather than restating it here, so a third tier or a
+    second surface that needs provisioning fails this file instead of ageing quietly in the document.
+    """
+
+    def test_a_ttl_claim_names_the_call_that_arms_it(self) -> None:
+        """AT-161 -- the paragraph that mentions ``ttl_seconds`` says what makes it act."""
+        text = _ROOT_README.read_text()
+        paragraphs = [
+            " ".join(line.lstrip("> ").strip() for line in block.splitlines()) for block in re.split(r"\n>?\s*\n", text)
+        ]
+        mentions = [p for p in paragraphs if "ttl_seconds" in p]
+
+        assert mentions, "the landing page no longer mentions ttl_seconds; drop this test or the claim"
+        for paragraph in mentions:
+            assert "ensure_indexes()" in paragraph or "initialize()" in paragraph, (
+                f"the landing page discusses ttl_seconds without naming the call that provisions the "
+                f"index it needs, which is the difference between a working feature and a silent "
+                f"no-op: {paragraph!r}"
+            )
+
+    def test_every_tier_that_can_answer_a_query_is_named(self) -> None:
+        """AT-161 -- read the tiers out of ``ResolvedSearchType``, so adding one fails here."""
+        tiers = get_args(ResolvedSearchType)
+        text = _ROOT_README.read_text()
+
+        assert len(tiers) >= 2, f"ResolvedSearchType no longer lists tiers to check: {tiers!r}"
+        missing = [tier for tier in tiers if tier not in text]
+
+        assert not missing, (
+            f"the landing page describes the search surface without naming {missing}; it is the first "
+            f"page a reader sees and it would undersell what the package resolves to"
         )

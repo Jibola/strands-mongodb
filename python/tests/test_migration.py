@@ -40,7 +40,11 @@ from strands_mongodb.types import MongoDBConfig
 if sys.version_info >= (3, 11):
     import tomllib
 else:  # pragma: no cover - exercised only on the 3.10 floor
-    tomllib = None  # type: ignore[assignment]
+    # `tomli` is the parser `tomllib` was adopted from, and 2.x is the API `tomllib` shipped, so the
+    # alias makes the two interchangeable and every caller below reads one name. It is a dev dependency
+    # declared without a version marker on purpose; `pyproject.toml` says why, and the reason is mypy
+    # rather than this branch.
+    import tomli as tomllib
 
 # tests/ -> python/ -> the repository root -> the workspace that holds the archived tool.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -216,8 +220,6 @@ def _manifest() -> dict[str, Any]:
     Returns:
         The manifest as a mapping.
     """
-    if tomllib is None:  # pragma: no cover - the 3.10 floor has no stdlib parser
-        pytest.skip("reading pyproject.toml needs tomllib, which arrived in 3.11")
     return tomllib.loads(_PYPROJECT.read_text())
 
 

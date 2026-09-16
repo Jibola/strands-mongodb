@@ -42,7 +42,11 @@ if TYPE_CHECKING:
 if sys.version_info >= (3, 11):
     import tomllib
 else:  # pragma: no cover - exercised only on the 3.10 floor
-    tomllib = None  # type: ignore[assignment]
+    # `tomli` is the parser `tomllib` was adopted from, and 2.x is the API `tomllib` shipped, so the
+    # alias makes the two interchangeable and every caller below reads one name. It is a dev dependency
+    # declared without a version marker on purpose; `pyproject.toml` says why, and the reason is mypy
+    # rather than this branch.
+    import tomli as tomllib
 
 DISTRIBUTION = "strands-mongodb"
 
@@ -127,13 +131,9 @@ def dist_metadata() -> PackageMetadata:
 def manifest() -> dict[str, Any]:
     """Parsed ``pyproject.toml``.
 
-    Skips rather than fails on the 3.10 floor, where ``tomllib`` is absent from the standard
-    library. Adding ``tomli`` as a test dependency to read our own manifest is not worth it; the
-    assertions that need the manifest are about build configuration, which CI on any newer
-    interpreter covers.
+    Returns:
+        The manifest as a mapping.
     """
-    if tomllib is None:
-        pytest.skip("tomllib needs Python 3.11+; manifest assertions run on the newer interpreters")
     return tomllib.loads(PYPROJECT.read_text())
 
 
@@ -691,3 +691,40 @@ class TestTheBuiltWheelInstallsIntoAnEmptyVenv:
         assert result.returncode == 0, result.stdout + result.stderr
         assert result.stdout.strip() == expected, f"{result.stdout.strip()!r} != {expected!r}"
         assert expected != "0.0.0", "a build off this tree resolved the no-git fallback version"
+
+
+class TestTheDevExtraAndTheHatchEnvironmentAgree:
+    """AT-160 / REQ-E-154 — the same dependency list is written twice, so assert the copies are equal.
+
+    ``[project.optional-dependencies].dev`` is what a contributor installs with
+    ``pip install -e '.[all,dev]'``. ``[tool.hatch.envs.default].dependencies`` is what CI installs,
+    because every job runs through ``hatch``. Nothing derives one from the other, and nothing compared
+    them until this test: a package added to the first alone is present locally and absent in CI, which
+    makes a green matrix a statement about the maintainer's laptop.
+
+    Found by having to add the same dependency to both lists and noticing that nothing would have said so.
+
+    Compared as sets of requirement strings rather than as lists, so ordering is free, and in both
+    directions for the same reason ``AT-105`` is: a copy that is merely a superset is still a copy that
+    drifted, and which side is ahead is the first thing a reader needs to know.
+    """
+
+    def test_the_two_dependency_lists_are_equal(self, manifest: dict[str, Any]) -> None:
+        """Read from both tables, so neither can be edited alone."""
+        extra = set(manifest["project"]["optional-dependencies"]["dev"])
+        environment = set(manifest["tool"]["hatch"]["envs"]["default"]["dependencies"])
+
+        assert extra, "the dev extra declares nothing, so there is nothing to compare"
+        assert extra == environment, (
+            f"the dev extra and the hatch default environment have drifted; "
+            f"in the extra only: {sorted(extra - environment)}, "
+            f"in the environment only: {sorted(environment - extra)}"
+        )
+
+    def test_the_hatch_environment_installs_every_runtime_extra(self, manifest: dict[str, Any]) -> None:
+        """``features = ["all"]`` is the other half: CI gets the runtime dependencies too.
+
+        Without it the dev list would be equal and complete and CI would still fail to import the
+        package, which is a different failure the equality above cannot see.
+        """
+        assert manifest["tool"]["hatch"]["envs"]["default"]["features"] == ["all"]
