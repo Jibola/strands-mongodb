@@ -537,29 +537,32 @@ def _matrix_entries(job: dict[str, Any], dimension: str) -> list[Any]:
     return list(entries) if isinstance(entries, list) else []
 
 
-def _service_images(job: dict[str, Any]) -> list[str]:
-    """Every concrete image a job's service containers can run, with matrix references resolved.
+def _matrix_values(job: dict[str, Any], declared: str) -> list[str]:
+    """Every concrete value one declared string can take, with a matrix reference resolved.
 
     Args:
-        job: One parsed job.
+        job: The job the string was read from, which is where its matrix lives.
+        declared: The string as the workflow writes it.
 
     Returns:
-        The images. An expression naming a matrix key is replaced by that key's value in each entry, so a
-        job running two deployments reports two images; an expression naming anything else is returned
-        unchanged, which fails the caller's assertion rather than being quietly dropped.
+        One value per matrix entry where the string names a matrix key, so a job running two deployments
+        reports two values. A string naming anything else is returned as itself, unchanged, which fails the
+        caller's assertion rather than being quietly dropped.
     """
-    images: list[str] = []
-    for service in (job.get("services") or {}).values():
-        declared = str(service.get("image", ""))
-        reference = re.search(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\s*\}\}", declared)
-        if reference is None:
-            images.append(declared)
-            continue
-        dimension, key = reference.group(1), reference.group(2)
-        images.extend(
-            str(entry[key]) for entry in _matrix_entries(job, dimension) if isinstance(entry, dict) and key in entry
-        )
-    return images
+    reference = re.search(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\s*\}\}", declared)
+    if reference is None:
+        return [declared]
+    dimension, key = reference.group(1), reference.group(2)
+    return [str(entry[key]) for entry in _matrix_entries(job, dimension) if isinstance(entry, dict) and key in entry]
+
+
+def _service_images(job: dict[str, Any]) -> list[str]:
+    """Every concrete image a job's service containers can run, with matrix references resolved."""
+    return [
+        image
+        for service in (job.get("services") or {}).values()
+        for image in _matrix_values(job, str(service.get("image", "")))
+    ]
 
 
 def _contract_deployments(workflow: dict[str, Any]) -> list[dict[str, Any]]:
@@ -674,11 +677,43 @@ class TestTheContractTierRunsAgainstADeploymentThatCanSearch:
         contract = workflow["jobs"]["contract"]
         image = str(contract["services"]["mongodb"]["image"])
         promise = str((contract.get("env") or {}).get(_EXPECT_SEARCH, ""))
+        uri = str((contract.get("env") or {}).get("MONGODB_URI", ""))
 
         assert "matrix." in image, f"the service image does not vary with the matrix: {image!r}"
         assert "matrix." in promise, (
             f"{_EXPECT_SEARCH} does not vary with the matrix, so every leg makes the same promise about a "
             f"different deployment: {promise!r}"
+        )
+        assert "matrix." in uri, (
+            f"MONGODB_URI does not vary with the matrix, so both legs are handed one connection string and "
+            f"only one of these deployments is a replica set: {uri!r}"
+        )
+
+    def test_the_leg_with_a_replica_set_is_told_not_to_discover_the_topology(self, workflow: dict[str, Any]) -> None:
+        """``AT-187`` -- measured, not anticipated: this leg times out for fifteen minutes without it.
+
+        ``mongodb/mongodb-atlas-local`` is a single-node replica set that initiates itself with the
+        container's hostname as its member's host. A driver that discovers the topology therefore learns
+        one member named something the runner cannot resolve, and every operation ends in server selection:
+        thirty seconds per test, no error a reader can act on, and a job cancelled at its timeout with every
+        test failed. ``directConnection=true`` -- which is the connection string MongoDB's own Docker
+        instructions give for this image -- says talk to the address you were handed.
+
+        Asserted because the failure it prevents does not look like a missing parameter. It looks like the
+        deployment being broken, and the natural response to it is to widen the timeout.
+        """
+        promising = [
+            deployment
+            for deployment in _contract_deployments(workflow)
+            if str(deployment.get("expect_search", "")).strip()
+        ]
+        assert promising, "no deployment promises a search process, which another test in this class owns"
+
+        uri = str(promising[0].get("uri", ""))
+
+        assert "directConnection=true" in uri, (
+            f"the leg running a replica set connects with {uri!r}, so the driver will discover a member "
+            "host only resolvable inside the container network and spend the job in server selection"
         )
 
     def test_exactly_one_deployment_promises_a_search_process(self, workflow: dict[str, Any]) -> None:
@@ -1218,13 +1253,14 @@ class TestTheContractTierRunsOnEveryChange:
                 f"images this tier is written for: {sorted(_MONGODB_IMAGES)}"
             )
 
-            uri = job["env"]["MONGODB_URI"]
-            assert "secrets." not in uri, (
-                f"the {name} job reaches for a credential rather than the container beside it: {uri!r}"
+            declared = str(job["env"]["MONGODB_URI"])
+            assert "secrets." not in declared, (
+                f"the {name} job reaches for a credential rather than the container beside it: {declared!r}"
             )
-            assert "localhost" in uri or "127.0.0.1" in uri, (
-                f"the {name} job's connection string is {uri!r}, which does not point at that container"
-            )
+            for uri in _matrix_values(job, declared):
+                assert "localhost" in uri or "127.0.0.1" in uri, (
+                    f"the {name} job's connection string is {uri!r}, which does not point at that container"
+                )
 
     def test_the_tier_gates_a_change_rather_than_only_the_cron(self, workflow: dict[str, Any]) -> None:
         """Pull requests are specified to gate on this tier, so weekly alone is the wrong cadence.

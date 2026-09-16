@@ -274,6 +274,7 @@ jobs:
             image: mongo:8
             # Its own `mongosh`, which is in that image.
             health: "mongosh --quiet --eval 'db.adminCommand({ping:1})'"
+            uri: mongodb://localhost:27017
             expect_search: ''
           - label: with a search process
             image: mongodb/mongodb-atlas-local:8
@@ -282,10 +283,19 @@ jobs:
             # declares in its own HEALTHCHECK, and GitHub's service options replace that declaration
             # rather than adding to it, so naming it here is what keeps it.
             health: /usr/local/bin/runner healthcheck
+            # `directConnection=true` is not decoration, and it is the connection string MongoDB's own
+            # Docker instructions give for this image. The image is a single-node replica set and it
+            # initiates itself with the container's hostname as the member's host -- `30b29039c38d:27017`
+            # in the run that found this. A driver that discovers the topology therefore learns one member
+            # it cannot resolve from the runner, and every operation ends in server selection rather than
+            # in an error anybody can read: measured as 30 seconds per test and a job cancelled at the
+            # 15-minute timeout. Direct means the driver talks to the address it was handed.
+            uri: mongodb://localhost:27017/?directConnection=true
             expect_search: '1'
 
     # A real MongoDB, supplied by the runner rather than by a secret. The tier gate in conftest.py asks only
-    # that MONGODB_URI point at something that answers, and nothing in this package needs a replica set.
+    # that MONGODB_URI point at something that answers, and nothing in this package needs a replica set --
+    # though one of these two images is one, which is what the `uri` in each matrix entry is about.
     services:
       mongodb:
         image: ${{ matrix.deployment.image }}
@@ -300,7 +310,7 @@ jobs:
     # Under env: rather than on the command line. REQ-E-108 is written about every connection string rather
     # than only the secret ones: a rule with an exception is a rule somebody has to remember.
     env:
-      MONGODB_URI: mongodb://localhost:27017
+      MONGODB_URI: ${{ matrix.deployment.uri }}
       # Empty on the leg without a search process, and `1` on the leg with one. The tests that branch on
       # what the deployment can do read it and fail rather than take the quiet branch, because a leg that
       # exists to grade the search side of every branch and silently grades the other side is a green job
