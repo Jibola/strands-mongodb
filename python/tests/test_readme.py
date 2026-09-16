@@ -460,7 +460,7 @@ class TestTheTwoReadmesAgree:
         ("row", "declaration"),
         [
             ("Python", 'requires-python = ">=3.10"'),
-            ("`strands-agents`", '"strands-agents>=1.48.0"'),
+            ("`strands-agents`", '"strands-agents>=1.54.0"'),
         ],
     )
     def test_both_files_state_the_floor_pyproject_declares(self, row: str, declaration: str) -> None:

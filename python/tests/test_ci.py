@@ -1514,7 +1514,7 @@ class TestTheActionsHaveAnUpdateSourceAndTheFloorsDoNot:
     will not raise itself. Both peer repositories run Dependabot on ``github-actions`` with an identical
     seven-day cooldown -- the window in which a yanked or compromised release is usually caught.
 
-    The refusal is the half specific to this package. A library ships its floors: ``strands-agents>=1.48.0``
+    The refusal is the half specific to this package. A library ships its floors: ``strands-agents>=1.54.0``
     and the three beside it are the contract, not an artefact of how a requirements file was written. A
     bot that raises one revokes a promise, so the Python ecosystems are asserted *absent* rather than
     merely left out, because leaving something out is not a decision anybody can see.
@@ -1628,3 +1628,152 @@ class TestTheTierThatRunsShippedCodeLeavesNothingBehind:
                 f"{file}:{name} checks the working tree at step {asked} and runs the tier at step {ran}. "
                 f"Asked first, it reports the state the runner handed the job"
             )
+
+
+#: The two extras that ship. ``all`` is a self-reference to these and declares no floor of its own; ``dev``
+#: is not installed by any user, so a floor there is a fact about this repository and not about the package.
+_SHIPPED_EXTRAS = ("storage", "memory")
+
+#: A requirement specifier that states a floor, e.g. ``strands-agents>=1.54.0``. Anything without ``>=`` is
+#: either a self-reference (``strands-mongodb[memory,storage]``) or a pin, and neither has a floor to check.
+_FLOOR = re.compile(r"\A(?P<name>[A-Za-z0-9._-]+)>=(?P<version>[0-9][0-9A-Za-z.]*)\Z")
+
+
+def _declared_floors() -> dict[str, str]:
+    """Every runtime floor the manifest declares, as ``{distribution: version}``.
+
+    Read out of ``pyproject.toml`` rather than listed here, which is the whole point: a floor added to an
+    extra and not to the job below is a floor nothing installs, and that is the defect this requirement
+    exists for.
+
+    Returns:
+        The floors, keyed by distribution name.
+    """
+    extras = _pyproject()["project"]["optional-dependencies"]
+    floors: dict[str, str] = {}
+    for extra in _SHIPPED_EXTRAS:
+        for specifier in extras[extra]:
+            matched = _FLOOR.match(specifier.strip())
+            if matched:
+                floors[matched["name"]] = matched["version"]
+    return floors
+
+
+def _floor_job(workflow: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """The job that installs the floors, identified by what it does rather than by its key.
+
+    A job that pins a declared distribution with ``==`` is doing the one thing no other job in this file
+    does. Finding it that way means renaming it changes nothing here.
+
+    Args:
+        workflow: The parsed workflow.
+
+    Returns:
+        The job's key and body.
+    """
+    floors = _declared_floors()
+    found = [
+        (name, job)
+        for name, job in workflow["jobs"].items()
+        if any(f"{distribution}==" in _job_text(job) for distribution in floors)
+    ]
+    assert len(found) == 1, (
+        f"expected exactly one job pinning a declared floor with `==`; found {[name for name, _ in found]}"
+    )
+    return found[0]
+
+
+def _job_text(job: dict[str, Any]) -> str:
+    """Every ``run:`` script in a job, concatenated.
+
+    Args:
+        job: The parsed job.
+
+    Returns:
+        The scripts, newline-joined.
+    """
+    return "\n".join(str(step.get("run", "")) for step in job.get("steps", []))
+
+
+class TestSomethingInstallsTheFloorsThePackageShips:
+    """``AT-174`` / ``REQ-E-168`` -- the shipped artefact with no test behind it.
+
+    ``sdk-compat`` resolves the newest ``strands-agents`` every Monday and nothing resolved the oldest, so
+    the range this package promises was checked at one end. Asking the question found the answer: at the
+    floor it declared, ``strands-agents==1.48.0``, the package did not import -- ``storage.py`` reaches for
+    ``strands.storage.search.keyword``, which arrives in 1.54.0. Six modules failed collection.
+
+    **Read out of the manifest, not restated.** ``_declared_floors`` parses ``pyproject.toml``, so the
+    assertion is against whatever is declared today rather than against what was declared when this was
+    written. A new runtime dependency fails here on the change that adds it.
+
+    **Found by behaviour, not by key.** ``_floor_job`` looks for the job that pins a declared distribution
+    with ``==``. No other job in this file does that, and renaming this one breaks nothing.
+    """
+
+    def test_the_manifest_actually_declares_floors_to_check(self) -> None:
+        """AT-174 -- the vacuity guard, and it guards a regex against a manifest it does not own."""
+        floors = _declared_floors()
+        assert len(floors) >= 4, (
+            f"parsed {floors} out of the shipped extras, and there were four when this was written; a "
+            f"matcher that resolves nothing reports a clean result"
+        )
+
+    def test_a_job_installs_them(self, workflow: dict[str, Any]) -> None:
+        """AT-174 -- that the job exists at all, which is the half that was missing."""
+        name, _ = _floor_job(workflow)
+        assert name, "no job pins a declared floor"
+
+    def test_every_declared_floor_is_pinned_there(self, workflow: dict[str, Any]) -> None:
+        """AT-174 -- each one, at the version declared, so the resolver cannot lift one quietly.
+
+        ``>=`` rewritten as ``==``. Installing the extras and hoping is not this: a resolver handed
+        ``strands-agents>=1.54.0`` returns the newest release, which is what every other job already tests.
+        """
+        _, job = _floor_job(workflow)
+        script = _job_text(job)
+        for distribution, version in sorted(_declared_floors().items()):
+            assert f"{distribution}=={version}" in script, (
+                f"pyproject.toml declares {distribution}>={version} and the floor job does not install "
+                f"{distribution}=={version}, so that floor is a promise nothing checks"
+            )
+
+    def test_it_runs_the_tests_rather_than_only_resolving(self, workflow: dict[str, Any]) -> None:
+        """AT-174 -- a job that installs and stops asserts that pip can solve, which is not the claim."""
+        _, job = _floor_job(workflow)
+        assert "hatch run test" in _job_text(job), (
+            "the floor job installs the floors and never runs the suite against them, so it checks that "
+            "the versions resolve and not that the package works on them"
+        )
+
+    def test_it_runs_on_a_change_rather_than_on_the_schedule(self, workflow: dict[str, Any]) -> None:
+        """AT-174 -- the mirror of ``AT-107``: a floor breaks when the code moves, not when time passes."""
+        _, job = _floor_job(workflow)
+        declared = frozenset(str(key) for key in _triggers(workflow))
+        admitted = _admitted_events(job.get("if"), declared)
+        assert {"pull_request", "push"} <= admitted, (
+            f"the floor job runs on {sorted(admitted)}. An import added to a module is what invalidates a "
+            f"floor, and that arrives in a pull request"
+        )
+
+    def test_it_runs_the_oldest_interpreter_the_package_claims(self, workflow: dict[str, Any]) -> None:
+        """AT-174 -- because a resolver that hands back a floor is usually one an old Python constrained.
+
+        Compared against ``requires-python`` rather than against a literal, for the same reason the floors
+        are: raising the interpreter floor and leaving this job on 3.10 would test a combination the package
+        no longer claims.
+        """
+        _, job = _floor_job(workflow)
+        declared = str(_pyproject()["project"]["requires-python"])
+        oldest = declared.removeprefix(">=").strip()
+
+        versions = [
+            str(step["with"]["python-version"])
+            for step in job.get("steps", [])
+            if isinstance(step.get("with"), dict) and "python-version" in step["with"]
+        ]
+        assert versions, "the floor job pins no interpreter, so it runs whatever the runner defaults to"
+        assert versions == [oldest], (
+            f"the floor job runs Python {versions} and pyproject.toml declares requires-python "
+            f"{declared!r}; the floors describe the environment an old interpreter produces"
+        )
