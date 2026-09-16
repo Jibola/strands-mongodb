@@ -25,7 +25,7 @@ import ast
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import pytest
 import yaml
@@ -514,6 +514,67 @@ class TestTheTriggerWatchesEverythingTheSuiteReads:
         assert not _watched("python-notes/x.md", ["python/**"]), "`python/**` is not a prefix match on the name"
         assert not _watched("a/b/c.md", ["a/*/x.md"]), "`*` does not cross a separator"
         assert not _watched("AGENTS.md", []), "an empty filter watches nothing"
+
+
+_GATE_JOBS: Final = ("lint", "test", "floors", "contract", "coverage")
+
+
+class TestEveryPullRequestReachesTheGatesWhateverItsBaseIs:
+    """``AT-182`` / ``REQ-E-177`` -- the narrowing that let a pull request through with no gate job at all.
+
+    One change was proposed against the branch of an earlier one, because that earlier one was still open and
+    the two are unrelated. It came back with a single check -- the organisation's semgrep scan -- and no gate
+    job at all: ``gh run list --branch`` for that branch returned nothing. Both change triggers narrowed on
+    ``branches: [ main ]``, and the base was not ``main``.
+
+    This is the ``AT-138`` failure at the level above. ``paths`` and ``branches`` narrow the same trigger
+    independently, and ``AT-138`` reads only the first, so a filter can watch every file a change touches
+    and still exclude the change. Retargeting does not rescue it either: GitHub moves a stacked base to
+    ``main`` on its own, but the ``pull_request`` event for that is ``edited``, which is not one of the three
+    activity types a workflow receives by default.
+    """
+
+    def test_the_pull_request_trigger_narrows_on_no_branch(self, workflow: dict[str, Any]) -> None:
+        """A change proposed against any branch is graded, because a stack is a base that is not ``main``."""
+        pull_request = _triggers(workflow)["pull_request"]
+
+        assert "branches" not in pull_request, (
+            f"the pull_request trigger narrows on branches {pull_request['branches']}, so a pull request "
+            "based on anything else runs no gate job and reports the same green as one that passed"
+        )
+
+    def test_the_push_trigger_still_narrows_on_main_alone(self, workflow: dict[str, Any]) -> None:
+        """The asymmetry is the point, so it is asserted rather than left to whoever reads the file next.
+
+        A push to a topic branch is already graded by that branch's pull request. Dropping this filter too
+        would run the whole matrix twice on the same commit for the same verdict -- and the concurrency group
+        keys a push on the run id rather than the ref, so neither run would supersede the other.
+        """
+        push = _triggers(workflow)["push"]
+
+        assert push.get("branches") == ["main"], (
+            f"the push trigger narrows on {push.get('branches')}; every branch push with an open pull "
+            "request would be graded twice, and the concurrency group does not collapse the pair"
+        )
+
+    def test_dropping_the_branch_filter_did_not_take_the_path_filter_with_it(self, workflow: dict[str, Any]) -> None:
+        """The two narrowings are separate keys and the neighbouring classes depend on the other one.
+
+        Deleting the whole filter block would satisfy the first test here and quietly widen every trigger to
+        every file in the repository, which is the opposite of what ``AT-138`` spent a task establishing.
+        """
+        triggers = _triggers(workflow)
+
+        for event in ("pull_request", "push"):
+            paths = triggers[event].get("paths")
+            assert paths, f"the {event} trigger declares no paths, so it now matches every file in the tree"
+
+    def test_the_workflow_this_reads_is_the_one_with_the_gates_in_it(self, workflow: dict[str, Any]) -> None:
+        """The vacuity guard: a file with no triggers and no jobs would pass the first test on a technicality."""
+        jobs = workflow["jobs"]
+        missing = [job for job in _GATE_JOBS if job not in jobs]
+
+        assert missing == [], f"{missing} are not jobs in this workflow; its jobs are {sorted(jobs)}"
 
 
 class TestEveryJobCanBeStartedOnDemand:
