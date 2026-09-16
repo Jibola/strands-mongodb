@@ -28,6 +28,7 @@ from typing import Any
 
 import pytest
 import yaml
+from test_ci import _DEFAULT_TIMEOUT_MINUTES, _TIMEOUT_CEILING_MINUTES
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -575,3 +576,40 @@ class TestTheChangelogAndTheRepositoryAgreeAboutWhatExists:
             f"sdist include is {include}, so a source download of this package contains no changelog and "
             f"its reader has no way to know what changed between the version they have and this one"
         )
+
+
+class TestNoReleaseJobCanRunForSixHours:
+    """AT-165 / REQ-E-159 — the release half of the same requirement, with one job that is not like the others.
+
+    ``test_ci.py``'s class carries the argument and the measured numbers; the ceiling is imported from it
+    rather than written twice, because two copies of a number nothing compares is the drift ``AT-160``
+    exists to catch.
+
+    The job worth a sentence is ``publish``. It sits behind the ``pypi`` environment's required reviewers,
+    and a budget looks like it would cut the approval off — it does not. A job pending a deployment
+    protection rule has not started, so ``timeout-minutes`` has not begun counting; GitHub cancels an
+    unapproved run after thirty days on its own clock, and that is not a number this file can set. The
+    budget here bounds the upload once somebody has said yes, which takes seconds.
+    """
+
+    def test_every_job_declares_one(self, workflow: dict[str, Any]) -> None:
+        """AT-165 — including the two that have never run, since nothing has ever been released."""
+        undeclared = sorted(name for name, job in _jobs(workflow).items() if job.get("timeout-minutes") is None)
+        assert undeclared == [], (
+            f"these release jobs declare no timeout-minutes and so inherit GitHub's "
+            f"{_DEFAULT_TIMEOUT_MINUTES}: {undeclared}. This workflow has never run — there is no release "
+            f"— so a hang here would be discovered by a maintainer watching a tag they just pushed"
+        )
+
+    def test_none_of_them_is_the_default_in_disguise(self, workflow: dict[str, Any]) -> None:
+        """AT-165 — the same ceiling, and none of these jobs has a cluster tier's excuse for needing it."""
+        for name, job in _jobs(workflow).items():
+            budget = job.get("timeout-minutes")
+            assert isinstance(budget, int) and not isinstance(budget, bool), (
+                f"release job {name!r} declares timeout-minutes {budget!r}, which YAML did not read as an integer"
+            )
+            assert 0 < budget <= _TIMEOUT_CEILING_MINUTES, (
+                f"release job {name!r} budgets {budget} minutes against a ceiling of "
+                f"{_TIMEOUT_CEILING_MINUTES}. Nothing here runs a cluster tier, so there is no job in this "
+                f"workflow with a reason to approach it"
+            )

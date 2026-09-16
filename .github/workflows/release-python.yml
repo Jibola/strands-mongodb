@@ -29,6 +29,9 @@ jobs:
   gate:
     name: Release gate
     runs-on: ubuntu-latest
+    # The same scheme `ci-python.yml` uses, and for the same reason: nothing here should be allowed to
+    # sit for six hours. `publish` is the one to read twice -- see the note on its own budget. `AT-165`.
+    timeout-minutes: 20  # The whole unit tier on one interpreter, plus the gate's own checks.
 
     # The build tier, so the wheel and sdist are resolved from PyPI exactly as CI does it. Set here for
     # the same reason `ci-python.yml` sets it on one job: the artifact is the same on every interpreter.
@@ -73,6 +76,7 @@ jobs:
   contract:
     name: Contract tier
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # A container start plus the contract tier, as in CI.
 
     # A real MongoDB, supplied by the runner rather than by a secret -- the same container
     # `ci-python.yml` gives its contract job, for the same reason it costs nothing. A release workflow
@@ -122,6 +126,7 @@ jobs:
     name: Build and verify the artifact
     needs: [gate, contract]
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # A build of both artifacts and the checks that they are the right ones.
 
     steps:
       - name: Checkout code
@@ -174,6 +179,10 @@ jobs:
     name: Publish to PyPI
     needs: build
     runs-on: ubuntu-latest
+    # This does not cut the approval short. A job waiting on an environment's required reviewers has not
+    # started, and the budget only begins counting when it does; GitHub cancels an unapproved run after
+    # thirty days on its own clock. What this bounds is the upload, once somebody has said yes.
+    timeout-minutes: 10
 
     # The environment PyPI's publisher is bound to, and where the required reviewers live. A tag alone
     # does not publish: a human approves the deployment first, which is the last stop before an upload
