@@ -3234,7 +3234,10 @@ class TestWhatASearchHandsBack:
         # instead of printing two sets for the reader to diff.
         assert metadata["_id"]
         assert metadata["_scope"] == "tenant-a"
-        assert metadata["_search_type"] in {"vector", "text"}
+        # Every tier that can resolve, not every tier that could when this was written. The claim is that
+        # the key carries the tier that ran; which one that is depends on the deployment, and `auto`
+        # prefers fusion wherever both single tiers came up (`REQ-E-145`).
+        assert metadata["_search_type"] in {"vector", "text", "hybrid"}
         assert isinstance(metadata["_relevance_score"], float)
         assert metadata["source"] == "chat"
 
@@ -3581,7 +3584,11 @@ class TestTheShippedDefaultAgainstADeploymentWithNoModel:
         results = await _answered(atlas_store, QUERY_TEXT)
 
         assert [entry.content for entry in results] == ["the user prefers dark mode"]
-        if _metadata(results[0])["_search_type"] == "vector":
+        # `hybrid` beside `vector`, because this guard is detecting one thing: whether the vector half of
+        # the index set came up. Both answers mean it did -- `auto` resolves to fusion only where both
+        # single tiers exist (`REQ-E-144`, `REQ-E-145`), so on a deployment with a registered model the
+        # tier that runs is `hybrid`, where before the fused tier existed it was `vector`.
+        if _metadata(results[0])["_search_type"] in {"vector", "hybrid"}:
             pytest.skip("MONGODB_ATLAS_URI names a deployment with a registered embedding model; nothing is degraded")
         assert _metadata(results[0])["_search_type"] == "text"
 
@@ -3603,7 +3610,11 @@ class TestSearchTypeReportsTheTierThatRan:
         results = await _answered(atlas_store, QUERY_TEXT)
 
         assert results
-        if _metadata(results[0])["_search_type"] == "vector":
+        # `hybrid` beside `vector`, because this guard is detecting one thing: whether the vector half of
+        # the index set came up. Both answers mean it did -- `auto` resolves to fusion only where both
+        # single tiers exist (`REQ-E-144`, `REQ-E-145`), so on a deployment with a registered model the
+        # tier that runs is `hybrid`, where before the fused tier existed it was `vector`.
+        if _metadata(results[0])["_search_type"] in {"vector", "hybrid"}:
             pytest.skip("MONGODB_ATLAS_URI names a deployment with a registered embedding model; nothing is degraded")
         assert _metadata(results[0])["_search_type"] == "text"
 
@@ -3664,13 +3675,31 @@ class TestTheScoreBoundDropsResults:
     result's score is checked to :data:`_SCORE_DRIFT` and not for equality, because the same document on the
     same query text scored 6.9e-5 differently a minute apart. Which document survived is asserted by its
     content, which is the claim the requirement actually makes.
+
+    The third was found the same way on 2026-09-16, and is the same mistake one level up: calibrating
+    against an unbounded query is only safe while the unbounded query runs the same tier as the bounded
+    one. Adding the fused tier broke that silently, because setting a bound is itself what decides the
+    tier (`REQ-E-146`). The measuring store now declares a bound of its own for that reason alone.
     """
 
     async def test_a_bound_above_the_lowest_score_drops_exactly_that_result(
         self, atlas_uri: str, test_database_name: str, unique_collection_name: str, caplog: pytest.LogCaptureFixture
     ) -> None:
         """AT-059b. Measure first, then bound just above the measurement's floor."""
-        writer = _real_store(atlas_uri, test_database_name, unique_collection_name, writable=True, scope="tenant-a")
+        # `min_score=0.0` on the measuring store, which is not a bound so much as a declaration that one
+        # exists. Tier resolution reads whether a bound is set and never its value (`REQ-E-146`), so this
+        # puts the writer on exactly the path the bounded store below will take -- whichever path that is
+        # on this deployment -- while dropping nothing, because every tier's score is non-negative.
+        #
+        # Without it the two stores resolve differently and the test measures one scale to bound another.
+        # Found on 2026-09-16 by `Atlas tiers` on `eb9ac2d`: the writer got fusion and measured RRF scores
+        # of 0.016 to 0.033, the bounded store declined fusion for vector and scored 0.771 and 0.887, and
+        # a bound of 0.0163 dropped neither. Pinning a literal `search_type` instead would not work here:
+        # this test has to pass against a deployment with a registered embedding model and against one
+        # without, and those resolve to different tiers.
+        writer = _real_store(
+            atlas_uri, test_database_name, unique_collection_name, writable=True, scope="tenant-a", min_score=0.0
+        )
         try:
             # Repeated terms outrank a single mention, which is what puts a measurable gap between the
             # highest and lowest score. Uniform text scores everything within rounding distance.

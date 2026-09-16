@@ -60,8 +60,18 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Keyed on the event as well, because `github.ref` is `refs/heads/main` for a push to main, for a
+  # dispatch against main and for the weekly cron alike. Keying on the ref alone put all three in one
+  # group, where `cancel-in-progress` made whichever started last kill the others. The job that lost was
+  # always `Atlas tiers`: 36 minutes, startable only by the cron or by hand, and destroyed by any merge
+  # that landed while it ran. The fallback is the run id rather than the ref so that two dispatches are
+  # two questions rather than one asked twice; a pull request still keys on its number, below.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  # Superseding is right for a pull request and wrong everywhere else. A second push to a branch makes
+  # the first run's verdict worthless -- it grades a commit nobody will merge. A push, a dispatch and a
+  # cron each grade a commit that is already on main, where the run being cancelled is the only verdict
+  # that commit will ever get.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
@@ -109,7 +119,7 @@ jobs:
         # Quoted, because unquoted 3.10 is the float 3.1 in YAML and setup-python would resolve it to 3.1.
         # This list must equal the Programming Language :: Python :: classifiers in pyproject.toml, and
         # AT-105 compares the two as sets in both directions.
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
       fail-fast: false
 
     steps:

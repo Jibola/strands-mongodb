@@ -335,6 +335,60 @@ def _admitted_events(condition: str | None, triggers: frozenset[str]) -> frozens
     return frozenset(admitted)
 
 
+#: One ``${{ ... }}`` interpolation. The two concurrency keys are the only place this workflow computes a
+#: value instead of stating one, so the grammar below stays as small as they are.
+_INTERPOLATION = re.compile(r"\$\{\{(.+?)\}\}")
+
+#: A context read: ``github.`` and a dotted path. The paths this workflow reads are a closed set, and one
+#: it does not read is refused rather than rendered as the empty string -- an unknown key quietly becoming
+#: "" is precisely how a group expression collapses two events into one group with nobody the wiser.
+_CONTEXT_READ = re.compile(r"github\.([a-z_.]+)\Z")
+
+#: ``github.x == 'literal'``, the only comparison either concurrency key performs.
+_CONTEXT_EQUALITY = re.compile(r"github\.([a-z_.]+)\s*==\s*'([a-z_]+)'\Z")
+
+
+def _context_read(term: str, context: dict[str, str]) -> str:
+    """One ``github.x`` lookup, refusing a key this reader holds no value for."""
+    match = _CONTEXT_READ.fullmatch(term.strip())
+    assert match is not None, (
+        f"this reader does not understand {term.strip()!r}. Extend it rather than letting an expression "
+        "nothing reads decide which runs share a group"
+    )
+    key = match.group(1)
+    assert key in context, f"{term.strip()!r} reads a context key this reader has no value for: {sorted(context)}"
+    return context[key]
+
+
+def _render(template: object, context: dict[str, str]) -> str:
+    """Render a workflow expression against one run's context.
+
+    The same reasoning as :func:`_admitted_events`, applied to the other half of the file that decides
+    whether a job runs. Comparing the expression to the string somebody typed answers "is this still
+    spelled that way". What the tests below ask is "do these two runs land in the same group", and
+    nothing but evaluating it answers that.
+    """
+
+    def one(match: re.Match[str]) -> str:
+        terms = match.group(1).split("||")
+        if len(terms) == 1:
+            equality = _CONTEXT_EQUALITY.fullmatch(terms[0].strip())
+            if equality is not None:
+                key, literal = equality.groups()
+                assert key in context, f"{terms[0].strip()!r} reads a key this reader has no value for"
+                return "true" if context[key] == literal else "false"
+            return _context_read(terms[0], context)
+        # ``||`` is first-non-empty in a workflow expression, and only a lookup can be empty. An equality
+        # inside one would be read as its truthy spelling "false", so the reader refuses it in _context_read.
+        for term in terms:
+            value = _context_read(term, context)
+            if value:
+                return value
+        return ""
+
+    return _INTERPOLATION.sub(one, str(template))
+
+
 class TestTheGatesEveryChangeMustPass:
     """AT-104 / REQ-E-104 -- the four things a pull request has to clear before anyone reads it.
 
@@ -533,6 +587,131 @@ class TestEveryJobCanBeStartedOnDemand:
         for condition in ("success()", "github.ref == 'refs/heads/main'", "github.event_name == 'push' && true"):
             with pytest.raises(AssertionError, match="does not understand"):
                 _admitted_events(condition, frozenset({"push", "schedule"}))
+
+
+class TestOneRunNeverCancelsAnUnrelatedOne:
+    """``AT-159`` / ``REQ-E-152`` -- the concurrency group, which had three unrelated events inside it.
+
+    ``github.ref`` is ``refs/heads/main`` for a push to ``main``, for a dispatch against ``main`` and for
+    the weekly cron alike. Keying the group on it put all three in one group, and ``cancel-in-progress:
+    true`` then made whichever started last kill the others.
+
+    The job that loses is always the same one. ``Atlas tiers`` measured 36 minutes, it is the only job
+    here that cannot be re-run cheaply, and the two events that start it -- the cron and a dispatch --
+    are exactly the two with no second chance: the cron's is a week away, and a dispatch is a button
+    somebody pressed because they wanted an answer now. A merge landing during either run destroyed it,
+    and a cancelled run sits in the checks list looking like a failure.
+
+    Superseding is right for a pull request and wrong everywhere else, which is the asymmetry these tests
+    pin. A second push to a branch makes the first run's verdict worthless -- it grades a commit nobody
+    will merge. A push, a dispatch and a cron each grade a commit that is already on ``main``, where the
+    cancelled run is the only verdict that commit was ever going to get.
+    """
+
+    #: One run's context. A push to ``main`` and a dispatch against ``main`` agree on every value here
+    #: except ``event_name`` and ``run_id``, which is the whole of the defect above.
+    BASE_CONTEXT = {
+        "workflow": "CI - Python",
+        "event_name": "push",
+        "ref": "refs/heads/main",
+        "run_id": "35076582911",
+        "sha": "eb9ac2d6",
+        "event.pull_request.number": "",
+    }
+
+    def _context(self, **overrides: str) -> dict[str, str]:
+        return {**self.BASE_CONTEXT, **overrides}
+
+    def _group(self, workflow: dict[str, Any], **overrides: str) -> str:
+        return _render(workflow["concurrency"]["group"], self._context(**overrides))
+
+    def _pull_request(self, number: str, run_id: str) -> dict[str, str]:
+        return self._context(
+            event_name="pull_request",
+            ref=f"refs/pull/{number}/merge",
+            run_id=run_id,
+            **{"event.pull_request.number": number},
+        )
+
+    def _supersedes(self, workflow: dict[str, Any], context: dict[str, str]) -> bool:
+        """Whether a newer run cancels an in-progress one, for a run in this context."""
+        rendered = _render(workflow["concurrency"]["cancel-in-progress"], context)
+        assert rendered in {"true", "false"}, (
+            f"cancel-in-progress rendered {rendered!r} for a {context['event_name']} run. A literal there "
+            "applies one answer to every event, and the events differ: see this class's docstring"
+        )
+        return rendered == "true"
+
+    def test_no_two_events_against_main_share_a_group(self, workflow: dict[str, Any]) -> None:
+        """AT-159 -- the finding. Three events, one ref, and one of them cancelling another."""
+        groups = {
+            event: self._group(workflow, event_name=event, run_id=str(index))
+            for index, event in enumerate(("push", "workflow_dispatch", "schedule"), start=1)
+        }
+        assert len(set(groups.values())) == len(groups), (
+            f"these events against main share a concurrency group: {groups}. A dispatch or the weekly "
+            "cron is cancelled by any merge that lands while it runs, and Atlas tiers runs 36 minutes"
+        )
+
+    def test_two_dispatches_do_not_share_a_group(self, workflow: dict[str, Any]) -> None:
+        """AT-159 -- two presses of a "run CI now" button are two questions, not one asked twice."""
+        first = self._group(workflow, event_name="workflow_dispatch", run_id="1")
+        second = self._group(workflow, event_name="workflow_dispatch", run_id="2")
+        assert first != second, f"both dispatches land in {first!r}, so the second cancels the first"
+
+    def test_two_runs_of_one_pull_request_do_share_a_group(self, workflow: dict[str, Any]) -> None:
+        """AT-159 -- the other direction, and the reason the key is not simply unique per run.
+
+        Coalescing a pull request's runs is the behaviour worth keeping. Losing it would run the full
+        matrix against every intermediate commit of a branch somebody is still pushing to.
+        """
+        first = _render(workflow["concurrency"]["group"], self._pull_request("20", run_id="1"))
+        second = _render(workflow["concurrency"]["group"], self._pull_request("20", run_id="2"))
+        assert first == second, f"two runs of one pull request landed in {first!r} and {second!r}"
+
+    def test_two_pull_requests_do_not_share_a_group(self, workflow: dict[str, Any]) -> None:
+        """AT-159 -- the guard on the test above, which a constant group expression also passes."""
+        twenty = _render(workflow["concurrency"]["group"], self._pull_request("20", run_id="1"))
+        twenty_one = _render(workflow["concurrency"]["group"], self._pull_request("21", run_id="2"))
+        assert twenty != twenty_one, f"both pull requests land in {twenty!r}, so one cancels the other"
+
+    def test_only_a_pull_request_run_is_superseded(self, workflow: dict[str, Any]) -> None:
+        """AT-159 -- ``REQ-E-152``: the asymmetry, asserted in both directions."""
+        assert self._supersedes(workflow, self._pull_request("20", run_id="1")), (
+            "a second push to a pull request should cancel the first run, which grades a commit nobody will merge"
+        )
+        kept = [
+            event
+            for event in ("push", "workflow_dispatch", "schedule")
+            if self._supersedes(workflow, self._context(event_name=event))
+        ]
+        assert kept == [], (
+            f"a newer run cancels an in-progress one for {kept}, and each of those grades a commit "
+            "already on main, where the cancelled run is the only verdict that commit will ever get"
+        )
+
+    def test_the_reader_resolves_the_fallback_rather_than_the_first_term(self) -> None:
+        """AT-159 -- the vacuity guard. Every test above passes if the reader renders everything to ""."""
+        template = "${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}"
+
+        on_a_pull_request = _render(template, {**self.BASE_CONTEXT, "event.pull_request.number": "20"})
+        assert on_a_pull_request == "CI - Python-20", on_a_pull_request
+
+        on_a_push = _render(template, self.BASE_CONTEXT)
+        assert on_a_push == "CI - Python-35076582911", on_a_push
+
+        assert _render("${{ github.event_name == 'push' }}", self.BASE_CONTEXT) == "true"
+        assert _render("${{ github.event_name == 'pull_request' }}", self.BASE_CONTEXT) == "false"
+
+    def test_the_reader_refuses_an_expression_it_cannot_read(self) -> None:
+        """AT-159 -- a reader that answers anyway turns an unread expression into a green test."""
+        for template in (
+            "${{ github.head_ref }}",
+            "${{ contains(github.ref, 'main') }}",
+            "${{ github.event.pull_request.number || github.ref || github.sha }}-x",
+        ):
+            with pytest.raises(AssertionError, match="does not understand|no value for"):
+                _render(template, {"workflow": "CI - Python", "event_name": "push", "run_id": "1"})
 
 
 class TestTheMatrixCoversEveryVersionTheClassifiersClaim:
