@@ -1291,3 +1291,56 @@ class TestNothingNeedsMoreThanTheOldestInterpreterInTheMatrix:
                         f"{path.relative_to(PROJECT_ROOT)}: the string at line {node.lineno} will not compile "
                         f"on 3.10, at its own lines {offenders}"
                     )
+
+
+#: GitHub's default job timeout, in minutes. Not a setting anybody chose — it is what a workflow gets when
+#: it declares nothing, and six hours of a hung runner is what it costs.
+_DEFAULT_TIMEOUT_MINUTES = 360
+
+#: The ceiling this repository holds itself to. `Atlas tiers` is the long pole at 36 minutes observed, so
+#: anything above an hour is either a job nobody measured or the default wearing a number.
+_TIMEOUT_CEILING_MINUTES = 60
+
+
+class TestNoJobCanRunForSixHours:
+    """AT-165 / REQ-E-159 — every job declares how long it is allowed to take.
+
+    Nothing in either workflow set ``timeout-minutes``, so every job inherited GitHub's 360. The failure
+    that matters is not a slow job; it is a *hung* one, which looks identical to a running one until the
+    six hours are up. This repository has three places where that is a real shape rather than a
+    hypothetical: ``initialize()`` polls a search index until it is queryable, the cluster tiers talk to
+    Atlas over the network, and ``REQ-E-124`` exists because a mongot that is merely unreachable is a
+    thing that happens here.
+
+    The budgets are per job rather than one number at the top, because the jobs are not alike. Measured
+    over the last eleven runs of this workflow, maxima: ``Lint`` 52s, the five ``Test`` legs 196s,
+    ``Contract tier`` 92s, ``Coverage floors`` 263s, ``Latest SDK compatibility`` 145s, and ``Atlas
+    tiers`` 2,170s. One ceiling above the slowest would give the fastest job a fifty-fold margin, which is
+    a budget that never fires.
+    """
+
+    def test_every_job_declares_one(self, workflow: dict[str, Any]) -> None:
+        """AT-165 — read from the job mapping, so a job added later has to answer the question too."""
+        jobs = workflow["jobs"]
+        assert jobs, "the workflow defines no jobs, so this test proves nothing"
+
+        undeclared = sorted(name for name, job in jobs.items() if job.get("timeout-minutes") is None)
+        assert undeclared == [], (
+            f"these jobs declare no timeout-minutes and so inherit GitHub's {_DEFAULT_TIMEOUT_MINUTES}: "
+            f"{undeclared}. A job that hangs rather than fails holds a runner for six hours, and on a "
+            f"cluster tier that is indistinguishable from one that is merely waiting on a search index"
+        )
+
+    def test_none_of_them_is_the_default_in_disguise(self, workflow: dict[str, Any]) -> None:
+        """AT-165 — a budget has to be a number somebody chose, which means it has to be small enough to fire."""
+        budgets = {name: job.get("timeout-minutes") for name, job in workflow["jobs"].items()}
+
+        for name, budget in budgets.items():
+            assert isinstance(budget, int) and not isinstance(budget, bool), (
+                f"job {name!r} declares timeout-minutes {budget!r}, which YAML did not read as an integer"
+            )
+            assert 0 < budget <= _TIMEOUT_CEILING_MINUTES, (
+                f"job {name!r} budgets {budget} minutes. The slowest job in this workflow is the Atlas tier "
+                f"at 36 minutes observed, so anything above {_TIMEOUT_CEILING_MINUTES} is the "
+                f"{_DEFAULT_TIMEOUT_MINUTES}-minute default with a different number on it"
+            )

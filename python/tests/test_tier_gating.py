@@ -334,6 +334,70 @@ class TestAnUnreachableSearchProcessSkipsRatherThanFails:
 
         assert raised.typename == "Skipped"
 
+    def test_the_index_management_channel_is_recognised_too(self) -> None:
+        """``AT-167`` / ``REQ-E-161`` -- one outage, two codes, because mongod reaches mongot over two channels.
+
+        Measured on 2026-09-16 on a deployment running ``mongod`` with nothing on its ``mongotHost``
+        port. ``$search`` answered with 6 and the host and port that refused; ``$listSearchIndexes``
+        and ``createSearchIndexes`` answered with **125**, ``CommandFailed``, *"Error connecting to
+        Search Index Management service."* -- a different code, a different sentence, no host in it.
+        A guard that knows only 6 therefore catches the query surface and misses every call that
+        provisions or reads an index, which on that deployment was all twelve of the failures.
+        """
+        from pymongo.errors import OperationFailure
+
+        with pytest.raises(BaseException, match="search process is unreachable") as raised:
+            skip_if_search_is_unreachable(
+                OperationFailure(
+                    "Executor error during aggregate command :: caused by :: Error connecting to "
+                    "Search Index Management service.",
+                    code=125,
+                )
+            )
+
+        assert raised.typename == "Skipped"
+
+    def test_a_command_failed_that_names_something_else_is_left_to_fail(self) -> None:
+        """The other half of it, and the reason 125 is matched with its message rather than alone.
+
+        ``CommandFailed`` is a general code -- unlike 6, which is a network answer, it is what the
+        server says about a command that did not work out. Matching the number on its own would skip
+        on a whole class of real results. The sentence naming the Search Index Management service is
+        the part this package cannot cause: the host it names comes from a server parameter.
+        """
+        from pymongo.errors import OperationFailure
+
+        try:
+            skip_if_search_is_unreachable(OperationFailure("Executor error during aggregate command", code=125))
+        except BaseException as outcome:  # noqa: BLE001 - a skip is a BaseException, and it is the defect
+            pytest.fail(
+                f"the guard skipped on a bare CommandFailed: {outcome!r}. 125 without the sentence that "
+                f"names the index management service is an ordinary command failure, and skipping on it "
+                f"would hide results the suite exists to report"
+            )
+
+    def test_a_reason_three_links_down_is_still_found(self) -> None:
+        """``AT-167`` / ``REQ-E-161`` -- the chain is walked to the end, not read two links deep.
+
+        ``REQ-E-160`` gives the ``auto`` path's *"no search tier could be prepared"* a cause, and that
+        cause is itself this package's error wrapping the driver's. So the code now sits three links
+        from what the caller catches, and a guard reading ``error`` and ``error.__cause__`` alone
+        stops one link short of every failure on that path.
+        """
+        from pymongo.errors import OperationFailure
+        from strands.types.exceptions import StorageError
+
+        driver = OperationFailure("Error connecting to localhost:27027", code=HOST_UNREACHABLE)
+        tier = StorageError("strands_mongodb: creating text_index failed")
+        tier.__cause__ = driver
+        outer = StorageError("strands_mongodb: no search tier could be prepared on testdb.memory")
+        outer.__cause__ = tier
+
+        with pytest.raises(BaseException, match="search process is unreachable") as raised:
+            skip_if_search_is_unreachable(outer)
+
+        assert raised.typename == "Skipped"
+
     @pytest.mark.parametrize("code", [8, 26, 31082, None], ids=["unknown-error", "namespace", "unsupported", "none"])
     def test_every_other_failure_is_left_to_fail(self, code: int | None) -> None:
         """The half that keeps the guard honest.
@@ -350,6 +414,67 @@ class TestAnUnreachableSearchProcessSkipsRatherThanFails:
                 f"the guard skipped on code {code}: {outcome!r}. Only HostUnreachable is infrastructure, "
                 f"and a skip on anything else turns a result the suite has to report into a clean-looking run"
             )
+
+
+class TestTheOutageSkipsWhereverItSurfaces:
+    """``AT-167`` / ``REQ-E-161`` -- the guard reaches the arrange phase, not only the act phase.
+
+    What the 2026-09-16 reproduction settled. With the codes widened and the chain walked, two of the
+    twelve failures became skips and ten did not, and the ten had nothing in common with the two except
+    *where* they were standing: they failed on ``await store.add(...)``, the line before the search, or
+    in a fixture. ``add`` calls ``initialize`` and ``initialize`` provisions the search indexes, so on a
+    deployment with no mongot the outage arrives during setup and never reaches the search helper that
+    holds the guard.
+
+    So the narrowness that was wrong was in the call sites, not in the match. A hook around the setup
+    and call phases sees the failure wherever it is standing; the match stays exactly as strict, which
+    is what keeps a package regression a failure.
+    """
+
+    @staticmethod
+    def _outage() -> BaseException:
+        from pymongo.errors import OperationFailure
+
+        return OperationFailure(
+            "Executor error during aggregate command :: caused by :: Error connecting to Search "
+            "Index Management service.",
+            code=125,
+        )
+
+    @pytest.mark.parametrize("phase", ["setup", "call"])
+    def test_an_outage_escaping_either_phase_becomes_a_skip(self, phase: str) -> None:
+        """Both phases, because a fixture that provisions indexes fails in the first one.
+
+        A failure in setup is reported as an *error* rather than a failure, which reads as "the suite is
+        broken" -- the worst of the three readings for something an operator fixes with a restart.
+        """
+        import conftest
+
+        wrapper = getattr(conftest, f"pytest_runtest_{phase}")(item=None)
+        next(wrapper)
+
+        with pytest.raises(BaseException, match="search process is unreachable") as raised:
+            wrapper.throw(self._outage())
+
+        assert raised.typename == "Skipped"
+
+    @pytest.mark.parametrize("phase", ["setup", "call"])
+    def test_every_other_failure_comes_out_as_it_went_in(self, phase: str) -> None:
+        """The half that keeps it honest: the hook is a filter, not a net.
+
+        An ``AssertionError`` is what a real defect looks like arriving here, and it has to survive the
+        wrapper unchanged -- same type, same message -- or every red test in the suite would be one
+        wrapper bug away from reading green.
+        """
+        import conftest
+
+        wrapper = getattr(conftest, f"pytest_runtest_{phase}")(item=None)
+        next(wrapper)
+
+        with pytest.raises(AssertionError, match="two results, got one") as raised:
+            wrapper.throw(AssertionError("expected two results, got one"))
+
+        assert raised.typename == "AssertionError"
 
 
 class TestTheEnvFileFillsTierVariables:

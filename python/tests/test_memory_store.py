@@ -1519,6 +1519,31 @@ class TestWhatInitializeDecides:
         assert len([record for record in caplog.records if "search tier is not available" in record.getMessage()]) == 2
         assert store._initialized is False
 
+    async def test_the_raise_carries_the_last_tiers_reason_rather_than_pointing_at_the_log(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``AT-166`` / ``REQ-E-160`` -- the reason travels on the exception, not only in a log line.
+
+        Measured on 2026-09-16 against a deployment whose mongot was gone: twelve cluster tests failed
+        here with *"Each tier's failure is logged above with the server's own reason"* and a traceback
+        that carried no reason and no server error code at all. The codes existed -- 125 on the index
+        management channel -- but they were spent on ``logger.warning`` and dropped, so the only caller
+        who could see why was one with logging configured at ``WARNING``. An exception that tells its
+        reader to go and look somewhere else is an exception with one job left undone.
+        """
+        _patch_setup(monkeypatch, failing=frozenset({"vector_index", "text_index"}))
+        store = _store()
+
+        with pytest.raises(StorageError) as caught:
+            await store.initialize()
+
+        cause = caught.value.__cause__
+        assert cause is not None, (
+            "the raise names no cause, so a traceback of it says no tier could be prepared and nothing "
+            "about why -- which is the whole of what a reader needs"
+        )
+        assert _PRETEND_REASON in str(cause)
+
     async def test_auto_landing_on_text_warns_that_answers_became_lexical(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:

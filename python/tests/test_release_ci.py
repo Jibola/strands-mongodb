@@ -22,11 +22,19 @@ from __future__ import annotations
 
 import fnmatch
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+from test_ci import _DEFAULT_TIMEOUT_MINUTES, _TIMEOUT_CEILING_MINUTES
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - exercised only on the 3.10 floor
+    # The same alias `test_examples.py` and `test_migration.py` use, for the same reason.
+    import tomli as tomllib
 
 # tests/ -> python/ -> the repository root, which is where `.github/` belongs.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -387,4 +395,221 @@ class TestTheReleaseGateIsNoWeakerThanCI:
             assert "secrets." not in str(uri), f"job {name!r} takes MONGODB_URI from a secret: {uri!r}"
             assert job.get("services"), (
                 f"job {name!r} sets MONGODB_URI to {uri!r} but declares no `services:` container to answer it"
+            )
+
+
+#: The release document, beside the package README rather than at the repository root: it is about
+#: releasing the Python distribution, and a second language in this repository releases on its own tag.
+RELEASING_PATH = PROJECT_ROOT / "RELEASING.md"
+
+#: The changelog, in the same place and for the same reason. ``pyproject.toml`` points ``readme`` at
+#: ``python/README.md``, and these two are that document's neighbours.
+CHANGELOG_PATH = PROJECT_ROOT / "CHANGELOG.md"
+
+#: The marker both READMEs carry above their install blocks while nothing is on PyPI. It is the
+#: repository's own statement about its publication state, and ``AT-164`` makes the changelog answer to it.
+UNPUBLISHED_MARKER = "<!-- skip: these reach PyPI for a package that is not published yet -->"
+
+#: ``## [Unreleased]`` or ``## [0.1.0] - 2026-09-16``. The bracketed form is Keep a Changelog's, and the
+#: date group is what distinguishes a section that describes a release from one that describes a plan.
+_CHANGELOG_HEADING = re.compile(r"^##\s+\[(?P<version>[^\]]+)\](?:\s*-\s*(?P<date>\S+))?\s*$", re.MULTILINE)
+
+#: The version table in the repository-root README -- ``| `0.1.0` | ... |``. Read rather than duplicated,
+#: for the reason ``AT-161`` gives about that file: it is the landing page, and it is what a reader believes.
+_VERSION_ROW = re.compile(r"^>?\s*\|\s*`(?P<version>\d+\.\d+\.\d+)`\s*\|", re.MULTILINE)
+
+#: What a reader of a red run needs to be told, once, in the first line.
+_RELEASING_DEFECT = (
+    "REQ-E-157: the release workflow exists and is asserted, but nothing in this tree tells a person how to run it"
+)
+_CHANGELOG_DEFECT = "REQ-E-158: the repository publishes a version table and describes no version"
+
+
+def _document(path: Path, requirement: str) -> str:
+    """Read a release document, failing with the defect named rather than with a ``FileNotFoundError``.
+
+    A fixture would do this too, and the ``workflow`` fixture above is one. The difference matters while
+    the file is absent: a fixture that fails reports every test in the class as an *error*, and an error
+    reads as "the suite is broken" where a failure reads as "the thing under test is missing". These
+    documents are missing exactly once -- before they are written -- and that is the run whose first line
+    should say which file and which requirement.
+    """
+    assert path.is_file(), f"{requirement}: no document at {path}"
+    return path.read_text()
+
+
+class TestSomebodyCanActuallyPerformARelease:
+    """AT-163 / REQ-E-157 -- the release document, held to the workflow rather than to itself.
+
+    ``AT-134``…``AT-137`` assert that ``release-python.yml`` says what it must say. Nothing asserted that
+    a person could follow it. Four jobs run on a tag and only the last one does anything irreversible,
+    which means the cost of not knowing the order is paid exactly once, at the only moment it cannot be
+    undone.
+
+    Every assertion here reads its expectation out of the parsed workflow. A document that restates the
+    workflow passes the day it is written and drifts silently afterwards, which is the failure mode the
+    root ``README.md`` demonstrated for thirteen tasks with a passing test over it.
+    """
+
+    def test_it_names_every_job_the_workflow_runs(self, workflow: dict[str, Any]) -> None:
+        """AT-163 -- job names come from the YAML, so a fifth job fails here instead of being forgotten."""
+        releasing = _document(RELEASING_PATH, _RELEASING_DEFECT)
+        jobs = _jobs(workflow)
+        missing = sorted(
+            name for name, job in jobs.items() if name not in releasing and str(job.get("name", "")) not in releasing
+        )
+
+        assert missing == [], (
+            f"the release document does not mention these jobs: {missing}. A reader following it would "
+            f"not know they run, and one of them is the last gate before an upload that can only be yanked"
+        )
+
+    def test_it_names_the_tag_that_starts_a_release(self, workflow: dict[str, Any]) -> None:
+        """AT-163 -- the prefix is read from the trigger, not from this file's own constant."""
+        releasing = _document(RELEASING_PATH, _RELEASING_DEFECT)
+        patterns = [str(tag) for tag in (_triggers(workflow).get("push") or {}).get("tags") or []]
+        assert patterns, "the workflow declares no tag trigger, which AT-134 should have caught first"
+
+        for pattern in patterns:
+            prefix = pattern.rstrip("*")
+            assert prefix in releasing, (
+                f"the release document never mentions {prefix!r}, which is the only thing that starts a "
+                f"release; a reader has no way to know what to tag"
+            )
+
+    def test_it_names_the_environment_the_upload_waits_on(self, workflow: dict[str, Any]) -> None:
+        """AT-163 -- the protected environment is where a human approves, and it is a settings artifact.
+
+        It is the one part of the release a reader cannot discover by reading the repository, because
+        the environment and its required reviewers live in repository settings rather than in a file.
+        A release document that omits it describes a process that stops without explanation.
+        """
+        releasing = _document(RELEASING_PATH, _RELEASING_DEFECT)
+        environments = [
+            job["environment"]["name"] if isinstance(job.get("environment"), dict) else job.get("environment")
+            for job in _jobs(workflow).values()
+            if job.get("environment")
+        ]
+        assert environments, "no job binds an environment, which AT-135 should have caught first"
+
+        for environment in environments:
+            assert str(environment) in releasing, (
+                f"the release document never mentions the {environment!r} environment, where the release "
+                f"waits for a human and where it stops if nobody is watching"
+            )
+
+
+class TestTheChangelogAndTheRepositoryAgreeAboutWhatExists:
+    """AT-164 / REQ-E-158 -- two documents that both claim to say what a version contains.
+
+    The version table lives on the repository's landing page; the changelog is the file a packager
+    reads. Nothing derives either from the other, which is the same condition that let the ``dev``
+    extra and the hatch environment drift until ``AT-160`` compared them.
+
+    The second test is the one that earns its place. Both READMEs carry a marker saying the package is
+    not on PyPI. That marker becomes false the moment the name is claimed, and until now the only thing
+    tracking it was a line in a planning document outside this repository. Here it is a gate: the
+    changelog may not date a release while the repository says none has happened.
+    """
+
+    def test_its_versions_are_the_versions_the_landing_page_publishes(self) -> None:
+        """AT-164 -- compared as sets in both directions; ``Unreleased`` is not a version."""
+        changelog = _document(CHANGELOG_PATH, _CHANGELOG_DEFECT)
+        readme = (REPO_ROOT / "README.md").read_text()
+
+        documented = {
+            match.group("version")
+            for match in _CHANGELOG_HEADING.finditer(changelog)
+            if match.group("version").lower() != "unreleased"
+        }
+        published = {match.group("version") for match in _VERSION_ROW.finditer(readme)}
+        assert published, "the landing page's version table did not parse, so this test proves nothing"
+
+        assert documented == published, (
+            f"the changelog and the landing page disagree about which versions exist. Only in the "
+            f"changelog: {sorted(documented - published)}. Only on the landing page: "
+            f"{sorted(published - documented)}"
+        )
+
+    def test_nothing_is_dated_while_the_repository_says_nothing_is_published(self) -> None:
+        """AT-164 -- the install-block marker and the changelog change on the same day or neither does.
+
+        Both directions are asserted. While the marker is present no section may carry a date, and once
+        it is gone at least one must — so the test fails whichever half of the pair is forgotten, which
+        is the only arrangement that survives the claim being made by a person in a hurry.
+        """
+        changelog = _document(CHANGELOG_PATH, _CHANGELOG_DEFECT)
+        readmes = {
+            "README.md": (REPO_ROOT / "README.md").read_text(),
+            "python/README.md": (PROJECT_ROOT / "README.md").read_text(),
+        }
+        unpublished = {name for name, text in readmes.items() if UNPUBLISHED_MARKER in text}
+        dated = {
+            match.group("version"): match.group("date")
+            for match in _CHANGELOG_HEADING.finditer(changelog)
+            if match.group("date")
+        }
+
+        if unpublished:
+            assert dated == {}, (
+                f"{sorted(unpublished)} still say the package is not published, and the changelog dates "
+                f"{dated} as released. One of the two is wrong, and a dated release nobody can install is "
+                f"the more expensive way to be wrong"
+            )
+        else:
+            assert dated, (
+                "no README carries the unpublished marker any more, so the package is claimed on PyPI, "
+                "and the changelog still dates nothing as released"
+            )
+
+    def test_a_source_download_carries_it(self) -> None:
+        """AT-164 -- the sdist ships the changelog, on the same argument ``test_migration.py`` makes.
+
+        A changelog that exists only on GitHub is read by people who were already going to find the
+        repository. The reader it is written for is the one holding a source download and deciding
+        whether to upgrade, and ``include`` is what decides whether they have it.
+        """
+        include = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())["tool"]["hatch"]["build"]["targets"][
+            "sdist"
+        ]["include"]
+        assert CHANGELOG_PATH.name in include, (
+            f"sdist include is {include}, so a source download of this package contains no changelog and "
+            f"its reader has no way to know what changed between the version they have and this one"
+        )
+
+
+class TestNoReleaseJobCanRunForSixHours:
+    """AT-165 / REQ-E-159 — the release half of the same requirement, with one job that is not like the others.
+
+    ``test_ci.py``'s class carries the argument and the measured numbers; the ceiling is imported from it
+    rather than written twice, because two copies of a number nothing compares is the drift ``AT-160``
+    exists to catch.
+
+    The job worth a sentence is ``publish``. It sits behind the ``pypi`` environment's required reviewers,
+    and a budget looks like it would cut the approval off — it does not. A job pending a deployment
+    protection rule has not started, so ``timeout-minutes`` has not begun counting; GitHub cancels an
+    unapproved run after thirty days on its own clock, and that is not a number this file can set. The
+    budget here bounds the upload once somebody has said yes, which takes seconds.
+    """
+
+    def test_every_job_declares_one(self, workflow: dict[str, Any]) -> None:
+        """AT-165 — including the two that have never run, since nothing has ever been released."""
+        undeclared = sorted(name for name, job in _jobs(workflow).items() if job.get("timeout-minutes") is None)
+        assert undeclared == [], (
+            f"these release jobs declare no timeout-minutes and so inherit GitHub's "
+            f"{_DEFAULT_TIMEOUT_MINUTES}: {undeclared}. This workflow has never run — there is no release "
+            f"— so a hang here would be discovered by a maintainer watching a tag they just pushed"
+        )
+
+    def test_none_of_them_is_the_default_in_disguise(self, workflow: dict[str, Any]) -> None:
+        """AT-165 — the same ceiling, and none of these jobs has a cluster tier's excuse for needing it."""
+        for name, job in _jobs(workflow).items():
+            budget = job.get("timeout-minutes")
+            assert isinstance(budget, int) and not isinstance(budget, bool), (
+                f"release job {name!r} declares timeout-minutes {budget!r}, which YAML did not read as an integer"
+            )
+            assert 0 < budget <= _TIMEOUT_CEILING_MINUTES, (
+                f"release job {name!r} budgets {budget} minutes against a ceiling of "
+                f"{_TIMEOUT_CEILING_MINUTES}. Nothing here runs a cluster tier, so there is no job in this "
+                f"workflow with a reason to approach it"
             )

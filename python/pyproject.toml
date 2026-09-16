@@ -77,7 +77,12 @@ memory = [
 all = ["strands-mongodb[memory,storage]"]
 dev = [
     "pytest>=8.0.0,<9.0.0",
-    "pytest-asyncio>=0.25.0,<1.0.0",
+    # Floor at 1.0 because `filterwarnings` below turns a DeprecationWarning into an error, and 0.26
+    # calls `asyncio.get_event_loop_policy()` on every async test -- deprecated in 3.14, slated for
+    # removal in 3.16. Measured: the same suite under the same filter is 915 errors on 0.26.0 and 912
+    # passed on 1.4.0. The floor is load-bearing rather than tidy, which is why it is not just a ceiling
+    # raise: lowering it does not merely restore noise, it stops the suite running at all.
+    "pytest-asyncio>=1.0.0,<2.0.0",
     # The 90% aggregate floor is a release gate. A gate no installed tool can
     # measure is not a gate, and the scaffold declared the floor without declaring this.
     "pytest-cov>=5.0.0,<8.0.0",
@@ -141,13 +146,24 @@ fallback_version = "0.0.0"
 packages = ["src/strands_mongodb"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "tests", "examples", "README.md", "MIGRATION.md", "LICENSE", "NOTICE", "pyproject.toml"]
+include = [
+    "src",
+    "tests",
+    "examples",
+    "README.md",
+    "MIGRATION.md",
+    # The reader this is for is holding a source download and deciding whether to upgrade. `AT-164`.
+    "CHANGELOG.md",
+    "LICENSE",
+    "NOTICE",
+    "pyproject.toml",
+]
 
 [tool.hatch.envs.default]
 features = ["all"]
 dependencies = [
     "pytest>=8.0.0,<9.0.0",
-    "pytest-asyncio>=0.25.0,<1.0.0",
+    "pytest-asyncio>=1.0.0,<2.0.0",
     "pytest-cov>=5.0.0,<8.0.0",
     "ruff>=0.11.0,<1.0.0",
     "mypy>=1.15.0,<2.0.0",
@@ -219,6 +235,18 @@ asyncio_default_fixture_loop_scope = "function"
 # A typo in a marker name silently produces a test that never runs under its tier and always runs
 # under none. Strict mode turns that into a collection error.
 addopts = "--strict-markers --strict-config"
+# A deprecation is a deadline, and a deadline nobody reads is not a deadline. Until now the suite ended
+# `2269 warnings` and every one of them came from `pytest_asyncio` calling an API Python is removing in
+# 3.16, so a DeprecationWarning raised by this package would have arrived as line 2270 of a wall of text
+# nobody scrolls to. Erroring on the category is what makes the count meaningful: it is zero, and the
+# next one to appear is ours.
+#
+# Only `DeprecationWarning`. Not `error` for everything, because the two other warnings on file are
+# neither ours nor fixable by anything this project pins: a `ResourceWarning` from a client whose loop
+# closed under it, and a `PytestUnraisableExceptionWarning` from pymongo's periodic executor running as
+# a weakref callback on a dead loop. A filter wide enough to catch those would redden the suite for
+# somebody else's finalizer, which is how a strict setting gets turned off again a week later.
+filterwarnings = ["error::DeprecationWarning"]
 markers = [
     "contract: needs a real MongoDB deployment of any kind. Gated on MONGODB_URI.",
     "integration: needs Atlas or an Atlas CLI local deployment with mongot. Gated on MONGODB_ATLAS_URI.",

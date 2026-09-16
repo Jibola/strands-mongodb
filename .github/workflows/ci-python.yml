@@ -82,6 +82,12 @@ jobs:
     name: Lint
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    # Every job in this file declares one of these. The default is six hours -- not a number anybody
+    # chose, just what a job inherits by saying nothing -- and a runner that hangs on a network read
+    # spends all of it before anyone is told. Each budget below is a little above the slowest run this
+    # job has had, which is tight enough that a hang fails and loose enough that a slow runner does not.
+    # `AT-165`.
+    timeout-minutes: 10  # Lint: under a minute in practice.
 
     steps:
       - name: Checkout code
@@ -114,6 +120,7 @@ jobs:
     name: Test - Python ${{ matrix.python-version }}
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # The slowest leg runs a little over three minutes.
     strategy:
       matrix:
         # Quoted, because unquoted 3.10 is the float 3.1 in YAML and setup-python would resolve it to 3.1.
@@ -146,6 +153,7 @@ jobs:
     name: Contract tier
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # A container start plus the contract tier: about a minute and a half.
 
     # A real MongoDB, supplied by the runner rather than by a secret. The tier gate in conftest.py asks only
     # that MONGODB_URI point at something that answers, and nothing in this package needs a replica set.
@@ -191,6 +199,7 @@ jobs:
     name: Coverage floors
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # Two suites under coverage, which is the slowest of the change-trigger jobs.
 
     # The build tier, which builds a wheel and an sdist and resolves dependencies from PyPI. It is the one
     # tier gate that is not a connection string, so a runner with network is all it needs. Set here rather
@@ -225,6 +234,7 @@ jobs:
     name: Latest SDK compatibility
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 15  # A resolve against the unpinned SDK, then the unit tier.
 
     # The same container the contract job uses, for the same reason it costs nothing. The canary is
     # specified to run the contract tier beside both protocol checks; that clause was unmet while the
@@ -281,6 +291,7 @@ jobs:
     name: Atlas tiers
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 60  # The long pole: two tiers against a real cluster, 36 minutes at its slowest.
 
     # The two tiers a container cannot stand in for: integration needs mongot, and autoembed needs a
     # cluster with a registered embedding model. Off the change triggers, because a fork's pull request
