@@ -251,28 +251,61 @@ jobs:
         run: hatch run test
 
   contract:
-    name: Contract tier
+    name: Contract tier (${{ matrix.deployment.label }})
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 15  # A container start plus the contract tier: about a minute and a half.
+
+    # Twice, over two deployments, because half of what this tier asserts is invisible on one of them.
+    # `mongo:8` has no search process, so every claim about which search tier a store resolves is true
+    # there for the trivial reason that it resolves none -- and the tier resolution rules are exactly what
+    # nothing on a change trigger was grading. The Atlas local image carries mongot, so the same tests read
+    # the other side of every branch they contain. Measured 2026-09-17: 99 pass on `mongo:8` in 12s, 94
+    # pass and 5 skip on the search image in 27s, and the skips are guards that already existed for a
+    # contract deployment with search -- the suite was written for both and only ever given one.
+    #
+    # `fail-fast: false` because the two legs answer different questions and the answer to one is not a
+    # reason to stop asking the other. `AT-187`.
+    strategy:
+      fail-fast: false
+      matrix:
+        deployment:
+          - label: mongod alone
+            image: mongo:8
+            # Its own `mongosh`, which is in that image.
+            health: "mongosh --quiet --eval 'db.adminCommand({ping:1})'"
+            expect_search: ''
+          - label: with a search process
+            image: mongodb/mongodb-atlas-local:8
+            # The image's own health check rather than a ping, because a ping answers as soon as `mongod`
+            # is up and mongot is the part this leg exists for. `runner healthcheck` is what the image
+            # declares in its own HEALTHCHECK, and GitHub's service options replace that declaration
+            # rather than adding to it, so naming it here is what keeps it.
+            health: /usr/local/bin/runner healthcheck
+            expect_search: '1'
 
     # A real MongoDB, supplied by the runner rather than by a secret. The tier gate in conftest.py asks only
     # that MONGODB_URI point at something that answers, and nothing in this package needs a replica set.
     services:
       mongodb:
-        image: mongo:8
+        image: ${{ matrix.deployment.image }}
         ports:
           - 27017:27017
         options: >-
-          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1})'"
+          --health-cmd "${{ matrix.deployment.health }}"
           --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
+          --health-timeout 60s
+          --health-retries 20
 
     # Under env: rather than on the command line. REQ-E-108 is written about every connection string rather
     # than only the secret ones: a rule with an exception is a rule somebody has to remember.
     env:
       MONGODB_URI: mongodb://localhost:27017
+      # Empty on the leg without a search process, and `1` on the leg with one. The tests that branch on
+      # what the deployment can do read it and fail rather than take the quiet branch, because a leg that
+      # exists to grade the search side of every branch and silently grades the other side is a green job
+      # asserting nothing -- which is the failure this whole tier arrangement is about. `REQ-E-182`.
+      STRANDS_MONGODB_EXPECT_SEARCH: ${{ matrix.deployment.expect_search }}
 
     steps:
       - name: Checkout code

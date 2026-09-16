@@ -3145,6 +3145,321 @@ class TestTheFusionProbeAgreesWithTheServerItProbed:
 
 
 @pytest.mark.contract
+class TestTheTierSetIsTheOneTheDeploymentImplies:
+    """``AT-185`` / ``REQ-E-180`` -- tier resolution, graded by a tier that runs on every change.
+
+    Which tier a store resolves was asserted in two places before this class: against monkeypatched
+    capabilities in the unit tier, and against real search results in the Atlas tier. The Atlas tier runs
+    on the cron and on a dispatch and on no change trigger, so its verdict on a pull request arrives after
+    the merge. That is not hypothetical -- a change widening the tier set from two to three merged with
+    four Atlas tests still asserting the two-tier world, and the dispatch that found them ran afterwards.
+
+    So the claim moves down to the tier gated on any deployment at all. What moves is only the resolution:
+    whether the store decides to use fusion. How well fusion ranks is a different claim, it needs a search
+    process to produce the results it ranks, and it stays where it is.
+
+    **Implications rather than a lookup table, and the table was tried first.** A table keyed on the two
+    capabilities is wrong, measured on 2026-09-17 against a local Atlas container that reports
+    ``search=True`` and ``rank_fusion=True`` and resolves ``("text",)``: the default store's vector index
+    needs a registered embedding model, that deployment has an empty registry (server code 8), and the
+    tier set therefore depends on a third input neither capability describes. What is true of every
+    deployment is a set of one-directional implications, and each one is written here as one.
+
+    Written to hold wherever it runs rather than on the deployment it runs against today. On a deployment
+    with no search process only the first implication has content, which is why the same class is run twice
+    over two deployments -- see the second job in the contract tier.
+    """
+
+    async def test_the_tier_set_agrees_with_what_this_deployment_can_do(
+        self, contract_uri: str, test_database_name: str, unique_collection_name: str
+    ) -> None:
+        """``AT-185`` -- four implications, each one a rule that holds on any deployment.
+
+        The pair itself is checked first. ``(search=False, rank_fusion=True)`` is unreachable, because
+        ``initialize()`` does not probe the version where search is missing (``AT-146``), and a deployment
+        reporting it would mean that short-circuit had been removed rather than that this table is stale.
+        """
+        store = _real_store(contract_uri, test_database_name, unique_collection_name)
+        try:
+            await store.initialize()
+            capabilities = store._connection.capabilities
+            assert capabilities is not None, "initialize() leaves the probe's answer on the connection"
+            tiers = store._tiers
+
+            assert capabilities.search or not capabilities.rank_fusion, (
+                "this deployment reports no search process and a probed $rankFusion, which the "
+                "short-circuit in initialize() says cannot happen: the version is probed only where "
+                "search is available"
+            )
+            if not capabilities.search:
+                assert tiers == (), f"no search process means no search index and so no tier: {tiers}"
+            if not capabilities.rank_fusion:
+                assert "hybrid" not in tiers, (
+                    f"the fused tier is on offer on a deployment that cannot run the stage: {tiers}"
+                )
+            if tiers:
+                assert capabilities.search, f"tiers were prepared without a search process: {tiers}"
+            if "hybrid" in tiers:
+                assert capabilities.search and capabilities.rank_fusion, (
+                    "hybrid needs both facts and this deployment reports "
+                    f"search={capabilities.search}, rank_fusion={capabilities.rank_fusion}"
+                )
+                assert tiers == ("hybrid", "vector", "text"), (
+                    "hybrid is a fusion of the other two, so a set containing it contains them, and it "
+                    f"leads rather than replaces them: {tiers}"
+                )
+        finally:
+            await store.close()
+
+    async def test_a_store_needing_no_embedding_model_resolves_the_fusion_wherever_it_can(
+        self, contract_uri: str, test_database_name: str, unique_collection_name: str
+    ) -> None:
+        """``AT-185`` -- the positive rule, on the one store shape a container can build both indexes for.
+
+        The default store embeds on the deployment, so its vector index needs a model in the registry and
+        a container has an empty one. The manual-vector path takes the caller's own vectors, so its index
+        is an ordinary ``vector`` field and comes up wherever there is a search process at all. That makes
+        this the test that grades the rule rather than its necessary conditions -- the one that would have
+        gone red when the tier set widened from two to three, on a pull request rather than on a cron.
+
+        The three ``_pick_tier`` reads are the fallback order, which is a claim about query *shapes* and
+        not a preference: a manual-vector store's fused tier needs the caller's vector, so a text-only
+        query has to fall past both hybrid and vector and be answered lexically. Measured that way on a
+        local Atlas container on 2026-09-17.
+
+        ``MANUAL_VECTOR``, ``QUERY_TEXT`` and ``QUERY_VECTOR`` are defined further down this module with
+        the vector-tier corpus they were written for; module globals resolve when the test runs.
+        """
+        store = _real_store(contract_uri, test_database_name, unique_collection_name, connection=dict(MANUAL_VECTOR))
+        try:
+            await store.initialize()
+            capabilities = store._connection.capabilities
+            assert capabilities is not None
+
+            if capabilities.search and capabilities.rank_fusion:
+                assert store._tiers == ("hybrid", "vector", "text"), (
+                    "a manual-vector store on a deployment with search and the stage has both indexes "
+                    f"and so has the fusion: {store._tiers}"
+                )
+                assert store._pick_tier(query_text=QUERY_TEXT, query_vector=QUERY_VECTOR) == "hybrid"
+                assert store._pick_tier(query_text=None, query_vector=QUERY_VECTOR) == "vector"
+                assert store._pick_tier(query_text=QUERY_TEXT, query_vector=None) == "text", (
+                    "the fused tier of a manual-vector store reads the caller's vector, so a query "
+                    "without one falls past it and past the vector tier as well"
+                )
+            else:
+                assert "hybrid" not in store._tiers, (
+                    f"this deployment reports search={capabilities.search} and "
+                    f"rank_fusion={capabilities.rank_fusion}, and offered the fusion anyway: {store._tiers}"
+                )
+        finally:
+            await store.close()
+
+    async def test_hybrid_leads_the_set_or_is_absent_from_it(
+        self, contract_uri: str, test_database_name: str, unique_collection_name: str
+    ) -> None:
+        """``AT-185`` -- the ordering claim on its own, because the table would hide a subtle version.
+
+        ``hybrid`` in the middle of the list is the one wrong answer a table comparison catches only by
+        accident: it would still contain all three names. It is also the one a plausible edit produces,
+        since ``insert(0, ...)`` and ``append(...)`` differ by two characters and both compile.
+        """
+        store = _real_store(contract_uri, test_database_name, unique_collection_name)
+        try:
+            await store.initialize()
+            tiers = store._tiers
+
+            assert "hybrid" not in tiers or tiers[0] == "hybrid", (
+                f"hybrid is on offer here and is not the preferred tier: {tiers}"
+            )
+            assert tiers == () or tiers[-1] == "text", (
+                f"text is the tier every other one falls through to, and it is not last: {tiers}"
+            )
+        finally:
+            await store.close()
+
+    async def test_a_text_query_resolves_to_hybrid_where_hybrid_is_on_offer(
+        self, contract_uri: str, test_database_name: str, unique_collection_name: str
+    ) -> None:
+        """``AT-185`` -- resolution is the tier set read against a query shape, so read it.
+
+        A plain string, not both keys: on the AutoEmbeddings path the fused tier reads ``text`` in both
+        of its input pipelines, so one string fits it whole, and a test supplying a ``vector`` beside it
+        would be asserting about the manual-vector mode instead of about the tier set.
+
+        The third branch is the one CI takes, and it asserts the refusal cites the server's own code.
+        Falling through to the text tier there would answer lexically and report ``text``, which is true
+        and is not what a store that resolved nothing should be able to say.
+        """
+        store = _real_store(contract_uri, test_database_name, unique_collection_name)
+        try:
+            await store.initialize()
+            capabilities = store._connection.capabilities
+            assert capabilities is not None
+
+            if "hybrid" in store._tiers:
+                assert store._pick_tier(query_text="dark mode", query_vector=None) == "hybrid"
+            elif store._tiers:
+                assert store._pick_tier(query_text="dark mode", query_vector=None) != "hybrid", (
+                    f"hybrid is not in {store._tiers} and a query resolved to it anyway"
+                )
+            else:
+                with pytest.raises(StorageError) as caught:
+                    store._pick_tier(query_text="dark mode", query_vector=None)
+                assert str(capabilities.no_search_code) in str(caught.value), (
+                    "a store with no tier has to refuse the query with the code the deployment gave for "
+                    f"having no search process, and said: {caught.value}"
+                )
+        finally:
+            await store.close()
+
+    async def test_an_explicit_hybrid_store_gets_the_tier_or_an_error_and_never_a_substitute(
+        self, contract_uri: str, test_database_name: str, unique_collection_name: str
+    ) -> None:
+        """``AT-185`` -- a named ``search_type`` has nothing to fall through to, on a real deployment.
+
+        The unit tier asserts this against patched capabilities in both directions. Here the deployment
+        supplies the direction, and the assertion is that there is no third outcome: the tier, or an
+        error naming the deployment. A store left holding ``("vector",)`` after asking for ``"hybrid"``
+        would answer semantically under a name that promises both, and nothing in the result says so.
+        """
+        store = _real_store(
+            contract_uri,
+            test_database_name,
+            unique_collection_name,
+            connection={"search_type": "hybrid"},
+        )
+        reference = _real_store(contract_uri, test_database_name, unique_collection_name)
+        try:
+            await reference.initialize()
+            capabilities = reference._connection.capabilities
+            assert capabilities is not None
+
+            if "hybrid" in reference._tiers:
+                await store.initialize()
+                assert store._tiers == ("hybrid",), (
+                    f"an explicit hybrid store has one tier by its own request: {store._tiers}"
+                )
+            elif capabilities.search:
+                # Search, and something about this deployment still keeps the fusion from being built:
+                # the stage is too old, or one of the two indexes it fuses would not come up. Fatal
+                # either way, because a named tier has nothing to fall through to, and the message
+                # carries the server's own reason rather than a guess at which of the two it was --
+                # measured on a local Atlas container, where it is `voyage-4-lite not registered yet`
+                # and not the version at all.
+                with pytest.raises(StorageError) as caught:
+                    await store.initialize()
+                assert "hybrid" in str(caught.value) or "index" in str(caught.value), (
+                    f"the refusal has to say what could not be prepared: {caught.value}"
+                )
+                assert store._tiers == (), f"a store that raised has no tier, and this one is holding {store._tiers}"
+            else:
+                # No search process at all, and this is the branch CI takes. `initialize()` resolves an
+                # empty set here without consulting the tier logic, deliberately and for every named
+                # `search_type` alike: a store used for `add` and for filtered reads works on a
+                # deployment that cannot search, and the refusal belongs at the query that needs a tier.
+                await store.initialize()
+                assert store._tiers == (), (
+                    f"there is no search index to build here and this store built a tier set: {store._tiers}"
+                )
+                with pytest.raises(StorageError) as caught:
+                    store._pick_tier(query_text="dark mode", query_vector=None)
+                assert str(capabilities.no_search_code) in str(caught.value)
+        finally:
+            await reference.close()
+            await store.close()
+
+
+@pytest.mark.contract
+class TestTheStageIsHereWhereTheProcessIsNot:
+    """``AT-186`` / ``REQ-E-181`` -- why this deployment refuses hybrid, and not merely that it does.
+
+    Two independent facts have to hold before a store offers fusion: ``mongod`` new enough for the
+    ``$rankFusion`` stage, and a search process to build the two indexes the stage fuses. On the
+    deployment CI runs this tier against, exactly one of them fails. A test that observed only "no hybrid
+    here" would therefore pass just as happily on a deployment where the stage was missing, where the
+    probe was broken, and where the resolution logic had been deleted -- so ``AT-185``'s negative case is
+    worth about as much as the reason behind it is pinned down.
+
+    Measured on 2026-09-17 against a single-node ``mongo:8`` replica set reporting 8.3.8 with
+    ``modules: []``: the stage runs and returns fused documents, and ``search_support()`` on the same
+    deployment answers ``available=False, code=31082``. The stage lives in ``mongod`` and it is there.
+
+    The stage is run directly rather than through a store on purpose. ``initialize()`` skips the version
+    probe where search is absent, so the package's own ``rank_fusion`` is ``False`` here by design
+    (``AT-146``), and what this class asks about is the deployment rather than the package.
+    """
+
+    async def test_this_deployment_can_run_rank_fusion_over_ordinary_pipelines(
+        self, contract_uri: str, test_database_name: str, unique_collection_name: str, contract_database: Any
+    ) -> None:
+        """``AT-186`` -- the stage, with two input pipelines that need no search index.
+
+        ``$sort`` rather than ``$vectorSearch`` and ``$search``, which is what makes this runnable
+        without mongot. The stage's own contract is the part being read: an input pipeline may be any
+        pipeline, and the output is one ranking fused from the several.
+        """
+        build_info = await contract_database.command("buildInfo")
+        if build_info["versionArray"][0] < _indexes.RANK_FUSION_MIN_MAJOR:
+            pytest.skip(f"$rankFusion needs major {_indexes.RANK_FUSION_MIN_MAJOR}; this is {build_info['version']}")
+        collection = contract_database[unique_collection_name]
+        await collection.insert_many([{"_id": index, "up": index, "down": -index} for index in range(5)])
+
+        cursor = await collection.aggregate(
+            [
+                {
+                    "$rankFusion": {
+                        "input": {
+                            "pipelines": {
+                                "ascending": [{"$sort": {"up": 1}}],
+                                "descending": [{"$sort": {"down": 1}}],
+                            }
+                        }
+                    }
+                },
+                {"$limit": 3},
+            ]
+        )
+        fused = [document async for document in cursor]
+
+        assert len(fused) == 3, f"the stage ran and returned {len(fused)} of 5 documents under a $limit of 3"
+        assert {document["_id"] for document in fused} <= set(range(5)), (
+            f"the stage returned documents this test did not write: {fused}"
+        )
+
+    async def test_the_hybrid_tier_is_refused_here_for_the_process_and_not_for_the_stage(
+        self, contract_uri: str, test_database_name: str, unique_collection_name: str, contract_database: Any
+    ) -> None:
+        """``AT-186`` -- the attribution, as the two answers disagreeing in the direction they should.
+
+        Skips on a deployment that has search, where there is no refusal to attribute and ``AT-185``'s
+        positive case is the assertion instead.
+        """
+        store = _real_store(contract_uri, test_database_name, unique_collection_name)
+        try:
+            await store.initialize()
+            capabilities = store._connection.capabilities
+            assert capabilities is not None
+            if capabilities.search:
+                pytest.skip("this deployment has a search process, so it refuses nothing to attribute")
+
+            stage_is_available = await _indexes.rank_fusion_support(contract_database[unique_collection_name])
+
+            assert store._tiers == (), f"no search process means no search index and so no tier: {store._tiers}"
+            assert stage_is_available is True, (
+                "the deployment this tier runs against is expected to carry the stage, so that the "
+                "absent search process is the only reason hybrid is unavailable. It answered False, "
+                "which makes AT-185's negative case ambiguous rather than wrong"
+            )
+            assert capabilities.rank_fusion is False, (
+                "the store must not have probed the version on a deployment where it cannot matter "
+                "(AT-146), even though the answer would have been True"
+            )
+        finally:
+            await store.close()
+
+
+@pytest.mark.contract
 class TestTenStoresShareOneSetup:
     """AT-065's ``initialize()`` half / REQ-E-012, REQ-E-045 — the client, the probe and the indexes.
 
