@@ -394,18 +394,43 @@ class FakeSearchIndexCursor:
 
 
 class FakeAsyncDatabase:
-    """The database half of the fake, which exists for one call: ``create_collection``."""
+    """The database half of the fake, which exists for two calls: ``create_collection`` and ``command``.
 
-    def __init__(self, *, name: str = "testdb", create_error: Exception | None = None) -> None:
+    ``command`` arrived with the ``$rankFusion`` probe (``REQ-E-143``) and counts its calls, because
+    "once per connection" is an assertion about a number and not about a return value (``AT-146``).
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str = "testdb",
+        create_error: Exception | None = None,
+        version_array: Sequence[int] | None = None,
+        command_error: Exception | None = None,
+    ) -> None:
         self.name = name
         self._create_error = create_error
+        # 8.0.23 unless a test says otherwise: the version the target deployments report, so a test
+        # that does not care about the version does not accidentally assert against a fabricated one.
+        self._version_array = list(version_array if version_array is not None else (8, 0, 23, 0))
+        self._command_error = command_error
         self.create_collection_calls: list[tuple[str, dict[str, Any]]] = []
+        self.command_calls: list[str] = []
 
     async def create_collection(self, name: str, **kwargs: Any) -> Any:
         self.create_collection_calls.append((name, kwargs))
         if self._create_error is not None:
             raise self._create_error
         return None
+
+    async def command(self, command: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        self.command_calls.append(command)
+        if self._command_error is not None:
+            raise self._command_error
+        return {
+            "version": ".".join(str(part) for part in self._version_array[:3]),
+            "versionArray": list(self._version_array),
+        }
 
 
 class FakeAsyncCollection:
@@ -1438,6 +1463,85 @@ class TestTheCapabilityProbeAgainstAFake:
         assert "socket timed out" in str(caught.value.__cause__)
 
 
+class TestTheRankFusionProbeAgainstAFake:
+    """AT-145 / ``REQ-E-143`` — whether the deployment can run ``$rankFusion``, from its own version.
+
+    The opposite shape from the probe above, deliberately. ``search_support`` must be a *call* because
+    Atlas Search is mongot, a separate process no version number predicts -- this module records the
+    four measured deployments that prove it, including a 7.0.12 reporting ``modules: ['enterprise']``
+    with no search. ``$rankFusion`` is an aggregation stage inside ``mongod`` itself, so ``mongod``'s
+    own version is not merely adequate for it but authoritative.
+
+    ``versionArray`` rather than a parse of ``version``: the server computes the former as integers,
+    and the latter is a string carrying things like ``"8.0.23-rc1"`` whose parsing this package would
+    then own.
+    """
+
+    @pytest.mark.parametrize(
+        ("version_array", "expected"),
+        [
+            ((6, 0, 28, 0), False),
+            ((7, 0, 12, 0), False),
+            ((8, 0, 0, 0), True),
+            ((8, 0, 23, 0), True),
+            ((8, 2, 1, 0), True),
+            ((9, 0, 0, 0), True),
+        ],
+    )
+    async def test_the_major_version_is_what_decides(self, version_array: tuple[int, ...], expected: bool) -> None:
+        """8.0 is the floor, not 8.1. The MongoDB 8.0 manual states it in the stage's own compatibility
+        note and permits ``$vectorSearch`` in an input pipeline, with a worked example.
+
+        8.0.23 is called out among these because it is what the target deployments report, and a floor
+        one minor version too high would have deferred this tier for a reason that does not exist.
+        """
+        collection: Any = FakeAsyncCollection(database=FakeAsyncDatabase(version_array=version_array))
+
+        assert await _indexes.rank_fusion_support(collection) is expected
+
+    async def test_it_reads_build_info_once_per_call(self) -> None:
+        """``AT-146``'s per-call half. The per-connection half is the caching in ``memory_store``, which
+        is asserted where the cache lives; what this pins is that the probe itself does not fan out."""
+        database = FakeAsyncDatabase()
+        collection: Any = FakeAsyncCollection(database=database)
+
+        await _indexes.rank_fusion_support(collection)
+
+        assert database.command_calls == ["buildInfo"]
+
+    @pytest.mark.parametrize(
+        "payload",
+        [{}, {"versionArray": []}, {"versionArray": ["8", 0, 0, 0]}, {"versionArray": None}],
+    )
+    async def test_a_version_array_the_server_does_not_send_reads_as_unsupported(self, payload: dict[str, Any]) -> None:
+        """Absent or malformed, the answer is ``False``.
+
+        Degrading to "no fusion" costs a caller the better tier; degrading to "yes" costs them a query
+        that fails on every search against a deployment that cannot run the stage. Only one of those is
+        recoverable by the caller, so the unreadable answer resolves to the recoverable one.
+        """
+
+        async def command(_command: str, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            return payload
+
+        database = FakeAsyncDatabase()
+        database.command = command  # type: ignore[method-assign, assignment]
+        collection: Any = FakeAsyncCollection(database=database)
+
+        assert await _indexes.rank_fusion_support(collection) is False
+
+    async def test_a_failed_build_info_degrades_rather_than_raising(self) -> None:
+        """Unlike ``search_support``, which raises on an unrecognised code so a wrong password does not
+        read as a missing cluster. The asymmetry is right: that probe's answer decides whether search
+        runs at all, and this one only decides which of two working tiers is preferred. A deployment
+        that will not answer ``buildInfo`` has a problem the very next call surfaces anyway.
+        """
+        database = FakeAsyncDatabase(command_error=operation_failure(13, "not authorized"))
+        collection: Any = FakeAsyncCollection(database=database)
+
+        assert await _indexes.rank_fusion_support(collection) is False
+
+
 class TestTheFakesMatchTheDriver:
     """MP-001, MP-002 — the parity contract for both fakes in this file.
 
@@ -1453,6 +1557,7 @@ class TestTheFakesMatchTheDriver:
         ("AsyncCollection", "list_search_indexes", (), {}),
         ("AsyncCollection", "create_search_index", (None,), {}),
         ("AsyncDatabase", "create_collection", ("name",), {"check_exists": False}),
+        ("AsyncDatabase", "command", ("buildInfo",), {}),
     )
 
     @pytest.mark.parametrize(("owner", "method", "args", "kwargs"), CALLS)

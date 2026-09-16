@@ -19,6 +19,7 @@ mechanism the measurement contradicted.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import TYPE_CHECKING, Any, Final
 
@@ -400,6 +401,142 @@ class TestTheFilterReachesTheRightPlace:
         )
 
         assert "filter" not in stages[0]["$vectorSearch"]
+
+
+class TestTheHybridTierIsOneNativeStage:
+    """AT-144 / ``REQ-E-142`` — the assertion that gates a pull request on this feature.
+
+    The construction test that would prove the most, ``AT-143``, cannot run here: the input pipelines
+    contain ``$vectorSearch``, which needs mongot, so the CI container fails on the input rather than
+    on the stage and proves nothing about either. What runs on every change is the emitted shape, and
+    the two properties it pins are the two that a reasonable rewrite would break.
+    """
+
+    def _hybrid(self, **overrides: Any) -> list[dict[str, Any]]:
+        """Build a hybrid pipeline with both tiers answerable, overriding one keyword at a time."""
+        kwargs: dict[str, Any] = {
+            "mode": MANUAL_MODE,
+            "vector_index_name": "vi",
+            "text_index_name": "ti",
+            "query_text": "q",
+            "query_vector": VECTOR,
+            "limit": 5,
+        }
+        kwargs.update(overrides)
+        return _pipeline.hybrid_stages(**kwargs)
+
+    def test_the_fusion_is_one_stage_plus_the_score_the_server_does_not_project(self) -> None:
+        """Two stages, and the second is not optional. ``$rankFusion`` returns fused documents with no
+        score field, so without this ``$set`` every hybrid result would map to ``0.0`` and a configured
+        ``min_score`` would return nothing while the collection was full."""
+        stages = self._hybrid()
+
+        assert _names(stages) == ["$rankFusion", "$set"]
+        assert stages[1] == {"$set": {"score": {"$meta": "score"}}}
+
+    def test_the_outer_projection_uses_neither_tiers_score_name(self) -> None:
+        """The fused score has a third ``$meta`` name of its own, and asking for either tier's name here
+        is the mistake the single-tier builders already guard against on their own paths."""
+        serialized = json.dumps(self._hybrid())
+
+        assert "vectorSearchScore" not in serialized
+        assert "searchScore" not in serialized
+
+    def test_the_two_tiers_arrive_as_named_input_pipelines(self) -> None:
+        """Named, because ``$rankFusion`` addresses weights and ``scoreDetails`` by pipeline name and a
+        positional list would leave nothing to address."""
+        fusion = self._hybrid()[0]["$rankFusion"]
+
+        assert set(fusion["input"]["pipelines"]) == {"vector", "text"}
+
+    def test_the_score_projection_is_outside_the_fusion_not_inside_it(self) -> None:
+        """The same stage type in the two places it can go, one of which the server rejects. Asserting
+        both halves together is what makes this a placement test rather than two absence tests."""
+        stages = self._hybrid()
+        pipelines = stages[0]["$rankFusion"]["input"]["pipelines"]
+
+        assert _names(stages)[-1] == "$set"
+        assert not any("$set" in _names(branch) for branch in pipelines.values())
+
+    def test_no_union_reaches_the_server_on_this_path(self) -> None:
+        """``REQ-E-142``'s prohibition, asserted on the serialized pipeline rather than on the top-level
+        stage names, because a ``$unionWith`` reintroduced by a rewrite would appear *inside* an input
+        pipeline and the outer stage list would still read as one ``$rankFusion``."""
+        assert "$unionWith" not in json.dumps(self._hybrid())
+
+    def test_neither_input_pipeline_carries_a_score_projection(self) -> None:
+        """The one subtlety in the construction. ``$rankFusion`` ranks by position within each input
+        pipeline, so a ``$set`` computing ``$meta`` there is read by nothing and lands in no output
+        document — and the server rejects the non-selection stage outright."""
+        pipelines = self._hybrid()[0]["$rankFusion"]["input"]["pipelines"]
+
+        for name, stages in pipelines.items():
+            assert "$set" not in _names(stages), name
+
+    def test_the_input_pipelines_are_the_builders_this_package_already_has(self) -> None:
+        """Composition asserted as equality against the two builders called with ``score=False``, which
+        is what makes the filter placement and the ``numCandidates`` arithmetic the same arithmetic on
+        this path as on the single-tier paths."""
+        pipelines = self._hybrid(query_filter={"scope": "s"})[0]["$rankFusion"]["input"]["pipelines"]
+
+        assert pipelines["vector"] == _pipeline.vector_stages(
+            mode=MANUAL_MODE,
+            index_name="vi",
+            limit=5,
+            query_vector=VECTOR,
+            query_filter={"scope": "s"},
+            score=False,
+        )
+        assert pipelines["text"] == _pipeline.text_stages(
+            query_text="q", index_name="ti", limit=5, query_filter={"scope": "s"}, score=False
+        )
+
+    def test_the_vector_tier_still_validates_its_candidate_count(self) -> None:
+        """Reuse has to include the rejections, not only the happy path: a hybrid builder that assembled
+        the stage dicts itself would silently accept a limit the single-tier path refuses."""
+        with pytest.raises(ValueError, match="numCandidates"):
+            self._hybrid(limit=_pipeline.MAX_NUM_CANDIDATES)
+
+    def test_a_query_contradicting_the_mode_is_rejected_here_too(self) -> None:
+        with pytest.raises(ValueError):
+            self._hybrid(mode=AUTO_EMBED_MODE, query_vector=VECTOR)
+
+
+class TestTheScoreKeywordIsTheOnlyDifference:
+    """AT-144's other half — the keyword ``REQ-E-142`` adds to the two existing builders.
+
+    Default ``True``, so every existing caller emits what it emitted before; the hybrid builder is the
+    only thing that passes ``False``. A default flipped the other way would have been a silent behaviour
+    change at two call sites for the benefit of one new one.
+    """
+
+    def test_the_vector_tier_keeps_its_score_stage_by_default(self) -> None:
+        stages = _pipeline.vector_stages(mode=MANUAL_MODE, index_name="i", limit=1, query_vector=VECTOR)
+
+        assert stages[-1] == {"$set": {"score": {"$meta": "vectorSearchScore"}}}
+
+    def test_the_vector_tier_drops_only_the_score_stage(self) -> None:
+        with_score = _pipeline.vector_stages(mode=MANUAL_MODE, index_name="i", limit=1, query_vector=VECTOR)
+        without = _pipeline.vector_stages(mode=MANUAL_MODE, index_name="i", limit=1, query_vector=VECTOR, score=False)
+
+        assert without == with_score[:-1]
+
+    def test_the_text_tier_drops_only_the_score_stage(self) -> None:
+        """The text tier's ``$limit`` comes after its score stage, so "drop the last one" is wrong here
+        and a slice would have passed on the vector tier and corrupted this one."""
+        with_score = _pipeline.text_stages(query_text="q", index_name="i", limit=1)
+        without = _pipeline.text_stages(query_text="q", index_name="i", limit=1, score=False)
+
+        assert _names(with_score) == ["$search", "$set", "$limit"]
+        assert _names(without) == ["$search", "$limit"]
+        assert without == [stage for stage in with_score if "$set" not in stage]
+
+    def test_the_text_tier_keeps_its_filter_when_the_score_goes(self) -> None:
+        stages = _pipeline.text_stages(
+            query_text="q", index_name="i", limit=1, query_filter={"scope": "s"}, score=False
+        )
+
+        assert _names(stages) == ["$search", "$match", "$limit"]
 
 
 class TestAQueryContradictingTheModeIsRejected:

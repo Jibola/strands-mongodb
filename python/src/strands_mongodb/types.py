@@ -45,14 +45,21 @@ __all__ = [
     "VectorSimilarity",
 ]
 
-SearchType = Literal["auto", "vector", "text"]
-"""Search tiers a caller may ask for in v0.1.0.
+SearchType = Literal["auto", "vector", "text", "hybrid"]
+"""Search tiers a caller may ask for.
 
 Deliberately narrower than the tiers the package can describe. A ``Literal`` in a config is a promise
-the caller can typecheck against, so it holds only values that actually run: ``"hybrid"`` arrives
-and ``"regex"`` are planned for v0.2.0. Widening a ``Literal`` is backwards
-compatible, so this costs nothing later, while shipping ``"hybrid"`` here and raising at runtime
-would be a documented feature that does not exist.
+the caller can typecheck against, so it holds only values that actually run: ``"regex"`` is planned for
+a later release and is absent here until it lands, rather than being a documented feature that raises.
+
+``"hybrid"`` was absent on those grounds and now runs (``REQ-E-141``). Widening a ``Literal`` is
+backwards compatible, which was the whole bet when this was written narrow, and it paid: every config
+that typechecked before still does.
+
+``"hybrid"`` resolves to one ``$rankFusion`` over the vector and text pipelines and needs both tiers
+available plus a server at major version 8 or later. Under ``"auto"`` it is preferred where it is
+available, **except** when ``min_score`` or ``max_score`` is set -- see those keys for the scale, which
+is the reason for the exception (``REQ-E-145``).
 """
 
 VectorSimilarity = Literal["cosine", "dotProduct", "euclidean"]
@@ -64,13 +71,16 @@ because a config assembled from environment variables or a settings file never p
 checker at all.
 """
 
-ResolvedSearchType = Literal["vector", "text"]
-"""Search tiers that can answer a query in v0.1.0, reported in the ``_search_type`` metadata key.
+ResolvedSearchType = Literal["vector", "text", "hybrid"]
+"""Search tiers that can answer a query, reported in the ``_search_type`` metadata key.
 
 Separate from :data:`SearchType` because asking for a tier and reporting one are different domains:
 ``"auto"`` is requestable and never an answer, and the answer set widens on a different schedule as
 tiers land. Both stay narrow for the same reason -- a caller matching on this key should not have to
 handle a branch that cannot occur.
+
+The two widened by different amounts when ``"hybrid"`` landed, three-to-four here and two-to-three
+there, which is what a single union covering both directions could not have done.
 """
 
 DEFAULT_MAX_SEARCH_RESULTS: Final[int] = 10
@@ -169,8 +179,21 @@ class MongoDBMemoryStoreConfig(MemoryStoreConfig, total=False):
         filter: Additional search predicate, composed as a narrowing conjunction with the scope
             predicate. Affects ``search`` only, and cannot widen what the store can read.
         min_score: Floor a result must meet. Atlas vector and text scores are similarity-oriented, so
-            this is the useful bound of the two.
-        max_score: Ceiling a result must not exceed. Mutually exclusive with ``min_score``.
+            this is the useful bound of the two. **Not on the same scale as a fused score:** the hybrid
+            tier ranks by reciprocal rank fusion, ``sum(weight / (RANK_FUSION_PENALTY + rank))`` with the
+            penalty at ``_pipeline.RANK_FUSION_PENALTY``, so a document first in both tiers scores about
+            0.033 and one first in a single tier about 0.016. A cosine floor of 0.7 empties the result
+            set. Under ``"auto"`` that is why setting either bound keeps the store on the vector tier
+            (``REQ-E-145``); asking for ``search_type="hybrid"`` by name applies the bound to the fused
+            score instead, because the tier was the caller's own choice (``REQ-E-146``).
+        max_score: Ceiling a result must not exceed. Mutually exclusive with ``min_score``. The same
+            scale note applies, and bites harder: a ceiling meant for cosine scores admits everything.
+        ttl_seconds: How long a memory lives, as an offset from its own ``created_at``. Absent means no
+            expiry and stamps no field; ``0`` means "expire at the next sweep" and is a legitimate
+            value, not a disabled one (``REQ-E-148``). Set on insert only, so re-extracting a fact this
+            store already holds does not push its expiry out. Unlike ``MongoDBStorage``, this surface
+            needs no separate ``ensure_indexes()`` call to make expiry effective: ``initialize()``
+            already creates ``strands_expires_at_ttl`` (``REQ-E-149``).
     """
 
     config: Required[MongoDBConfig]
@@ -179,6 +202,7 @@ class MongoDBMemoryStoreConfig(MemoryStoreConfig, total=False):
     filter: dict[str, Any]
     min_score: float
     max_score: float
+    ttl_seconds: int
 
 
 class MongoDBSearchQuery(TypedDict, total=False):

@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import datetime
 import hashlib
 import inspect
@@ -47,6 +48,7 @@ import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
+import bson
 import pytest
 from bson import ObjectId
 from conftest import skip_if_search_is_unreachable
@@ -57,7 +59,8 @@ from strands.memory.types import MemoryEntry, _has_method
 from strands.types.exceptions import StorageError
 
 import strands_mongodb
-from strands_mongodb import _client, _indexes
+from strands_mongodb import _client, _indexes, _pipeline
+from strands_mongodb import storage as storage_module
 from strands_mongodb.memory_store import UNSCOPED, MongoDBMemoryStore, _merge_metadata, _resolve_limit
 from strands_mongodb.storage import MongoDBStorage
 from strands_mongodb.types import DEFAULT_MAX_SEARCH_RESULTS, RESERVED_METADATA_KEYS
@@ -1274,9 +1277,17 @@ class _SetupRecorder:
             ``None`` for a call that passed none, which is the failure ``AT-126`` exists to catch.
         failing: Index names to refuse.
         available: What the capability probe answers.
+        rank_fusion: What the ``$rankFusion`` probe answers.
+        fusion_probes: The collection name for each ``$rankFusion`` probe. Separate from ``probes``
+            because the count that matters is per probe, not per initialize: ``AT-146``'s zero case is
+            a deployment where ``probes`` has one entry and this one must have none.
     """
 
-    def __init__(self, *, available: bool = True, failing: frozenset[str] = frozenset()) -> None:
+    def __init__(
+        self, *, available: bool = True, failing: frozenset[str] = frozenset(), rank_fusion: bool = False
+    ) -> None:
+        self.rank_fusion = rank_fusion
+        self.fusion_probes: list[str] = []
         self.probes: list[str] = []
         self.ordinary: list[tuple[str, ...]] = []
         self.search: list[str] = []
@@ -1306,6 +1317,22 @@ class _SetupRecorder:
         await asyncio.sleep(0)
         return _indexes.SearchSupport(available=self.available, code=None if self.available else 6047401)
 
+    async def probe_fusion(self, collection: Any) -> bool:
+        """Stand in for ``_indexes.rank_fusion_support``.
+
+        Suspends for the same reason :meth:`probe` does: it is a round trip, and a fake that never
+        suspends would let a sequential implementation pass a concurrency claim.
+
+        Args:
+            collection: The collection being probed.
+
+        Returns:
+            :attr:`rank_fusion`.
+        """
+        self.fusion_probes.append(collection.name)
+        await asyncio.sleep(0)
+        return self.rank_fusion
+
     async def ensure(self, collection: Any, *, ordinary: Any = (), search: Any = (), **kwargs: Any) -> None:
         """Stand in for ``_indexes.ensure``, recording what it was asked for.
 
@@ -1330,7 +1357,11 @@ class _SetupRecorder:
 
 
 def _patch_setup(
-    monkeypatch: pytest.MonkeyPatch, *, available: bool = True, failing: frozenset[str] = frozenset()
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    available: bool = True,
+    failing: frozenset[str] = frozenset(),
+    rank_fusion: bool = False,
 ) -> _SetupRecorder:
     """Replace both calls ``initialize()`` makes, so it runs to completion with no deployment.
 
@@ -1342,12 +1373,20 @@ def _patch_setup(
         monkeypatch: The fixture, so both patches are undone with the test.
         available: What the capability probe answers.
         failing: Search index names to refuse.
+        rank_fusion: What the ``$rankFusion`` probe answers. Defaults to ``False``, which is the one
+            place in this file a fake's default deliberately does not match the common deployment:
+            Atlas hands out 8.0.23 and would answer ``True``. It is ``False`` here because that is
+            ``INV-011``'s condition, and the tests that predate the hybrid tier are its coverage —
+            they assert the vector-first resolution *of a deployment without fusion*, and rewriting them
+            to opt out would have made the invariant self-certifying. Every test about hybrid passes
+            ``True`` and says so in its name.
 
     Returns:
         The recorder, holding what was asked for once the test has run.
     """
-    recorder = _SetupRecorder(available=available, failing=failing)
+    recorder = _SetupRecorder(available=available, failing=failing, rank_fusion=rank_fusion)
     monkeypatch.setattr(_indexes, "search_support", recorder.probe)
+    monkeypatch.setattr(_indexes, "rank_fusion_support", recorder.probe_fusion)
     monkeypatch.setattr(_indexes, "ensure", recorder.ensure)
     return recorder
 
@@ -1612,6 +1651,338 @@ class TestWhatInitializeDecides:
 
         assert "'vector'" in str(caught.value)
         assert "embedding_dimensions" in str(caught.value)
+
+
+class TestTheHybridTierIsAStatementAboutTwoOthers:
+    """AT-146, AT-147 / ``REQ-E-143``, ``REQ-E-144`` — when fusion is offered and when it is withheld.
+
+    Hybrid is not a third peer in the preference list. It is a claim that the other two both came up,
+    which is why every test here is about the *conditions* rather than about a pipeline: the pipeline is
+    ``test_pipeline.py``'s tier and is asserted there on the emitted stages.
+
+    A ``$rankFusion`` with one input pipeline is a more expensive spelling of that one pipeline and would
+    be the likeliest shape of the bug. On a deployment that answers with code 8, the missing input
+    would be the vector one, so the "hybrid" result would be lexical ranking under a name that promises
+    semantic ranking — the metadata would say ``hybrid`` and the caller would have no way to tell.
+    """
+
+    async def test_auto_prefers_fusion_where_the_deployment_and_both_tiers_allow_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``REQ-E-145``'s rule, and the ordering it produces.
+
+        Hybrid leads and the two single tiers stay behind it in their old order, rather than replacing
+        them: the fallback list is what answers a query whose shape only one tier fits, and collapsing it
+        to ``("hybrid",)`` would leave a manual-vector store unable to answer a text-only query it
+        answered before.
+        """
+        recorder = _patch_setup(monkeypatch, rank_fusion=True)
+        store = _store()
+
+        await store.initialize()
+
+        assert recorder.search == ["vector_index", "text_index"]
+        assert store._tiers == ("hybrid", "vector", "text")
+        assert store._pick_tier(query_text="dark mode", query_vector=None) == "hybrid"
+
+    async def test_a_deployment_without_the_stage_resolves_as_it_did_before_task_31(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``INV-011``, asserted directly rather than only inherited from the older tests."""
+        recorder = _patch_setup(monkeypatch, rank_fusion=False)
+        store = _store()
+
+        await store.initialize()
+
+        assert recorder.fusion_probes == ["memory"]
+        assert store._tiers == ("vector", "text")
+
+    async def test_the_version_is_not_asked_for_where_the_deployment_cannot_search(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``AT-146``'s zero case, and the reason the short-circuit exists.
+
+        ``REQ-E-144`` makes hybrid need both search tiers, so on a deployment with no Atlas Search the
+        answer cannot be used whatever the version is. Asking anyway costs a round trip per connection
+        for a value nothing reads — and this is not a hypothetical deployment, it is the CI contract
+        tier: ``mongo:8`` reports 8.3.8 and has no mongot.
+        """
+        recorder = _patch_setup(monkeypatch, available=False, rank_fusion=True)
+        store = _store()
+
+        await store.initialize()
+
+        assert recorder.probes == ["memory"]
+        assert recorder.fusion_probes == []
+        assert store._tiers == ()
+
+    async def test_ten_stores_on_one_connection_ask_the_version_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``AT-146``'s counting half, as ``AT-065b`` does it for the search probe.
+
+        The result is a boolean every store would compute identically, so a per-store probe is invisible
+        in behaviour and visible only as ten round trips on every process start.
+        """
+        recorder = _patch_setup(monkeypatch, rank_fusion=True)
+        stores = [_store(name=f"facts{index}") for index in range(10)]
+
+        await asyncio.gather(*(store.initialize() for store in stores))
+
+        assert recorder.fusion_probes == ["memory"]
+        assert all(store._tiers == ("hybrid", "vector", "text") for store in stores)
+
+    async def test_an_explicit_hybrid_store_creates_both_indexes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The narrowing that a named ``search_type`` does everywhere else would be wrong here.
+
+        ``search_type="text"`` creates one index because it queries one. ``"hybrid"`` names a tier built
+        out of two, and the filter that keeps a text store from building a vector index it will not query
+        would leave this store with no indexes at all.
+        """
+        recorder = _patch_setup(monkeypatch, rank_fusion=True)
+        store = _store(config=_connection_config(search_type="hybrid"))
+
+        await store.initialize()
+
+        assert recorder.search == ["vector_index", "text_index"]
+        assert store._tiers == ("hybrid",)
+
+    async def test_an_explicit_hybrid_store_with_one_tier_refused_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``AT-147``'s first direction. One half of a fusion is not a fusion."""
+        _patch_setup(monkeypatch, failing=frozenset({"vector_index"}), rank_fusion=True)
+        store = _store(config=_connection_config(search_type="hybrid"))
+
+        with pytest.raises(StorageError) as caught:
+            await store.initialize()
+
+        assert "vector_index" in str(caught.value)
+        assert _PRETEND_REASON in str(caught.value)
+
+    async def test_an_explicit_hybrid_store_on_a_deployment_without_the_stage_raises(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The same rule read against the other way hybrid can be unavailable.
+
+        A named tier that cannot be prepared is fatal, and the server version is one of the two reasons
+        this one cannot be. Degrading to vector here would answer a different question than the one
+        asked, silently, on the tier the caller explicitly declined to leave to ``auto``.
+        """
+        _patch_setup(monkeypatch, rank_fusion=False)
+        store = _store(config=_connection_config(search_type="hybrid"))
+
+        with pytest.raises(StorageError) as caught:
+            await store.initialize()
+
+        assert "rankFusion" in str(caught.value)
+
+    async def test_auto_skips_fusion_where_only_one_tier_came_up(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``AT-147``'s second direction: the same condition, not fatal, and vector answers."""
+        _patch_setup(monkeypatch, failing=frozenset({"text_index"}), rank_fusion=True)
+        store = _store()
+
+        with caplog.at_level(logging.WARNING):
+            await store.initialize()
+
+        assert store._tiers == ("vector",)
+        assert store._pick_tier(query_text="dark mode", query_vector=None) == "vector"
+
+    async def test_a_query_only_one_tier_fits_falls_past_hybrid(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Both tiers are up and fusion is offered, and the query still cannot use it.
+
+        A manual-vector store's hybrid tier needs both keys, because the ``$search`` branch has nothing
+        to search with without ``text`` and the ``$vectorSearch`` branch has nothing to compare without
+        ``vector``. Falling through to the tier the query does fit is what the ordered list is for.
+        """
+        _patch_setup(monkeypatch, rank_fusion=True)
+        store = _store(config=_connection_config(search_type="auto", **MANUAL_VECTOR))
+
+        await store.initialize()
+
+        assert store._tiers == ("hybrid", "vector", "text")
+        assert store._pick_tier(query_text="dark mode", query_vector=None) == "text"
+        assert store._pick_tier(query_text=None, query_vector=QUERY_VECTOR) == "vector"
+        assert store._pick_tier(query_text="dark mode", query_vector=QUERY_VECTOR) == "hybrid"
+
+
+class TestTheQueryShapeOnlyFusionCanRead:
+    """AT-157 / ``REQ-E-151`` — the rejection the hybrid tier had to narrow, and how far.
+
+    ``REQ-E-074a`` rejects a query setting both ``text`` and ``vector`` on the grounds that no tier reads
+    both. The hybrid tier on a manual-vector store reads both: ``text`` feeds its ``$search`` input
+    pipeline and ``vector`` feeds its ``$vectorSearch`` one. So the premise expired for exactly one
+    configuration, and the narrowing has to be exactly that wide or it gives back the bug the rejection
+    was written for.
+
+    Two checks rather than one, in two places, because they can answer at two different times. Whether
+    the *config* could use both keys is known at construction and is checked before the first round trip,
+    which is what ``AT-076`` asserts by running against a closed port. Whether the *deployment* delivered
+    the fused tier is known only after the probe, and the answer there cannot be a fallback: every
+    remaining tier reads one of the two keys and would drop the other silently.
+    """
+
+    async def test_the_autoembeddings_path_still_rejects_both_before_the_network(self) -> None:
+        """Unchanged, and this is the case ``AT-076`` covers: on this path the fused tier reads ``text``
+        in *both* of its input pipelines, so a ``vector`` beside it is as meaningless as it ever was."""
+        with pytest.raises(ValueError, match="no interpretation"):
+            await _store().search({"text": "dark mode", "vector": QUERY_VECTOR})
+
+    @pytest.mark.parametrize("search_type", ["vector", "text"], ids=["vector", "text"])
+    async def test_a_named_single_tier_still_rejects_both_before_the_network(self, search_type: str) -> None:
+        """A store that asked for one tier by name will never fuse, whatever the deployment can do."""
+        store = _store(config=_connection_config(search_type=search_type, **MANUAL_VECTOR))
+
+        with pytest.raises(ValueError, match="no interpretation"):
+            await store.search({"text": "dark mode", "vector": QUERY_VECTOR})
+
+    async def test_a_manual_store_that_could_fuse_gets_past_the_construction_time_check(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The narrowing itself, asserted as the tier that answers rather than as the absence of a raise.
+
+        The store is on ``auto``: nothing about it names hybrid, and the shape becomes legal because the
+        deployment offers fusion and the configuration lets it be chosen.
+        """
+        _patch_setup(monkeypatch, rank_fusion=True)
+        store = _store(config=_connection_config(**MANUAL_VECTOR))
+        await store.initialize()
+        collection = _prepared(store, tiers=store._tiers)
+
+        entries = await store.search({"text": "dark mode", "vector": QUERY_VECTOR})
+
+        assert [next(iter(stage)) for stage in collection.stages] == ["$rankFusion", "$set"]
+        assert _metadata(entries[0])["_search_type"] == "hybrid"
+
+    async def test_a_manual_store_that_cannot_fuse_raises_rather_than_answering_from_one_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The second half, and the reason it is not a fallback.
+
+        Both tiers are up and only the server version is missing, so there is a tier here that would
+        answer this query: the text one, reading ``text`` and ignoring the vector the caller computed. It
+        would return entries, ranked, stamped ``_search_type: "text"`` — a true report of a question
+        nobody asked, and indistinguishable from a fused answer unless the caller reads the metadata.
+        """
+        _patch_setup(monkeypatch, rank_fusion=False)
+        store = _store(config=_connection_config(**MANUAL_VECTOR))
+        await store.initialize()
+        _prepared(store, tiers=store._tiers)
+
+        with pytest.raises(ValueError) as caught:
+            await store.search({"text": "dark mode", "vector": QUERY_VECTOR})
+
+        assert "hybrid" in str(caught.value)
+        assert "vector, text" in str(caught.value)
+
+
+class TestAScoreBoundDeclinesTheBetterTier:
+    """AT-148, AT-149 / ``REQ-E-145``, ``INV-012``, premortem **P-2** — the exception that is not a preference.
+
+    The upgrade this protects has no code change in it. A caller who set ``min_score=0.7`` against the
+    vector tier, left ``search_type`` at its default, and upgraded this package would have had their
+    bound applied to fused scores that top out near 0.033 — an empty list, no error, no warning, and
+    indistinguishable from an empty collection.
+
+    So the tier resolution reads a configuration key that has nothing to do with tiers, which is
+    irregular enough to be worth the two tests. This package's line on silent wrong answers is that
+    ``initialize()`` degrades and ``search()`` raises; degrading here means declining the *better* tier,
+    which is the inversion that makes a degradation safe.
+    """
+
+    @pytest.mark.parametrize(
+        ("bound", "named"),
+        [({"min_score": 0.7}, "min_score"), ({"max_score": 0.9}, "max_score")],
+        ids=["floor", "ceiling"],
+    )
+    async def test_a_bound_leaves_auto_resolving_as_it_did_before(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, bound: dict[str, float], named: str
+    ) -> None:
+        """``AT-148`` and ``AT-149`` in one reading, because they are one decision and its log line.
+
+        Both bounds, not only the floor. ``max_score`` is a ceiling, so a fused score near 0.03 passes it
+        rather than failing it — the failure is quieter still, a result set that keeps everything and
+        means nothing. The log names which bound was set because the remedy differs by one word and is
+        not guessable from the result.
+        """
+        _patch_setup(monkeypatch, rank_fusion=True)
+        store = _store(**bound)
+
+        with caplog.at_level(logging.WARNING):
+            await store.initialize()
+
+        assert store._tiers == ("vector", "text")
+        assert store._pick_tier(query_text="dark mode", query_vector=None) == "vector"
+        warnings = [record.getMessage() for record in caplog.records if named in record.getMessage()]
+        assert len(warnings) == 1
+        assert "hybrid" in warnings[0]
+
+    async def test_no_bound_no_warning(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        """The ordinary store says nothing, which is what makes the line above worth reading."""
+        _patch_setup(monkeypatch, rank_fusion=True)
+        store = _store()
+
+        with caplog.at_level(logging.WARNING):
+            await store.initialize()
+
+        assert [record.getMessage() for record in caplog.records if "min_score" in record.getMessage()] == []
+
+    async def test_a_bound_is_silent_where_fusion_was_never_on_offer(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Nothing was declined, so there is nothing to report.
+
+        A warning here would describe a tier the deployment cannot run to an operator who cannot enable
+        it, on every store construction, forever — and the store it names resolves exactly as it always
+        has.
+        """
+        _patch_setup(monkeypatch, rank_fusion=False)
+        store = _store(min_score=0.7)
+
+        with caplog.at_level(logging.WARNING):
+            await store.initialize()
+
+        assert store._tiers == ("vector", "text")
+        assert [record.getMessage() for record in caplog.records if "min_score" in record.getMessage()] == []
+
+    async def test_an_explicit_hybrid_store_keeps_its_bound_and_its_tier(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``REQ-E-146``: asked for by name, so it is not second-guessed.
+
+        The same line ``_ensure_search_tiers`` already draws between ``auto`` and a named tier. What the
+        caller is owed here is the number, which is why ``AT-151`` holds the README and the docstring to
+        stating the scale.
+        """
+        _patch_setup(monkeypatch, rank_fusion=True)
+        store = _store(min_score=0.7, config=_connection_config(search_type="hybrid"))
+
+        with caplog.at_level(logging.WARNING):
+            await store.initialize()
+
+        assert store._tiers == ("hybrid",)
+        assert [record.getMessage() for record in caplog.records if "min_score" in record.getMessage()] == []
+
+    async def test_the_bound_reaches_the_fused_score_rather_than_being_dropped(self) -> None:
+        """``AT-150``, on scores this test chose, in the shape ``AT-079`` uses.
+
+        The numbers are what a real fusion returns rather than what a cosine tier does: ``0.0328`` is a
+        document ranked first by both branches, ``0.0164`` first by one, and ``0.0161`` third. A bound
+        picked on the fused scale keeps the first two, and the same code path that applies it to a cosine
+        score applies it here — which is the claim, since the alternative implementations both look right
+        from outside: dropping the bound on this tier, or comparing against a score field ``$rankFusion``
+        never projected and that would therefore read ``0.0`` for every document.
+        """
+        store = _store(min_score=0.0164, config=_connection_config(search_type="hybrid", **MANUAL_VECTOR))
+        documents = [
+            {"_id": str(index), "content": f"fact {index}", "score": score}
+            for index, score in enumerate((0.0328, 0.0164, 0.0161))
+        ]
+        collection = _prepared(store, documents=documents, tiers=("hybrid",))
+
+        entries = await store.search({"text": "dark mode", "vector": QUERY_VECTOR})
+
+        assert [entry.content for entry in entries] == ["fact 0", "fact 1"]
+        assert [next(iter(stage)) for stage in collection.stages] == ["$rankFusion", "$set"]
+        assert _metadata(entries[0])["_search_type"] == "hybrid"
 
 
 class TestADriverErrorArrivesNamingTheNamespaceAndNothingElse:
@@ -2240,6 +2611,210 @@ def _assert_no_leak(*subjects: Any) -> None:
         assert SECRET not in text, f"subject {index} ({type(subject).__name__}) leaked the password"
 
 
+class TestExpiryIsStampedFromTheDocumentsOwnClock:
+    """AT-153 / AT-154 / ``REQ-E-147``, ``REQ-E-148`` -- the three outcomes ``ttl_seconds`` can have.
+
+    Three cases rather than two, and that is the whole design of this test. ``0`` and ``None`` are the
+    same falsy value in Python and opposite instructions to MongoDB: ``expireAfterSeconds: 0`` on the
+    index means "delete once the stamped time passes", so ``ttl_seconds=0`` asks for expiry at the next
+    sweep, while absence asks for none at all. A ``if not self.ttl_seconds:`` guard satisfies a two-case
+    test and silently converts the first request into the second, where the only symptom is a collection
+    that fails to shrink -- indistinguishable, for weeks, from one whose documents have not aged out yet.
+
+    The offset is asserted against the document's own ``created_at`` rather than against a clock this
+    test reads. That is the property ``REQ-E-147`` is about, and it is stronger than a tolerance window:
+    one clock read means the two fields are exactly ``ttl_seconds`` apart, and a second ``now()`` call in
+    the implementation would fail this by microseconds no matter how generous the window.
+    """
+
+    @pytest.mark.parametrize("ttl", [0, 1, 3600, 86400], ids=["immediate", "one", "hour", "day"])
+    async def test_a_configured_ttl_stamps_exactly_that_offset_from_created_at(self, ttl: int) -> None:
+        """AT-153, AT-154's positive cases -- including ``0``, which is the one that gets optimised away."""
+        store = _store(config=_connection_config(), writable=True, ttl_seconds=ttl)
+        collection = _prepared(store)
+        with contextlib.suppress(NotImplementedError):
+            await store.add("the user prefers dark mode")
+
+        insert = collection.upserts[-1][1]["$setOnInsert"]
+        assert insert[_indexes.EXPIRES_FIELD] - insert["created_at"] == datetime.timedelta(seconds=ttl)
+
+    async def test_no_ttl_stamps_no_field_at_all(self) -> None:
+        """AT-154's negative case, and ``INV-014``: absence writes the original shape, unchanged.
+
+        Asserted as the field's absence rather than as a ``None`` value, because a stamped ``None`` is
+        indexed by the TTL index as a value that is not a date, which is a different behaviour from not
+        being indexed and one nobody would notice until a document failed to expire.
+        """
+        store = _store(config=_connection_config(), writable=True)
+        collection = _prepared(store)
+        with contextlib.suppress(NotImplementedError):
+            await store.add("the user prefers dark mode")
+
+        assert store.ttl_seconds is None
+        assert _indexes.EXPIRES_FIELD not in collection.upserts[-1][1]["$setOnInsert"]
+
+    async def test_zero_and_absence_reach_the_document_differently(self) -> None:
+        """AT-154, stated as the comparison the three-way split exists to make.
+
+        The two configurations a falsy check cannot tell apart, written side by side so that the test
+        that fails when someone writes one is the test whose name says why.
+        """
+        immediate = _store(config=_connection_config(), writable=True, ttl_seconds=0)
+        never = _store(config=_connection_config(), writable=True)
+        stamps = []
+        for store in (immediate, never):
+            collection = _prepared(store)
+            with contextlib.suppress(NotImplementedError):
+                await store.add("the user prefers dark mode")
+            stamps.append(collection.upserts[-1][1]["$setOnInsert"])
+
+        assert _indexes.EXPIRES_FIELD in stamps[0], "ttl_seconds=0 is a request to expire, not a disabled TTL"
+        assert _indexes.EXPIRES_FIELD not in stamps[1]
+
+    async def test_the_stamp_is_set_on_insert_so_a_duplicate_does_not_extend_it(self) -> None:
+        """``REQ-E-147`` -- expiry lives beside ``created_at`` in ``$setOnInsert`` and moves with it.
+
+        A re-extracted fact is the fact this store already holds (``REQ-E-042``), and ``$set`` here would
+        turn a TTL into a last-seen window: a memory the extractor keeps rediscovering would never
+        expire, which is the opposite of what an operator configuring a retention period asked for.
+        """
+        store = _store(config=_connection_config(), writable=True, ttl_seconds=60)
+        collection = _prepared(store)
+        with contextlib.suppress(NotImplementedError):
+            await store.add("the user prefers dark mode")
+
+        update = collection.upserts[-1][1]
+        assert list(update) == ["$setOnInsert"], f"a second update operator would move the stamp: {list(update)}"
+        assert _indexes.EXPIRES_FIELD in update["$setOnInsert"]
+
+
+class TestTheTtlIndexIsUnconditionalAndThatIsLoadBearing:
+    """AT-155 / AT-156 / ``REQ-E-149``, ``REQ-E-150`` -- the index, and the twenty bytes beside it.
+
+    ``memory_specs()`` returns the TTL index whether or not a TTL is configured, and until this store
+    gained a ``ttl_seconds`` that was an argument about a situation which could not arise, since
+    nothing on this surface wrote ``expires_at``. It is now the reason ``REQ-E-149`` can promise no
+    migration: a store that gains a ``ttl_seconds`` expires the documents it already holds on the next
+    sweep, because a TTL index acts on documents that predate it and this one has been there all along.
+
+    That promise stops being true the moment someone makes the spec conditional, which is an easy and
+    well-intentioned change to make -- it saves an index on stores that do not use it. This is the test
+    that fails when they do.
+    """
+
+    def test_the_memory_specs_carry_the_ttl_index_with_no_config_to_ask(self) -> None:
+        """AT-155 -- ``memory_specs()`` takes no arguments, which is itself the guarantee."""
+        names = [spec.name for spec in _indexes.memory_specs()]
+
+        assert "strands_expires_at_ttl" in names
+        assert inspect.signature(_indexes.memory_specs).parameters == {}, (
+            "memory_specs() gained a parameter, which is how the TTL index becomes conditional"
+        )
+        ttl = next(spec for spec in _indexes.memory_specs() if spec.name == "strands_expires_at_ttl")
+        assert ttl.options == {"expireAfterSeconds": 0}, (
+            "expireAfterSeconds must be 0: the document carries the deadline, not the index"
+        )
+        assert ttl.keys == ((_indexes.EXPIRES_FIELD, 1),), "the index has to cover the field add() stamps"
+
+    def test_the_two_surfaces_expire_on_the_same_field_and_the_same_index(self) -> None:
+        """AT-155 -- a memory and a storage record are different documents in different collections, and
+        an operator reading `REQ-E-061`'s provisioning block sees one field name and one index name."""
+        memory = {spec.name: spec for spec in _indexes.memory_specs()}["strands_expires_at_ttl"]
+        storage = {spec.name: spec for spec in _indexes.storage_specs()}["strands_expires_at_ttl"]
+
+        assert memory.keys == storage.keys
+        assert memory.options == storage.options
+
+    def test_the_size_overhead_of_the_expiry_field_has_one_definition(self) -> None:
+        """AT-156 / ``REQ-E-150`` -- the constant a preflight on this surface would have to use.
+
+        There is no preflight here to test, because oversized-snapshot handling is deferred and the
+        one that shipped is ``MongoDBStorage``'s. What can be tested now is that the number has a single
+        home and says out loud that it is about the field rather than about that class, so a preflight
+        added to the memory store later is written by someone who finds it rather than by someone who
+        reconstructs twenty bytes from first principles.
+        """
+        overhead = storage_module._EXPIRES_OVERHEAD_BYTES
+        assert overhead > 0
+        sources = [name for name, text in _package_sources().items() if "_EXPIRES_OVERHEAD_BYTES" in text]
+        assert sources == ["storage.py"], f"the expiry overhead is defined or copied in more than one module: {sources}"
+
+        stamped = {_indexes.EXPIRES_FIELD: datetime.datetime.now(datetime.timezone.utc)}
+        assert len(bson.encode(stamped)) - len(bson.encode({})) == overhead, (
+            "the constant no longer matches what an `expires_at` element costs in BSON, which is the "
+            "only way to check a number whose whole purpose is to avoid encoding the document"
+        )
+
+
+_TTL_SWEEP_BUDGET: Final[float] = 150.0
+"""How long a document may take to disappear before the expiry is judged not to work (``AT-152``).
+
+MongoDB's TTL monitor runs every 60 seconds by default and is not synchronous with anything: a document
+whose deadline passed a moment after a sweep waits most of a cycle for the next one, and the deletion
+itself is a background pass over the index. Two cycles plus slack is the smallest budget that is not
+measuring luck.
+
+Not a delay. The caller below polls once a second and returns the moment the document is gone, so a
+deployment whose monitor has been turned down finishes in seconds.
+"""
+
+
+@pytest.mark.contract
+class TestAMemoryWithATtlActuallyDisappears:
+    """AT-152 / ``REQ-E-147``, ``REQ-E-149`` -- boundary **B-19**, asserted as a disappearance.
+
+    Everything else about expiry is a field in a document this package wrote, and a test of that is a
+    test of this package agreeing with itself. What nobody can check without a server is the part that
+    matters: that the stamp is on the field the index covers, in a type the index understands, with an
+    ``expireAfterSeconds`` that makes the deadline the document's own. Get any of the three wrong and
+    every unit test above still passes while nothing is ever deleted.
+
+    **No ``ensure_indexes()`` call, and that absence is the test** (``REQ-E-149``). The store
+    is constructed, ``add`` is called, and the document goes away. A caller of ``MongoDBStorage`` has to
+    provision the index themselves; a caller here does not, and the difference is worth pinning because
+    it is the kind of asymmetry a later refactor "tidies up".
+
+    Runs on the contract tier: a TTL index is ordinary and needs no mongot, so this is checked on every
+    pull request rather than weekly.
+    """
+
+    async def test_a_document_written_with_a_ttl_is_gone_after_the_sweep(
+        self, contract_uri: str, test_database_name: str, unique_collection_name: str, contract_database: Any
+    ) -> None:
+        """AT-152 -- one store, one ``add``, and then the collection is empty."""
+        collection = contract_database[unique_collection_name]
+        with contextlib.suppress(OperationFailure):
+            # Turns a 60-second monitor cycle into a 1-second one, where the deployment allows it. Atlas
+            # does not expose `setParameter`, so this is an optimisation for local runs and never a
+            # premise: the budget below is sized for a monitor nobody touched.
+            await contract_database.client.admin.command("setParameter", 1, ttlMonitorSleepSecs=1)
+
+        store = _real_store(
+            contract_uri, test_database_name, unique_collection_name, writable=True, scope="tenant-a", ttl_seconds=0
+        )
+        try:
+            result = await store.add("this memory is written to be forgotten")
+            assert result.inserted == 1
+
+            stamped = await collection.find_one({"scope": "tenant-a"})
+            assert stamped is not None, "the write did not land, so this test cannot be about the sweep"
+            assert isinstance(stamped[_indexes.EXPIRES_FIELD], datetime.datetime), (
+                "the TTL index ignores a field that is not a date, silently and forever: "
+                f"{stamped[_indexes.EXPIRES_FIELD]!r}"
+            )
+
+            deadline = time.monotonic() + _TTL_SWEEP_BUDGET
+            while await collection.count_documents({"scope": "tenant-a"}) and time.monotonic() < deadline:
+                await asyncio.sleep(1.0)
+
+            assert await collection.count_documents({"scope": "tenant-a"}) == 0, (
+                f"a memory with ttl_seconds=0 was still there {_TTL_SWEEP_BUDGET}s later. The index "
+                "exists and the stamp is a date, so what is left is expireAfterSeconds or the field name"
+            )
+        finally:
+            await store.close()
+
+
 @pytest.mark.contract
 class TestNoMemoryMethodRendersThePassword:
     """AT-014's memory half / REQ-E-014 — the credential sweep, completed in two parts.
@@ -2342,6 +2917,67 @@ class TestNoMemoryMethodRendersThePassword:
 
 
 @pytest.mark.contract
+class TestTheFusionProbeAgreesWithTheServerItProbed:
+    """AT-145's real-deployment half / ``REQ-E-143`` -- the version read, against versions we did not write.
+
+    ``test_indexes.py`` closes this probe against a fake, which is where the malformed and missing
+    ``versionArray`` cases live because no real server sends them. What a fake cannot check is the one
+    thing the probe depends on: that ``buildInfo.versionArray[0]`` on an actual deployment is the major
+    version, an ``int``, and agrees with the ``version`` string beside it. That is a claim about MongoDB's
+    wire format, so it is asserted against MongoDB.
+
+    Runs on the contract tier because ``buildInfo`` is a ``mongod`` command and needs no mongot, which
+    also makes this the half that runs on every pull request. The three deployments ``AT-145`` names --
+    7.0.12, 8.0.23 and 8.3.8 -- are the ones CI supplies over time rather than in one run, so the
+    assertion is written as an agreement between two things the server said rather than as an expected
+    boolean this test would have to keep in step with the matrix.
+    """
+
+    async def test_the_probe_answers_what_the_deployments_own_version_string_says(
+        self, contract_uri: str, test_database_name: str, unique_collection_name: str, contract_database: Any
+    ) -> None:
+        """AT-145 -- ``rank_fusion`` is ``True`` exactly where the server calls itself 8 or later."""
+        build_info = await contract_database.command("buildInfo")
+        major = int(str(build_info["version"]).split(".", 1)[0])
+
+        answered = await _indexes.rank_fusion_support(contract_database[unique_collection_name])
+
+        assert answered is (major >= _indexes.RANK_FUSION_MIN_MAJOR), (
+            f"the probe said {answered} on a deployment calling itself {build_info['version']!r}"
+        )
+        assert build_info["versionArray"][0] == major, (
+            "the probe reads versionArray[0] as the major version, and this server disagrees with its "
+            f"own version string: {build_info['versionArray']} against {build_info['version']!r}"
+        )
+
+    async def test_a_store_on_this_deployment_reports_the_same_answer_in_its_capabilities(
+        self, contract_uri: str, test_database_name: str, unique_collection_name: str, contract_database: Any
+    ) -> None:
+        """AT-145 -- and the capability a caller reads is the probe's answer, not a second opinion.
+
+        Subject to the short-circuit: where search is unavailable the store never probes and reports
+        ``False`` regardless of version (``AT-146``), which is the one case the two answers may differ
+        and is asserted here rather than left as a surprise.
+        """
+        store = _real_store(contract_uri, test_database_name, unique_collection_name)
+        try:
+            await store.initialize()
+            capabilities = store._connection.capabilities
+            assert capabilities is not None, "initialize() leaves the probe's answer on the connection"
+            probed = await _indexes.rank_fusion_support(contract_database[unique_collection_name])
+
+            if not capabilities.search:
+                assert capabilities.rank_fusion is False, (
+                    "a deployment with no search process cannot reach the hybrid tier, so the "
+                    "capability has to be False whatever the server version is"
+                )
+            else:
+                assert capabilities.rank_fusion is probed
+        finally:
+            await store.close()
+
+
+@pytest.mark.contract
 class TestTenStoresShareOneSetup:
     """AT-065's ``initialize()`` half / REQ-E-012, REQ-E-045 — the client, the probe and the indexes.
 
@@ -2353,6 +2989,10 @@ class TestTenStoresShareOneSetup:
     The probe count is a spy, and it is the one assertion here that cannot be an outcome. The result of
     a probe is a boolean every store would compute identically, so a per-store probe is invisible in
     behavior and visible only as ten round trips on every process start.
+
+    The second count is there for the same reason and a stronger one: ``AT-146``'s claim is that the
+    ``$rankFusion`` probe is skipped entirely where search is unavailable, and this tier is the
+    deployment where that is true of a real server rather than of a fake.
     """
 
     async def test_ten_stores_initializing_concurrently_share_one_client_probe_and_index_set(
@@ -2372,6 +3012,15 @@ class TestTenStoresShareOneSetup:
             return await real_probe(collection)
 
         monkeypatch.setattr(_indexes, "search_support", counting)
+
+        fusion_probed: list[str] = []
+        real_fusion = _indexes.rank_fusion_support
+
+        async def counting_fusion(collection: Any) -> bool:
+            fusion_probed.append(collection.name)
+            return await real_fusion(collection)
+
+        monkeypatch.setattr(_indexes, "rank_fusion_support", counting_fusion)
         stores = [
             _real_store(contract_uri, test_database_name, unique_collection_name, name=f"facts{index}")
             for index in range(10)
@@ -2384,6 +3033,20 @@ class TestTenStoresShareOneSetup:
             assert len(_client._REGISTRY) == 1
             assert probed == [unique_collection_name]
             assert len(await contract_database[unique_collection_name].index_information()) == 4
+
+            # AT-146, both halves, and which one applies is the deployment's to decide: MONGODB_URI
+            # may name a bare `mongod` or a cluster with mongot, and the contract marker deliberately
+            # accepts either. Ten stores must never mean ten `buildInfo` calls; zero is additionally
+            # required where search is absent, because a tier list of two impossible entries cannot
+            # contain the third and the probe is then a round trip bought for nothing.
+            capabilities = stores[0]._connection.capabilities
+            assert capabilities is not None
+            assert len(set(fusion_probed)) <= 1, f"the fusion probe ran per store: {fusion_probed}"
+            if not capabilities.search:
+                assert fusion_probed == [], (
+                    "a deployment with no search process cannot reach the hybrid tier, so asking it "
+                    f"for its version is a round trip with no reader: {fusion_probed}"
+                )
         finally:
             await stores[0].close()
 
@@ -2696,6 +3359,155 @@ class TestNoSearchCrossesAScope:
             assert _metadata(results[0])["_search_type"] == "vector"
         finally:
             await store.close()
+
+
+#: The hybrid corpus, shaped so that reciprocal rank fusion has something to say (``AT-143``).
+#:
+#: Four documents, because three cannot produce the result this test is about. Reciprocal rank fusion
+#: with the penalty at 60 is a sum of ``1/(60 + rank)``, and ``1/x`` is convex, so a document ranked
+#: first and third beats one ranked second twice: ``1/61 + 1/63 = 0.03227`` against ``2/62 = 0.03226``.
+#: The middle document only wins once the extremes are spread further than that, which takes a fourth
+#: rank: ``1/61 + 1/64 = 0.03202``. This is the arithmetic the README's RRF passage describes, and the
+#: reason the corpus is the size it is rather than the smallest one that runs.
+#:
+#: The vectors set the vector ranks exactly, since cosine against ``QUERY_VECTOR`` is readable off the
+#: first component. The text ranks are BM25's and are *not* predicted here -- the test measures them.
+#: They are, however, what the *arrangement* is built around, so the first version of this corpus is
+#: worth recording: it gave the vector rank in descending keyword density, which is roughly the order
+#: BM25 produces too, and two tiers that agree cannot demonstrate fusion. On the deployment the fused
+#: winner came back as the vector tier's own winner and the test said so.
+#:
+#: So the tiers are now deliberately opposed, which is also the case hybrid search exists for. The
+#: paraphrase carries the query vector exactly and none of the query's words, so it leads the vector
+#: tier and the text tier never returns it at all. The keyword-stuffed line is the reverse: BM25's
+#: winner, and last by cosine. Neither can win the fusion -- each scores from one tier only -- and the
+#: document ranked second by both takes it, which is the property ``AT-143`` asserts.
+_FUSION_CORPUS: Final[dict[str, list[float]]] = {
+    "the user prefers a dim interface at night": [1.0, 0.0, 0.0, 0.0],
+    "dark mode": [0.9, 0.44, 0.0, 0.0],
+    "dark mode is the setting the user prefers": [0.7, 0.71, 0.0, 0.0],
+    "dark mode dark mode dark mode, in dark mode": [0.2, 0.98, 0.0, 0.0],
+}
+
+_FUSION_TEXT_MATCHES: Final[int] = sum(1 for content in _FUSION_CORPUS if QUERY_TEXT in content)
+"""How many of :data:`_FUSION_CORPUS` the text tier can return, which is not all of them.
+
+The paraphrase holds neither of ``QUERY_TEXT``'s terms, so ``$search`` does not match it and no amount
+of waiting will produce a fourth text result. ``_answered`` polls until its ``expected`` arrives or the
+budget runs out, so passing the corpus size here would spend the whole budget on every run, on a
+premise that cannot become true, and then assert against the same three documents anyway.
+"""
+
+
+def _fuse(*orders: list[str]) -> list[str]:
+    """Rank documents the way ``$rankFusion`` does, from orders measured on the deployment.
+
+    The expected result is computed rather than written down, because writing it down would mean
+    predicting BM25's ordering of four short strings on a version of mongot this test does not pin.
+    What the test actually claims is narrower and more useful: *given* what each tier returned, the
+    fused order is reciprocal rank fusion of exactly those two orders, with equal weights and the
+    penalty this package documents.
+
+    A document a tier did not return scores zero from that tier, which is the server's behaviour and
+    the reason a fused query can surface something one tier missed entirely.
+
+    Args:
+        *orders: One ranked list of contents per tier, best first.
+
+    Returns:
+        Every content seen, ordered by fused score, best first.
+    """
+    penalty = _pipeline.RANK_FUSION_PENALTY
+    scores: dict[str, float] = {}
+    for order in orders:
+        for rank, content in enumerate(order, start=1):
+            scores[content] = scores.get(content, 0.0) + 1 / (penalty + rank)
+    return sorted(scores, key=lambda content: (-scores[content], content))
+
+
+@pytest.mark.integration
+class TestFusionRanksWhatNeitherTierRanksFirst:
+    """AT-143 / ``REQ-E-142``, ``REQ-E-145`` -- boundary **B-11** for the fourth tier.
+
+    The unit tests assert that this package builds one ``$rankFusion`` with two named input pipelines.
+    They cannot assert that the server fuses, because the stage is the server's. This is the test that
+    crosses that boundary, and the claim it makes is the one a caller cares about: a hybrid search
+    returns an order that *neither* underlying tier returns, and returns it on the fused scale.
+
+    Three stores over one collection, differing only in ``search_type``, so the two single-tier orders
+    are measured from the same deployment, the same corpus and the same query as the fused one. Then
+    the fused order is checked against :func:`_fuse` of those two. Predicting BM25's ordering instead
+    would have made this a test of mongot's scoring rather than of this package's fusion.
+
+    Skips rather than fails below MongoDB 8.0: ``$rankFusion`` is not there, ``initialize()`` says so
+    by design (``REQ-E-144``), and a deployment lacking a server feature is the marker's problem and
+    not this test's.
+    """
+
+    async def test_the_fused_order_is_rrf_of_the_two_tiers_it_composed(
+        self, atlas_uri: str, test_database_name: str, unique_collection_name: str, atlas_database: Any
+    ) -> None:
+        """AT-143 -- the fused order, the winner neither tier picked, and the scale it arrives on."""
+        await _seed_vectors(
+            atlas_database[unique_collection_name], scope="tenant-a", store_name="facts", facts=_FUSION_CORPUS
+        )
+        stores = {
+            tier: _real_store(
+                atlas_uri,
+                test_database_name,
+                unique_collection_name,
+                scope="tenant-a",
+                connection={**MANUAL_VECTOR, "search_type": tier},
+            )
+            for tier in ("vector", "text", "hybrid")
+        }
+        try:
+            try:
+                await stores["hybrid"].initialize()
+            except StorageError as error:
+                # The whole sentence, not the version inside it: every deployment this suite runs
+                # against reports a version beginning "8.0", so a substring test on that turns any
+                # unrelated failure naming the server build into a silent skip.
+                if "needs MongoDB 8.0 or later" in str(error):
+                    pytest.skip(f"MONGODB_ATLAS_URI names a deployment without $rankFusion: {error}")
+                raise
+
+            size = len(_FUSION_CORPUS)
+            by_vector = await _answered(stores["vector"], {"vector": QUERY_VECTOR, "limit": size}, expected=size)
+            by_text = await _answered(
+                stores["text"], {"text": QUERY_TEXT, "limit": size}, expected=_FUSION_TEXT_MATCHES
+            )
+            fused = await _answered(
+                stores["hybrid"], {"text": QUERY_TEXT, "vector": QUERY_VECTOR, "limit": size}, expected=size
+            )
+
+            vector_order = [entry.content for entry in by_vector]
+            text_order = [entry.content for entry in by_text]
+            fused_order = [entry.content for entry in fused]
+
+            assert _metadata(fused[0])["_search_type"] == "hybrid"
+            assert fused_order == _fuse(vector_order, text_order), (
+                f"fused {fused_order} is not RRF of vector {vector_order} and text {text_order}"
+            )
+
+            # The point of the tier, asserted as the property rather than as a named document: if the
+            # fused winner were always one of the two tiers' winners, fusion would be a preference
+            # between tiers and not a combination of them.
+            assert fused_order[0] not in (vector_order[0], text_order[0]), (
+                "the corpus stopped exercising fusion: its winner is a tier winner, so this run would "
+                f"pass against a pipeline that just picked a tier. vector {vector_order}, text {text_order}"
+            )
+
+            # ``REQ-E-145``'s premise, measured rather than asserted from the pipeline shape: a cosine
+            # score would be near 1 and would clear any bound a caller carried over from the vector
+            # tier. The fused ceiling is two reciprocal ranks, which is why that requirement declines
+            # fusion under `auto` when a bound is set.
+            best = 2 / (_pipeline.RANK_FUSION_PENALTY + 1)
+            score = _metadata(fused[0])["_relevance_score"]
+            assert 0 < score <= best, f"a fused score cannot exceed {best}, and this one is {score}"
+        finally:
+            for store in stores.values():
+                await store.close()
 
 
 @pytest.mark.integration
