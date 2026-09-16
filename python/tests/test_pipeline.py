@@ -604,8 +604,16 @@ class TestTheBoundsThisPackageCopiesFromTheServer:
     async def test_the_ceiling_is_the_ceiling_the_server_enforces(
         self, atlas_database: Any, unique_collection_name: str
     ) -> None:
-        """Sent without a vector index on purpose. The range check fires first, so the failure mode
-        distinguishes *out of bounds* from *no such index*, and the value is what we assert on."""
+        """Sent without a vector index on purpose. The range check fires before the index lookup, so the
+        failure mode distinguishes *out of bounds* from *no such index*, and the value is what we assert
+        on.
+
+        Both checks live in the search process, though, which is why the guard below is not decoration.
+        Measured against a deployment whose ``mongotHost`` pointed at a closed port: the answer is
+        ``HostUnreachable`` naming that port, because there is nothing left to enforce the bound with
+        (`AT-168` / `REQ-E-162`). A test that catches its own failure has to ask -- the phase hooks in
+        ``conftest.py`` only see exceptions that escape.
+        """
         collection = atlas_database[unique_collection_name]
         await collection.insert_one({"_id": "seed"})
 
@@ -625,13 +633,20 @@ class TestTheBoundsThisPackageCopiesFromTheServer:
         with pytest.raises(OperationFailure) as caught:
             await (await collection.aggregate(stage(_pipeline.MAX_NUM_CANDIDATES + 1))).to_list()
 
+        skip_if_search_is_unreachable(caught.value)
         assert f"[1..{_pipeline.MAX_NUM_CANDIDATES}]" in str(caught.value)
 
     async def test_a_non_positive_limit_is_the_error_the_message_claims(
         self, atlas_database: Any, unique_collection_name: str
     ) -> None:
         """The docstring on ``candidate_count`` names code 7912700 for this, and a code in a docstring
-        is a claim like any other."""
+        is a claim like any other.
+
+        Guarded like the test above (`AT-168`), though on the same crippled deployment this one still passes:
+        ``mongod`` rejects a non-positive ``limit`` before it dispatches anything, so the outage never
+        reaches it. That ordering is the server's business and not a thing this package asserts, which
+        is the whole reason the guard is here rather than an assumption.
+        """
         collection = atlas_database[unique_collection_name]
         await collection.insert_one({"_id": "seed"})
 
@@ -652,6 +667,7 @@ class TestTheBoundsThisPackageCopiesFromTheServer:
                 )
             ).to_list()
 
+        skip_if_search_is_unreachable(caught.value)
         assert caught.value.code == 7912700
 
 

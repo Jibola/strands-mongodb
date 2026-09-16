@@ -45,7 +45,7 @@ import subprocess
 import sys
 import textwrap
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterable, Iterator, MutableMapping
+from collections.abc import AsyncIterator, Callable, Generator, Iterable, Iterator, MutableMapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
@@ -446,6 +446,61 @@ def test_database_name() -> str:
     return f"strands_mongodb_test_{_SESSION_SUFFIX}"
 
 
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_setup(item: pytest.Item) -> Generator[None]:
+    """Turn an unreachable search process into a skip when it surfaces while a fixture is building.
+
+    ``REQ-E-161``. See :func:`pytest_runtest_call` for why both phases are wrapped and why this is a
+    hook rather than another call site.
+
+    Args:
+        item: The test being set up. Unused: what is inspected is the failure, not the test.
+
+    Yields:
+        Control to the rest of the setup phase.
+    """
+    try:
+        return (yield)
+    except BaseException as error:
+        # The same two lines the two search helpers hold, for the same reason: the guard returns for
+        # anything that is not the outage, and then this re-raises it untouched.
+        skip_if_search_is_unreachable(error)
+        raise
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item: pytest.Item) -> Generator[None]:
+    """Turn an unreachable search process into a skip wherever in the test body it surfaces.
+
+    ``REQ-E-161``, and the part the 2026-09-16 reproduction added. :func:`skip_if_search_is_unreachable`
+    was called from the two search helpers, which covered the failure that prompted it and not the
+    shape it usually takes: ``add`` and ``initialize`` provision the search indexes, so on a deployment
+    whose mongot is gone the outage arrives on the *arrange* line, before any search runs. Ten of that
+    day's twelve failures were standing there.
+
+    Adding the guard to every arrange line would mean touching every cluster test and would still miss
+    the next one. A hook sees the failure wherever it stands, and the match it delegates to is exactly
+    as strict as before -- two codes, one of them qualified by a sentence this package cannot produce --
+    so nothing that could be a package regression is affected.
+
+    **Teardown is deliberately not wrapped.** By then the test has its result, and converting a
+    teardown failure into a skip would discard an answer the suite already has.
+
+    Args:
+        item: The test being run. Unused: what is inspected is the failure, not the test.
+
+    Yields:
+        Control to the test body.
+    """
+    try:
+        return (yield)
+    except BaseException as error:
+        # The same two lines the two search helpers hold, for the same reason: the guard returns for
+        # anything that is not the outage, and then this re-raises it untouched.
+        skip_if_search_is_unreachable(error)
+        raise
+
+
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     """Mark every test whose tier has no configured backend as skipped, naming the variable.
 
@@ -548,6 +603,68 @@ Connection refused', 6)``. The 28000 is mongot, which the CLI runs as a separate
 ``mongod``, so the database answered every other call in the same run and only search failed.
 """
 
+COMMAND_FAILED: Final[int] = 125
+"""``CommandFailed``, which is what the *other* channel to the same process answers with.
+
+Measured on 2026-09-16, ``mongod`` 8.0 running with nothing listening on its ``mongotHost`` port. One
+outage, two answers: ``$search`` raised code 6 naming the host and port that refused, while
+``$listSearchIndexes`` and ``createSearchIndexes`` raised ``OperationFailure('... :: caused by ::
+Error connecting to Search Index Management service.', 125)`` -- no host, no port, and a code that is
+general rather than a network answer. mongod reaches mongot over two channels and reports them
+differently, so a guard that knows one code knows half of the outage.
+"""
+
+SEARCH_MANAGEMENT_UNREACHABLE: Final[str] = "Error connecting to Search Index Management service"
+"""The sentence that makes :data:`COMMAND_FAILED` mean the outage rather than any failed command.
+
+125 on its own is far too wide to skip on: it is the server's general "that command did not work out",
+and a suite that skipped on it would hide results it exists to report. This sentence is the part no
+change to this package can produce -- the host it stands for comes from a server parameter, and the
+package neither sets it nor knows it. ``AT-167`` asserts both halves, so the pairing stays deliberate.
+"""
+
+
+def _chain(error: BaseException) -> list[BaseException]:
+    """Return ``error`` and every cause under it, outermost first.
+
+    Walked to the end rather than read two links deep, because ``REQ-E-160`` gave the ``auto`` path's
+    "no search tier could be prepared" a cause of its own: this package's error wrapping this package's
+    error wrapping the driver's, and the code is on the last of the three. A guard reading two links
+    stopped exactly one short of the failure that prompted all of this.
+
+    Args:
+        error: The outermost exception.
+
+    Returns:
+        The chain, outermost first. Bounded, and self-referencing chains terminate rather than spin.
+    """
+    chain: list[BaseException] = []
+    link: BaseException | None = error
+    while link is not None and not any(link is seen for seen in chain):
+        chain.append(link)
+        link = link.__cause__
+    return chain
+
+
+def _is_search_unreachable(error: BaseException) -> bool:
+    """Whether one link says the deployment's search process did not answer.
+
+    Two conditions, because one outage has two reports (:data:`COMMAND_FAILED`). The first is a code on
+    its own, since 6 is a network answer and nothing this package does can produce one. The second is a
+    code *and* a sentence, since 125 alone is the server's general "that command failed".
+
+    Args:
+        error: One link of the chain.
+
+    Returns:
+        ``True`` if this link is the outage, ``False`` for anything else, including every link with no
+        code at all.
+    """
+    code = getattr(error, "code", None)
+    if code == HOST_UNREACHABLE:
+        return True
+    return code == COMMAND_FAILED and SEARCH_MANAGEMENT_UNREACHABLE in str(error)
+
 
 def skip_if_search_is_unreachable(error: BaseException) -> None:
     """Skip the running test if ``error`` is the deployment's search process refusing connections.
@@ -557,32 +674,42 @@ def skip_if_search_is_unreachable(error: BaseException) -> None:
     searching. A failure the operator has to fix is not a failure the suite should assert on, and a
     skip that names the process is the difference between "go restart mongot" and an afternoon.
 
-    **Deliberately narrow, in two ways.** It matches one code, and code 6 means a process in the
-    deployment did not answer at all -- not that it answered badly. And it is called from the two
-    search helpers alone, so a write or an index call that fails for the same reason still fails.
-    Widening either would turn a package regression into a skip, which is worse than the failure it
-    is avoiding.
+    **Two reports of one outage** (``REQ-E-161``). Written against code 6 alone, which is what the
+    query channel answers with, and that missed every call that provisions or reads an index: those go
+    over mongod's second channel to the same process and come back as 125 with a sentence instead.
+    Reproduced on 2026-09-16 -- a deployment with mongot gone failed twelve cluster tests and not one
+    of them carried a 6. Both conditions live in :func:`_is_search_unreachable`.
 
-    The code is looked for on the error **and** on its cause, because the two callers hold different
-    shapes of the same failure: ``test_memory_store.py`` goes through this package and catches a
-    ``StorageError`` carrying the driver's error chained, while ``test_pipeline.py`` drives the driver
-    directly and catches the ``OperationFailure`` itself. One chain walk reads both.
+    **Still deliberately narrow.** 6 matches on its own because it is a network answer this package
+    cannot provoke; 125 matches only beside :data:`SEARCH_MANAGEMENT_UNREACHABLE`, because on its own
+    it is the server's general "that command failed" and skipping on it would hide results the suite
+    exists to report. And it stays called from the search helpers, so a write that fails the same way
+    still fails.
+
+    The whole chain is read rather than the first two links, because the callers hold three different
+    depths of the same failure: ``test_pipeline.py`` drives the driver and catches the
+    ``OperationFailure`` itself, ``test_memory_store.py`` catches this package's ``StorageError`` with
+    the driver's chained, and the ``auto`` path adds a third link on top (``REQ-E-160``). One walk
+    reads all three, and the skip message is built from the links that say something new, so the
+    namespace and the host that refused both survive however deep they sit.
 
     Args:
         error: The exception a search call raised. Anything else returns, so the caller re-raises.
 
     Raises:
-        Skipped: via ``pytest.skip``, when ``error`` or its cause carries code 6.
+        Skipped: via ``pytest.skip``, when any link in the chain is one of the two reports.
     """
-    if not any(getattr(link, "code", None) == HOST_UNREACHABLE for link in (error, error.__cause__)):
+    if not any(_is_search_unreachable(link) for link in _chain(error)):
         return
     # Both links, rather than whichever one was caught. This package's error names the namespace and
     # the operation; the driver's names the host and port that refused, which is the process to go and
     # restart. `REQ-E-124` asks for both, and building the message from the chain rather than trusting
     # the wrapper to have embedded its cause is what makes that true of every caller.
-    chain = [str(error)]
-    if error.__cause__ is not None and str(error.__cause__) not in chain[0]:
-        chain.append(str(error.__cause__))
+    chain: list[str] = []
+    for link in _chain(error):
+        text = str(link)
+        if not any(text in seen for seen in chain):
+            chain.append(text)
     pytest.skip(
         f"this deployment's search process is unreachable, so the failure is infrastructure rather "
         f"than a package regression and asserting on it would report the wrong thing: "

@@ -122,7 +122,8 @@ embedding models, which is empty.
 
 _NO_TIER_PREPARED = (
     "strands_mongodb: 'search_type' is 'auto' and no search tier could be prepared on %s, so no query "
-    "can be answered. Each tier's failure is logged above with the server's own reason."
+    "can be answered. The last tier's failure is chained to this one and every tier's is logged above, "
+    "each with the server's own reason."
 )
 """``REQ-E-053b``'s floor: warn per tier, then raise once nothing is left."""
 
@@ -618,6 +619,7 @@ class MongoDBMemoryStore:
             StorageError: If no tier could be prepared, or if a named ``search_type``'s own tier failed.
         """
         available: list[ResolvedSearchType] = []
+        refused: StorageError | None = None
         for tier, spec in self._specs:
             try:
                 await _indexes.ensure(
@@ -630,11 +632,17 @@ class MongoDBMemoryStore:
                 if self._search_type != "auto":
                     raise
                 logger.warning(_TIER_UNAVAILABLE, tier, self._target, error)
+                refused = error
                 continue
             available.append(tier)
 
         if not available:
-            raise StorageError(_NO_TIER_PREPARED % self._target)
+            # Chained to the last tier's failure, not left to the log alone (`REQ-E-160`). The warnings
+            # above carry every reason, but only for a caller who configured logging at `WARNING`; the
+            # exception reaches everyone. The last tier rather than the first because it is the one the
+            # store fell all the way down to, and on a deployment where the whole search process is
+            # unreachable every reason is the same one anyway.
+            raise StorageError(_NO_TIER_PREPARED % self._target) from refused
 
         if self._hybrid_is_available(available, rank_fusion=rank_fusion):
             # Instead of the other two under an explicit request, ahead of them under `auto`. The list
