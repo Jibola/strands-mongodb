@@ -146,7 +146,18 @@ fallback_version = "0.0.0"
 packages = ["src/strands_mongodb"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "tests", "examples", "README.md", "MIGRATION.md", "LICENSE", "NOTICE", "pyproject.toml"]
+include = [
+    "src",
+    "tests",
+    "examples",
+    "README.md",
+    "MIGRATION.md",
+    # The reader this is for is holding a source download and deciding whether to upgrade. `AT-164`.
+    "CHANGELOG.md",
+    "LICENSE",
+    "NOTICE",
+    "pyproject.toml",
+]
 
 [tool.hatch.envs.default]
 features = ["all"]
