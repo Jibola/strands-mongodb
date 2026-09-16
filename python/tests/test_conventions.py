@@ -27,6 +27,8 @@ from __future__ import annotations
 import ast
 import re
 import sys
+import warnings
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Final
 
@@ -656,4 +658,52 @@ class TestTheHouseConventionsAreEnforcedNotDescribed:
         assert "strands_mongodb: " in text, "AGENTS.md does not show the log prefix this package actually uses"
         assert any(word in text.lower() for word in ("deviat", "differs from", "does not copy")), (
             "AGENTS.md states the log format without saying it deviates from the SDK's, which reads as ignorance"
+        )
+
+
+class TestADeprecationIsAFailureRatherThanAScrollbackLine:
+    """``AT-162`` / ``REQ-E-156`` -- the warning filter, and the floor that lets the suite survive it.
+
+    The pin below sat at ``<1.0.0`` from this package's first commit, and the cost of leaving it there
+    looked like tidiness: 2,269 ``DeprecationWarning``s per run, every one of them ``pytest_asyncio``
+    0.26 calling ``asyncio.get_event_loop_policy()``, which Python removes in 3.16. The real cost was that
+    a deprecation raised by *this* package would have arrived as line 2,270 of a wall nobody reads, and
+    :class:`TestTheHouseConventionsAreEnforcedNotDescribed.test_every_warning_passes_a_stacklevel` is
+    written for exactly the ``warnings.warn`` call somebody adds later.
+
+    So the two halves are one change: the filter makes the category fatal, and the floor is what makes the
+    filter survivable. Measured on the same tree under the same filter -- 915 errors on ``pytest-asyncio``
+    0.26.0, 912 passed on 1.4.0.
+
+    Both tests below observe the running interpreter rather than reading ``pyproject.toml`` back. A test
+    that parses the manifest and asserts the manifest says what the manifest says passes while the setting
+    does nothing -- the same failure as a document checked only against itself, which is how the root
+    ``README.md`` came to describe a fixed defect for months with a passing test over it.
+    """
+
+    def test_a_deprecation_warning_raised_here_stops_the_test(self) -> None:
+        """AT-162 -- the filter is live, proven by raising one rather than by reading the config.
+
+        This is the whole of the guarantee. Delete ``filterwarnings`` from ``pyproject.toml`` and this
+        test fails; misspell the category and it fails; add an ``ignore`` that shadows it and it fails.
+        Nothing else in the suite can say that, because every other test passes whether warnings are fatal
+        or merely counted.
+        """
+        with pytest.raises(DeprecationWarning):
+            warnings.warn("AT-162 raises this to prove the filter catches it", DeprecationWarning, stacklevel=2)
+
+    def test_the_async_plugin_is_past_the_version_that_trips_that_filter(self) -> None:
+        """AT-162 -- read from the installed distribution, so the failure names the cause.
+
+        Strictly redundant: on 0.26 the filter turns 915 tests into errors and the run is unmistakably
+        broken. It is here for what the *first* line of that report says. 915 errors inside pytest's own
+        plugin is a morning of bisecting; one failure naming the plugin and the floor is a ``pip install``.
+        A test can be redundant about the outcome and load-bearing about the diagnosis.
+        """
+        installed = version("pytest-asyncio")
+        major = int(installed.split(".")[0])
+        assert major >= 1, (
+            f"pytest-asyncio {installed} is installed, and below 1.0 it calls asyncio.get_event_loop_policy() "
+            f"on every async test -- which pyproject.toml's filterwarnings turns into an error. Install the "
+            f"declared floor (>=1.0.0,<2.0.0); the rest of this run's failures are that, not your change"
         )
