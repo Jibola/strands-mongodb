@@ -1,8 +1,9 @@
 name: CI - Python
 
-# Five gates on a change and two jobs on the weekly cron. Asserted by tests/test_ci.py (AT-104 to AT-109,
-# AT-130, AT-131), because this file is the one part of the repository nothing else in the suite can
-# execute: the tests read it as YAML and check that it says what the requirements ask it to say.
+# Five gates on a change and two jobs on the weekly cron or on demand. Asserted by tests/test_ci.py
+# (AT-104 to AT-109, AT-130, AT-131, AT-139, AT-140), because this file is the one part of the repository
+# nothing else in the suite can execute: the tests read it as YAML and check that it says what the
+# requirements ask it to say.
 #
 # The contract tier runs on every change against a service container rather than a credential. The tier's
 # own definition is "any real MongoDB, including a plain mongod", and this package opens no transaction, no
@@ -45,6 +46,15 @@ on:
     # here is strands-agents>=1.48.0 with no upper bound, so a new user resolves whatever is current; this
     # is what sees a removed export or an added Protocol member before they do.
     - cron: '0 6 * * 1'
+  # The same two jobs, on demand. A cron is a trigger no person can pull: across the first thirty-four runs
+  # of this workflow the schedule had fired zero times against eighteen pull requests and sixteen pushes,
+  # so the canary and the Atlas tiers had never run once and reported `skipping` on every pull request --
+  # which sits beside a pass in the same colour. A job reachable only by waiting also cannot be debugged,
+  # because the answer to "did that fix it" is another week away. Dispatch requires write access and runs a
+  # ref already in the repository, so it is exactly as far out of a fork's reach as the cron is; `AT-140`
+  # asserts that rather than trusting it. No `inputs:` -- a dispatch runs every job, which is the useful
+  # meaning of a "run CI now" button.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -203,7 +213,7 @@ jobs:
 
   sdk-compat:
     name: Latest SDK compatibility
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     # The same container the contract job uses, for the same reason it costs nothing. The canary is
@@ -259,14 +269,15 @@ jobs:
 
   atlas:
     name: Atlas tiers
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     # The two tiers a container cannot stand in for: integration needs mongot, and autoembed needs a
-    # cluster with a registered embedding model. On the schedule rather than on pull requests, because a
-    # fork's pull request receives neither secret and conftest.py would report both tiers as skipped --
-    # which a green check reads as passed. pull_request_target is the trigger that would hand a fork's code
-    # these values, and it is deliberately not among the triggers above.
+    # cluster with a registered embedding model. Off the change triggers, because a fork's pull request
+    # receives neither secret and conftest.py would report both tiers as skipped -- which a green check
+    # reads as passed. The cron and workflow_dispatch both need write access or no party at all, which is
+    # the property AT-140 asserts rather than the literal condition. pull_request_target is the trigger
+    # that would hand a fork's code these values, and it is deliberately not among the triggers above.
     env:
       MONGODB_ATLAS_URI: ${{ secrets.MONGODB_ATLAS_URI }}
       MONGODB_AUTOEMBED_URI: ${{ secrets.MONGODB_AUTOEMBED_URI }}

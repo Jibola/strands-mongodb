@@ -468,7 +468,7 @@ class TestTheDocumentsAndTheRepositoryAgreeBothWays:
         assert undocumented == [], f"AGENTS.md never mentions these registered markers: {undocumented}"
 
     def test_the_documented_gates_are_the_workflow_jobs(self) -> None:
-        """AT-113 — set equality, both directions, against the four jobs in ``ci-python.yml``.
+        """AT-113 — set equality, both directions, against every job in ``ci-python.yml``.
 
         Read from the first column of ``CONTRIBUTING.md``'s table rather than from its prose, because the
         claim is a list and a list is the one thing a reader will assume is complete. Job names are

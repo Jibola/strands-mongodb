@@ -90,7 +90,7 @@ with no cluster is green and fast.
 | `integration` | `MONGODB_ATLAS_URI` | Atlas, or an Atlas CLI local deployment with `mongot` |
 | `autoembed` | `MONGODB_AUTOEMBED_URI` | A cluster with an Atlas embedding model registered |
 | `build` | `STRANDS_MONGODB_BUILD_TIER` | Network. Builds a wheel and installs it into an empty venv. No deployment and no secret |
-| `compat` | none, CI cron only | Resolves the latest published `strands-agents` rather than the pinned one |
+| `compat` | none, CI cron or dispatch only | Resolves the latest published `strands-agents` rather than the pinned one |
 | `example` | its backend's tier | Runs a shipped `examples/` script as a subprocess |
 | `gate` | none | The release-gate assertion. Ordered last, so it sees every other outcome |
 
