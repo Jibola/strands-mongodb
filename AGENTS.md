@@ -166,8 +166,12 @@ than a matter of taste. Placeholders stay `%s`: that half of the rule is enforce
   in the repository looking for one with credentials in it, and the examples redact the userinfo before they
   print a URI.
 - **Do not infer an SDK API.** Read the installed `strands` package. Requirements here name the version that
-  introduced what they depend on, because the floor is `strands-agents` 1.48.0 for a specific reason and a
-  guess about an earlier release is a guess about somebody's install.
+  introduced what they depend on, because the floor is `strands-agents` 1.54.0 for a specific reason and a
+  guess about an earlier release is a guess about somebody's install. And do not raise or lower a floor by
+  reading a changelog: the floor that stood before this one was picked by checking two symbols against wheel
+  contents, and the module imports six. The `Dependency floors` job installs the declared floors and runs the
+  suite against them, which is the only check that reads what the code needs rather than what somebody
+  remembered.
 - **Do not hand-edit the index and privilege commands in `python/README.md`.** They are compared against the
   renderer in `src/strands_mongodb/_indexes.py` that produces them, so an edit there fails a test rather
   than shipping a command the package does not run.

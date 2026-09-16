@@ -41,11 +41,21 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-# Floor rationale: strands-agents 1.48.0 is the first release that ships `strands.storage`
-# (the unified Storage protocol) and `StorageError`; below it, importing this package's
-# storage backend fails. Verified by inspecting the wheel contents of every strands-agents
-# release. `strands.memory` landed earlier, in 1.44.0 — a single shared floor is used so the
-# extras stay mutually consistent and `[all]` cannot resolve to a split pair.
+# Floor rationale: strands-agents 1.54.0 is the first release that ships every module
+# `storage.py` imports at module scope. The binding one is `strands.storage.search.keyword`,
+# whose `tokenize` the lexical search path calls for parity with the SDK's own
+# `KeywordSearchStrategy`; that package does not exist before 1.54.0, so `import
+# strands_mongodb.storage` raises `ModuleNotFoundError` on anything older. `strands.storage`
+# itself and `StorageError` arrive earlier, at 1.48.0, and `strands.memory` earlier still at
+# 1.44.0 — a single shared floor is used so the extras stay mutually consistent and `[all]`
+# cannot resolve to a split pair.
+#
+# This floor read 1.48.0 for most of the package's life: the release that satisfies the two
+# `strands` modules somebody checked, rather than all four this one imports from. It was verified
+# by reading wheel contents for those two. It is now verified by installing it and running the suite,
+# which is what the `Dependency floors` job in ci-python.yml exists to keep doing (`REQ-E-168`),
+# because a floor checked by reading is a floor checked against what the reader remembered.
+#
 # Upper bounds are deliberately omitted, matching strands-dynamodb-storage and the official
 # extension template.
 #
@@ -63,12 +73,12 @@ dependencies = []
 # floor matches theirs. A dependency we import is one we declare, because a transitive pin
 # is a fact about their current release rather than a promise to us.
 storage = [
-    "strands-agents>=1.48.0",
+    "strands-agents>=1.54.0",
     "pymongo>=4.14.0",
     "typing-extensions>=4.13.2",
 ]
 memory = [
-    "strands-agents>=1.48.0",
+    "strands-agents>=1.54.0",
     "pymongo>=4.14.0",
     "typing-extensions>=4.13.2",
     # Atlas $vectorSearch / $search stage builders, maintained by MongoDB.

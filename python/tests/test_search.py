@@ -132,14 +132,32 @@ class TestTouchingThePlaceholderNamesThePhase:
 class TestTheSignaturePhaseTwoHasToFill:
     """AT-075 / AT-133 — the unreachable methods' only job is to be type checked."""
 
-    def test_the_protocol_declares_the_two_members_this_class_declares(self) -> None:
+    #: Every member ``SearchStrategy`` has declared across the range this package supports. ``search`` is
+    #: there from 1.54.0, the floor; ``index`` arrived in 1.56.0. A resolver is free to give a user either.
+    _DECLARED_ACROSS_THE_SUPPORTED_RANGE = frozenset({"index", "search"})
+
+    def test_the_protocol_declares_at_least_the_member_it_has_always_declared(self) -> None:
         """A guard on the guard below, which iterates and so passes vacuously on an empty set.
 
         ``_protocol_members`` reads ``vars``, and ``vars`` sees nothing if a future release moves the
-        members onto a base class or generates them. This test is what turns that from a green run
-        into a red one, and it names both members so the diff says which arrived or left.
+        members onto a base class or generates them. This test is what turns that from a green run into
+        a red one.
+
+        Stated as a bound rather than as an equality, which is the difference between describing the
+        installed release and describing the supported range. The floor is ``strands-agents>=1.54.0``
+        and ``index`` does not exist until 1.56.0, so an equality here is an assertion that the
+        developer's resolver won -- and it fails on the one environment that most needs to pass, the
+        ``floors`` job. What is asserted instead is that ``search`` is present, that nothing outside the
+        known pair has appeared, and therefore that the iteration below has something to iterate.
         """
-        assert sorted(_protocol_members(SearchStrategy)) == ["index", "search"]
+        members = frozenset(_protocol_members(SearchStrategy))
+        assert "search" in members, f"SearchStrategy declares {sorted(members)} and not `search`"
+
+        arrived = members - self._DECLARED_ACROSS_THE_SUPPORTED_RANGE
+        assert not arrived, (
+            f"SearchStrategy has grown {sorted(arrived)}, which nothing in this package declares; the "
+            f"signature test below will say the same thing, and this names it first"
+        )
 
     def test_every_protocol_member_matches_the_sdk_signature(self) -> None:
         """AT-133 — compared against ``SearchStrategy`` itself, so SDK drift lands here.

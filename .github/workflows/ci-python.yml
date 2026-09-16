@@ -23,6 +23,7 @@ on:
       - 'python/**'
       - '.github/workflows/ci-python.yml'
       - '.github/workflows/release-python.yml'
+      - '.github/dependabot.yml'
       - 'AGENTS.md'
       - 'CONTRIBUTING.md'
       - 'README.md'
@@ -37,14 +38,17 @@ on:
       - 'python/**'
       - '.github/workflows/ci-python.yml'
       - '.github/workflows/release-python.yml'
+      - '.github/dependabot.yml'
       - 'AGENTS.md'
       - 'CONTRIBUTING.md'
       - 'README.md'
       - '.gitignore'
   schedule:
     # Weekly canary against the newest SDK release, and the only mitigation for an unpinned SDK floor. The floor
-    # here is strands-agents>=1.48.0 with no upper bound, so a new user resolves whatever is current; this
-    # is what sees a removed export or an added Protocol member before they do.
+    # here is strands-agents>=1.54.0 with no upper bound, so a new user resolves whatever is current; this
+    # is what sees a removed export or an added Protocol member before they do. Its opposite number is the
+    # `floors` job, which resolves the other end of that range; between them the two ends of every declared
+    # floor are exercised and the middle is inferred.
     - cron: '0 6 * * 1'
   # The same two jobs, on demand. A cron is a trigger no person can pull: across the first thirty-four runs
   # of this workflow the schedule had fired zero times against eighteen pull requests and sixteen pushes,
@@ -94,6 +98,11 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # The credential `actions/checkout` otherwise writes into `.git/config` as an `http.extraheader`
+          # and leaves readable by every later step in the job. Nothing in either workflow pushes, tags or
+          # comments, so no step after a checkout has a use for it. `REQ-E-163` -- all nine checkouts
+          # across the two files set this, and `AT-169` reads both files rather than this one.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v7.0.0
@@ -134,6 +143,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v7.0.0
@@ -147,6 +157,76 @@ jobs:
       # No tier variable is set, so this is the unit tier: the three tiers that need a backend skip and
       # say which variable was missing.
       - name: Run tests
+        run: hatch run test
+
+  # The other end of the range `sdk-compat` tests. That job resolves the newest `strands-agents` every
+  # Monday; nothing resolved the oldest, and the floors in pyproject.toml are as much a shipped artefact as
+  # the code -- they are what a user's resolver reads. The first run of this job found the declared floor
+  # was wrong by six releases: `storage.py` imports `strands.storage.search.keyword`, which does not exist
+  # before 1.54.0, so `pip install strands-mongodb[storage]` resolving 1.48.0 produced a package that could
+  # not be imported. `REQ-E-168`, asserted by `AT-174`.
+  floors:
+    name: Dependency floors
+    # On a change rather than on the schedule, which is the mirror of `sdk-compat`: a floor stops being true
+    # when an import is added to a module, and that arrives in a pull request. Nothing upstream can break it.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15  # An install that resolves nothing current, then the unit tier. Budgeted as `test`.
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          # Quoted for the same reason the matrix is: unquoted 3.10 is the float 3.1 in YAML. The oldest
+          # interpreter rather than the newest, because a resolver that hands a user the floors is usually
+          # one an old Python constrained, and `AT-174` compares this against `requires-python`.
+          python-version: "3.10"
+          cache: 'pip'
+
+      # Written out rather than generated from pyproject.toml, so the pinned set is visible in the diff and
+      # in the log. `AT-174` reads the floors out of the manifest and requires each one to appear here, so
+      # a floor added to an extra and not added below fails on the change that adds it.
+      - name: Pin every declared floor
+        run: |
+          cat > "${RUNNER_TEMP}/floors.txt" <<'EOF'
+          strands-agents==1.54.0
+          pymongo==4.14.0
+          typing-extensions==4.13.2
+          pymongo-search-utils==0.3.0
+          EOF
+          cat "${RUNNER_TEMP}/floors.txt"
+          # pip reads PIP_CONSTRAINT on every invocation, including the ones hatch makes when it builds its
+          # environment, which is what makes `hatch run test` below run against the pinned set rather than
+          # against whatever the `>=` specifiers resolve to. `UV_CONSTRAINT` is the same file for the same
+          # reason, so this keeps working if hatch's installer is ever switched. Under `$RUNNER_TEMP` rather
+          # than in the checkout, so the job leaves the working tree alone.
+          #
+          # Exported into `$GITHUB_ENV` from a step, rather than declared in a job-level `env:` block, which
+          # is where this started and where it cannot work: `runner` is not one of the contexts available to
+          # `jobs.<job_id>.env`, and a workflow that names it there does not fail the job -- it fails the
+          # whole run at startup, before any job exists to report it. Observed on the first push: a run that
+          # completed in 0s with no jobs, no annotations and no log. `AT-175` is the gate that catches it
+          # without a push.
+          {
+            echo "PIP_CONSTRAINT=${RUNNER_TEMP}/floors.txt"
+            echo "UV_CONSTRAINT=${RUNNER_TEMP}/floors.txt"
+          } >> "$GITHUB_ENV"
+
+      - name: Install hatch
+        run: pip install hatch
+
+      - name: Show what resolved
+        run: hatch run pip list
+
+      # The unit tier, as the matrix runs it. A job that installed the floors and stopped would assert that
+      # pip can solve them, which is not the claim being made to anybody who installs this package.
+      - name: Run tests against the floors
         run: hatch run test
 
   contract:
@@ -178,6 +258,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v7.0.0
@@ -194,6 +275,20 @@ jobs:
       # is executed here rather than merely linted.
       - name: Run the contract tier
         run: hatch run test -m contract
+
+      # The contract tier is the only tier that runs shipped code against a real server, so it is the
+      # tier with something to leave behind: a `.env` a fixture wrote, an index definition dumped for
+      # debugging, a cache directory `.gitignore` does not name. Anything the run created that git can
+      # still see is either an artifact that belongs in `.gitignore` or an example writing into the
+      # working tree of whoever runs it, and both are defects worth a red job. `REQ-E-167`.
+      - name: Assert the tier left the working tree clean
+        run: |
+          dirty="$(git status --porcelain)"
+          if [ -n "$dirty" ]; then
+            echo "The contract tier left files behind:"
+            echo "$dirty"
+            exit 1
+          fi
 
   coverage:
     name: Coverage floors
@@ -212,6 +307,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v7.0.0
@@ -258,6 +354,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v7.0.0
@@ -287,9 +384,27 @@ jobs:
       - name: Run the contract tier against the upgraded SDK
         run: hatch run test -m contract
 
+      # Same gate as the `contract` job above, against the resolved-latest SDK rather than the pinned
+      # one, because an upstream release is exactly the thing that starts writing somewhere new.
+      # `REQ-E-167`.
+      - name: Assert the tier left the working tree clean
+        run: |
+          dirty="$(git status --porcelain)"
+          if [ -n "$dirty" ]; then
+            echo "The contract tier left files behind:"
+            echo "$dirty"
+            exit 1
+          fi
+
   atlas:
     name: Atlas tiers
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # `push` is here because the schedule alone leaves up to seven days between a merge and the first
+    # run of the only tiers that touch a real cluster, and a `$rankFusion` pipeline or an index
+    # definition that a fake accepts and Atlas rejects is invisible until then. `pull_request` stays
+    # off the list: the secrets a fork cannot read would make every fork PR fail on this job.
+    # `REQ-E-165`, and affordable because `REQ-E-152` keys the concurrency group on the event name,
+    # so a merge cancels the previous merge's run rather than the pull request's.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 60  # The long pole: two tiers against a real cluster, 36 minutes at its slowest.
 
@@ -308,6 +423,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v7.0.0

@@ -378,10 +378,15 @@ class TestCoreMetadata:
         assert dist_metadata["License-Expression"] == "Apache-2.0"
 
     @pytest.mark.parametrize("extra", ["storage", "memory"])
-    def test_strands_agents_floor_is_1_48_on_both_runtime_extras(
+    def test_strands_agents_floor_is_1_54_on_both_runtime_extras(
         self, dist_metadata: PackageMetadata, extra: str
     ) -> None:
-        """1.48.0 is the first release shipping ``strands.storage``.
+        """1.54.0 is the first release shipping every ``strands`` module ``storage.py`` imports.
+
+        ``strands.storage`` and ``StorageError`` arrive at 1.48.0, which is what this floor said until
+        the floors were installed rather than read. ``strands.storage.search.keyword`` -- whose
+        ``tokenize`` the lexical path calls -- arrives at 1.54.0, and below it the storage backend
+        raises ``ModuleNotFoundError`` on import.
 
         Applied to both extras deliberately, though ``strands.memory`` landed in 1.44.0, so ``[all]``
         cannot resolve to a split pair.
@@ -389,7 +394,7 @@ class TestCoreMetadata:
         requirements = [r for r in (dist_metadata.get_all("Requires-Dist") or []) if f"extra == '{extra}'" in r]
         floors = [r for r in requirements if r.startswith("strands-agents")]
         assert floors, requirements
-        assert all(">=1.48.0" in r for r in floors), floors
+        assert all(">=1.54.0" in r for r in floors), floors
 
     @pytest.mark.parametrize("extra", ["storage", "memory"])
     def test_pymongo_floor_is_4_14_on_both_runtime_extras(self, dist_metadata: PackageMetadata, extra: str) -> None:

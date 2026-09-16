@@ -90,7 +90,7 @@ you run as separate processes, so the only thing that carries state between them
 | | |
 |---|---|
 | Python | >= 3.10 |
-| `strands-agents` | >= 1.48.0, the release that introduced the unified `Storage` interface and `StorageError` |
+| `strands-agents` | >= 1.54.0, the first release shipping every `strands` module the storage backend imports — `strands.storage.search.keyword` is the binding one |
 | MongoDB | Any deployment serves storage. The text tier needs Atlas Search; the vector tier needs Atlas or an Atlas CLI local deployment. The default embedding path also needs a model registered on the cluster, measured present on Atlas and absent on a local `mongot` 8.3.8. |
 
 ## Erasing memories

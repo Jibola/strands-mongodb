@@ -178,6 +178,7 @@ _PACKAGE_DIRECTORY = "python"
 _READ_AT_LEAST = (
     ".github/workflows/ci-python.yml",
     ".github/workflows/release-python.yml",
+    ".github/dependabot.yml",
     "AGENTS.md",
     "CONTRIBUTING.md",
     ".gitignore",
@@ -1017,11 +1018,13 @@ class TestTheTiersThatNeedAClusterAreNeverHandedToAStranger:
     is the wrong trigger.
 
     ``integration`` needs mongot and ``autoembed`` needs a cluster with a registered embedding model, so
-    neither can be stood up by a container. Both therefore run against a repository secret, off the change
-    triggers, for two reasons that point the same way: a pull request from a fork receives no secret, so the
-    tiers would skip on exactly the contributions that most need checking and report the skip as a pass; and
-    they cost 33 minutes of wall clock against a cloud cluster when measured, which is not a gate anybody
-    keeps.
+    neither can be stood up by a container. Both therefore run against a repository secret, and off
+    ``pull_request`` in particular, for two reasons that point the same way: a pull request from a fork
+    receives no secret, so the tiers would skip on exactly the contributions that most need checking and
+    report the skip as a pass; and they cost 33 minutes of wall clock against a cloud cluster when
+    measured, which is not a gate anybody keeps. ``REQ-E-165`` later added ``push`` to the same job, which
+    this class permits and ``AT-171`` requires: a push to ``main`` needs write access, so it is not a
+    trigger a stranger can pull.
 
     This was once asserted as ``if:`` equalling ``"github.event_name == 'schedule'"``. That was right
     about the file and wrong about the claim, in both directions: it broke on the change that added a
@@ -1343,4 +1346,597 @@ class TestNoJobCanRunForSixHours:
                 f"job {name!r} budgets {budget} minutes. The slowest job in this workflow is the Atlas tier "
                 f"at 36 minutes observed, so anything above {_TIMEOUT_CEILING_MINUTES} is the "
                 f"{_DEFAULT_TIMEOUT_MINUTES}-minute default with a different number on it"
+            )
+
+
+#: The other workflow. Three of the four gates below are about a property no single file can have on its
+#: own: a credential left in a checkout is left in whichever job checked out, and there are nine of them
+#: across the two files.
+RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release-python.yml"
+
+#: The automated update source for the actions these workflows run. Outside ``python/``, so ``AT-138``
+#: requires both change triggers to watch it once this module names it.
+DEPENDABOT_PATH = REPO_ROOT / ".github" / "dependabot.yml"
+
+
+def _checkout_steps(parsed: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Every ``actions/checkout`` step in a parsed workflow, paired with the job that runs it.
+
+    Matched on the action rather than the reference, so a version bump does not quietly empty the walk.
+    """
+    found: list[tuple[str, dict[str, Any]]] = []
+    for job_name, job in (parsed.get("jobs") or {}).items():
+        for step in job.get("steps") or []:
+            uses = step.get("uses")
+            if isinstance(uses, str) and uses.split("@")[0] == "actions/checkout":
+                found.append((job_name, step))
+    return found
+
+
+def _every_checkout() -> list[tuple[str, str, dict[str, Any]]]:
+    """Every checkout in the repository, as ``(workflow file, job, step)``."""
+    out: list[tuple[str, str, dict[str, Any]]] = []
+    for path in (WORKFLOW_PATH, RELEASE_WORKFLOW_PATH):
+        parsed = yaml.safe_load(path.read_text())
+        assert isinstance(parsed, dict), f"{path.name} did not parse as a mapping"
+        out.extend((path.name, job, step) for job, step in _checkout_steps(parsed))
+    return out
+
+
+class TestNoCheckoutLeavesACredentialBehind:
+    """``AT-169`` / ``REQ-E-163`` -- the token ``actions/checkout`` writes into ``.git/config``.
+
+    By default the action stores an ``http.extraheader`` carrying the job's ``GITHUB_TOKEN`` in the
+    checked-out repository's config and leaves it there for the rest of the job. Nothing in either
+    workflow pushes, tags or comments, so no step after a checkout has any use for it -- and the contract
+    tier runs a shipped example as a subprocess in an environment where ``pip`` has just resolved a
+    dependency tree.
+
+    **What this is worth, stated plainly.** Both workflows declare ``permissions: contents: read``, so the
+    persisted credential is read-scoped, and the one job that raises ``id-token: write`` checks nothing
+    out. This is defence in depth, not a live escalation, and the requirement says so.
+    """
+
+    def test_the_walk_actually_finds_the_checkouts(self) -> None:
+        """AT-169 -- a gate over an empty list is a gate that passes for the wrong reason."""
+        checkouts = _every_checkout()
+        assert len(checkouts) >= 9, (
+            f"the walk found {len(checkouts)} checkouts across the two workflows and there were nine when "
+            f"this was written; a matcher that resolves nothing reports a clean result"
+        )
+
+    def test_every_checkout_refuses_to_persist_the_credential(self) -> None:
+        """AT-169 -- read from the step, so a checkout added later has to answer the question too."""
+        offenders = [
+            f"{file}:{job}"
+            for file, job, step in _every_checkout()
+            if (step.get("with") or {}).get("persist-credentials") is not False
+        ]
+        assert offenders == [], (
+            f"these checkouts leave the job's GITHUB_TOKEN readable in .git/config for every later step: "
+            f"{offenders}. Nothing in either workflow pushes, so set `persist-credentials: false`"
+        )
+
+
+#: The two variables that name a real cluster. A job that sets either is a job this gate is about.
+_CLUSTER_VARIABLES = ("MONGODB_ATLAS_URI", "MONGODB_AUTOEMBED_URI")
+
+
+def _cluster_jobs(workflow: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Every job that hands itself a cluster credential, keyed by job name.
+
+    Identified by the variables it sets rather than by its key, so renaming the job does not silently
+    empty this gate.
+    """
+    return {
+        name: job
+        for name, job in workflow["jobs"].items()
+        if any(variable in (job.get("env") or {}) for variable in _CLUSTER_VARIABLES)
+    }
+
+
+class TestTheClusterTiersRunOnEveryMerge:
+    """``AT-171`` / ``REQ-E-165`` -- a seven-day window on the branch tags are cut from.
+
+    The job admitted ``schedule`` and ``workflow_dispatch`` and nothing else. A push to ``main`` triggers
+    this workflow but did not trigger this job, so a merge received no ``integration`` and no
+    ``autoembed`` coverage until the following Monday -- and ``release-python.yml`` runs only the gate and
+    contract tiers, so a tag could be published having never exercised ``$vectorSearch`` with
+    ``autoEmbed``, this package's default search mode, against a cluster at all.
+
+    The reason the job stays off the *change* triggers is unchanged: a fork's pull request receives no
+    secret, ``conftest.py`` reports both tiers as skipped, and a skip and a pass are the same colour. A
+    push to ``main`` is not a fork.
+    """
+
+    def test_there_is_a_job_that_needs_a_cluster(self, workflow: dict[str, Any]) -> None:
+        """AT-171 -- the vacuity guard. Every assertion below is over this set."""
+        assert _cluster_jobs(workflow), (
+            f"no job sets any of {_CLUSTER_VARIABLES}, so the three assertions below are about nothing"
+        )
+
+    def test_a_merge_to_main_runs_them(self, workflow: dict[str, Any]) -> None:
+        """AT-171 -- the finding. A commit on main is the commit a tag is cut from."""
+        triggers = frozenset(_triggers(workflow))
+        for name, job in _cluster_jobs(workflow).items():
+            admitted = _admitted_events(job.get("if"), triggers)
+            assert "push" in admitted, (
+                f"job {name!r} runs on {sorted(admitted)} and not on a push to main, so a merge gets no "
+                f"cluster coverage until the next cron and a tag can be cut from a commit no cluster saw"
+            )
+
+    def test_they_stay_off_the_trigger_a_fork_can_pull(self, workflow: dict[str, Any]) -> None:
+        """AT-171 -- widening this job must not widen it to the one event that hands a stranger the wheel."""
+        triggers = frozenset(_triggers(workflow))
+        for name, job in _cluster_jobs(workflow).items():
+            admitted = _admitted_events(job.get("if"), triggers)
+            assert "pull_request" not in admitted, (
+                f"job {name!r} admits pull_request. A fork's pull request receives no secret, so both "
+                f"tiers would skip and report the same green as a run that passed"
+            )
+
+    def test_a_person_can_still_start_them(self, workflow: dict[str, Any]) -> None:
+        """AT-171 -- the property AT-139 holds workflow-wide, asserted here because this gate edits the condition."""
+        triggers = frozenset(_triggers(workflow))
+        for name, job in _cluster_jobs(workflow).items():
+            admitted = _admitted_events(job.get("if"), triggers)
+            assert "workflow_dispatch" in admitted, (
+                f"job {name!r} no longer admits workflow_dispatch, so the only way to ask this question "
+                f"is to merge something or wait for Monday"
+            )
+
+
+#: The ecosystem whose versions nothing in this repository raises by hand.
+_ACTIONS_ECOSYSTEM = "github-actions"
+
+#: The ecosystem this repository deliberately does not configure. `pyproject.toml` declares floors with no
+#: upper bounds and a paragraph of rationale for each; an automated pull request that raises one would
+#: narrow the range this package promises to work on while looking like housekeeping.
+_REFUSED_ECOSYSTEMS = frozenset({"pip", "uv", "poetry"})
+
+
+@pytest.fixture(scope="module")
+def dependabot() -> dict[str, Any]:
+    """The parsed update configuration.
+
+    Fails rather than skips when absent, for the reason the workflow fixture gives: absence is the defect.
+    """
+    assert DEPENDABOT_PATH.is_file(), f"REQ-E-166: no update configuration at {DEPENDABOT_PATH}"
+    parsed = yaml.safe_load(DEPENDABOT_PATH.read_text())
+    assert isinstance(parsed, dict), "the update configuration did not parse as a mapping"
+    return parsed
+
+
+class TestTheActionsHaveAnUpdateSourceAndTheFloorsDoNot:
+    """``AT-172`` / ``REQ-E-166`` -- two halves, and the second one is a refusal.
+
+    Nothing raises an action version in this repository, and ``REQ-E-164`` has just added a digest that
+    will not raise itself. Both peer repositories run Dependabot on ``github-actions`` with an identical
+    seven-day cooldown -- the window in which a yanked or compromised release is usually caught.
+
+    The refusal is the half specific to this package. A library ships its floors: ``strands-agents>=1.54.0``
+    and the three beside it are the contract, not an artefact of how a requirements file was written. A
+    bot that raises one revokes a promise, so the Python ecosystems are asserted *absent* rather than
+    merely left out, because leaving something out is not a decision anybody can see.
+    """
+
+    def test_it_watches_the_actions(self, dependabot: dict[str, Any]) -> None:
+        """AT-172 -- the first half. Nine checkouts and a digest, and nothing raising any of them."""
+        ecosystems = [entry.get("package-ecosystem") for entry in dependabot.get("updates") or []]
+        assert _ACTIONS_ECOSYSTEM in ecosystems, (
+            f"the update configuration watches {ecosystems} and not {_ACTIONS_ECOSYSTEM!r}, so the action "
+            f"references in both workflows -- including the digest REQ-E-164 pins -- go stale unwatched"
+        )
+
+    def test_every_entry_waits_before_proposing_a_release(self, dependabot: dict[str, Any]) -> None:
+        """AT-172 -- a cooldown, because the day a release lands is the day a bad one is still a release."""
+        for entry in dependabot.get("updates") or []:
+            ecosystem = entry.get("package-ecosystem")
+            cooldown = (entry.get("cooldown") or {}).get("default-days")
+            assert isinstance(cooldown, int) and cooldown >= 7, (
+                f"the {ecosystem!r} entry declares default-days {cooldown!r}. Both peer repositories wait "
+                f"seven, which is the window a yanked release is usually caught in"
+            )
+
+    def test_nothing_proposes_a_new_dependency_floor(self, dependabot: dict[str, Any]) -> None:
+        """AT-172 -- the refusal, asserted rather than assumed."""
+        configured = {entry.get("package-ecosystem") for entry in dependabot.get("updates") or []}
+        overreach = sorted(configured & _REFUSED_ECOSYSTEMS)
+        assert overreach == [], (
+            f"the update configuration watches {overreach}, which proposes new dependency floors. The "
+            f"floors in pyproject.toml are the range this package promises to work on and each one has a "
+            f"reason written beside it; raising one is a decision, not maintenance"
+        )
+
+
+#: The marker expression that selects the tier which runs a shipped example as a subprocess.
+_CONTRACT_SELECTION = "-m contract"
+
+#: What the gate has to run. `--porcelain` is the machine-readable form and, unlike a bare `git status`,
+#: it is empty on a clean tree -- which is what makes it usable as a condition.
+_TREE_QUERY = "git status --porcelain"
+
+
+def _jobs_running_shipped_code() -> list[tuple[str, str, dict[str, Any]]]:
+    """Every job in the repository that selects the contract tier, as ``(workflow file, job, job body)``.
+
+    Found by what the job runs rather than by its name, because two of the three are not called
+    ``contract``.
+    """
+    out: list[tuple[str, str, dict[str, Any]]] = []
+    for path in (WORKFLOW_PATH, RELEASE_WORKFLOW_PATH):
+        parsed = yaml.safe_load(path.read_text())
+        for name, job in (parsed.get("jobs") or {}).items():
+            if any(_CONTRACT_SELECTION in block for block in _run_blocks(job)):
+                out.append((path.name, name, job))
+    return out
+
+
+class TestTheTierThatRunsShippedCodeLeavesNothingBehind:
+    """``AT-173`` / ``REQ-E-167`` -- an example that writes a file beside itself.
+
+    ``-m contract`` selects the storage quickstart alongside the tier, so one of the two examples in
+    ``examples/`` is executed as a subprocess against a real server on every change rather than merely
+    linted. A shipped example that leaves a file behind is a defect every reader inherits by copying it,
+    and nothing in this repository observed whether one did.
+
+    **Every job that selects the tier, not just the one called ``contract``.** Three do: the contract job
+    here, the SDK canary, and the release gate's own contract job. A rule with an exception is a rule
+    somebody has to remember.
+
+    **What it cannot catch.** ``--porcelain`` respects ``.gitignore``, so the caches and coverage files
+    that file already names stay invisible. What is left is a path nobody declared, which is the shape a
+    stray artifact actually has.
+    """
+
+    def test_there_are_jobs_that_run_shipped_code(self) -> None:
+        """AT-173 -- the vacuity guard. The count has moved before: the release workflow's own contract
+        job was the third, and was added after the other two.
+        """
+        found = _jobs_running_shipped_code()
+        assert len(found) >= 3, (
+            f"the walk found {len(found)} jobs selecting {_CONTRACT_SELECTION!r} and there were three when "
+            f"this was written; a matcher that resolves nothing reports a clean result"
+        )
+
+    def test_each_of_them_asks_whether_the_tree_is_still_clean(self) -> None:
+        """AT-173 -- the gate itself."""
+        offenders = [
+            f"{file}:{name}"
+            for file, name, job in _jobs_running_shipped_code()
+            if not any(_TREE_QUERY in block for block in _run_blocks(job))
+        ]
+        assert offenders == [], (
+            f"these jobs run a shipped example as a subprocess and never ask what it left behind: "
+            f"{offenders}. Add a step running `{_TREE_QUERY}` and failing on any output"
+        )
+
+    def test_the_question_is_asked_after_the_tier_rather_than_before(self) -> None:
+        """AT-173 -- a clean tree before the run is the state every job starts in and proves nothing."""
+        for file, name, job in _jobs_running_shipped_code():
+            steps = job.get("steps") or []
+            ran = next(
+                (index for index, step in enumerate(steps) if _CONTRACT_SELECTION in (step.get("run") or "")),
+                None,
+            )
+            asked = next(
+                (index for index, step in enumerate(steps) if _TREE_QUERY in (step.get("run") or "")),
+                None,
+            )
+            assert ran is not None and asked is not None, f"{file}:{name} is missing one of the two steps"
+            assert asked > ran, (
+                f"{file}:{name} checks the working tree at step {asked} and runs the tier at step {ran}. "
+                f"Asked first, it reports the state the runner handed the job"
+            )
+
+
+#: The two extras that ship. ``all`` is a self-reference to these and declares no floor of its own; ``dev``
+#: is not installed by any user, so a floor there is a fact about this repository and not about the package.
+_SHIPPED_EXTRAS = ("storage", "memory")
+
+#: A requirement specifier that states a floor, e.g. ``strands-agents>=1.54.0``. Anything without ``>=`` is
+#: either a self-reference (``strands-mongodb[memory,storage]``) or a pin, and neither has a floor to check.
+_FLOOR = re.compile(r"\A(?P<name>[A-Za-z0-9._-]+)>=(?P<version>[0-9][0-9A-Za-z.]*)\Z")
+
+
+def _declared_floors() -> dict[str, str]:
+    """Every runtime floor the manifest declares, as ``{distribution: version}``.
+
+    Read out of ``pyproject.toml`` rather than listed here, which is the whole point: a floor added to an
+    extra and not to the job below is a floor nothing installs, and that is the defect this requirement
+    exists for.
+
+    Returns:
+        The floors, keyed by distribution name.
+    """
+    extras = _pyproject()["project"]["optional-dependencies"]
+    floors: dict[str, str] = {}
+    for extra in _SHIPPED_EXTRAS:
+        for specifier in extras[extra]:
+            matched = _FLOOR.match(specifier.strip())
+            if matched:
+                floors[matched["name"]] = matched["version"]
+    return floors
+
+
+def _floor_job(workflow: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """The job that installs the floors, identified by what it does rather than by its key.
+
+    A job that pins a declared distribution with ``==`` is doing the one thing no other job in this file
+    does. Finding it that way means renaming it changes nothing here.
+
+    Args:
+        workflow: The parsed workflow.
+
+    Returns:
+        The job's key and body.
+    """
+    floors = _declared_floors()
+    found = [
+        (name, job)
+        for name, job in workflow["jobs"].items()
+        if any(f"{distribution}==" in _job_text(job) for distribution in floors)
+    ]
+    assert len(found) == 1, (
+        f"expected exactly one job pinning a declared floor with `==`; found {[name for name, _ in found]}"
+    )
+    return found[0]
+
+
+def _job_text(job: dict[str, Any]) -> str:
+    """Every ``run:`` script in a job, concatenated.
+
+    Args:
+        job: The parsed job.
+
+    Returns:
+        The scripts, newline-joined.
+    """
+    return "\n".join(str(step.get("run", "")) for step in job.get("steps", []))
+
+
+class TestSomethingInstallsTheFloorsThePackageShips:
+    """``AT-174`` / ``REQ-E-168`` -- the shipped artefact with no test behind it.
+
+    ``sdk-compat`` resolves the newest ``strands-agents`` every Monday and nothing resolved the oldest, so
+    the range this package promises was checked at one end. Asking the question found the answer: at the
+    floor it declared, ``strands-agents==1.48.0``, the package did not import -- ``storage.py`` reaches for
+    ``strands.storage.search.keyword``, which arrives in 1.54.0. Six modules failed collection.
+
+    **Read out of the manifest, not restated.** ``_declared_floors`` parses ``pyproject.toml``, so the
+    assertion is against whatever is declared today rather than against what was declared when this was
+    written. A new runtime dependency fails here on the change that adds it.
+
+    **Found by behaviour, not by key.** ``_floor_job`` looks for the job that pins a declared distribution
+    with ``==``. No other job in this file does that, and renaming this one breaks nothing.
+    """
+
+    def test_the_manifest_actually_declares_floors_to_check(self) -> None:
+        """AT-174 -- the vacuity guard, and it guards a regex against a manifest it does not own."""
+        floors = _declared_floors()
+        assert len(floors) >= 4, (
+            f"parsed {floors} out of the shipped extras, and there were four when this was written; a "
+            f"matcher that resolves nothing reports a clean result"
+        )
+
+    def test_a_job_installs_them(self, workflow: dict[str, Any]) -> None:
+        """AT-174 -- that the job exists at all, which is the half that was missing."""
+        name, _ = _floor_job(workflow)
+        assert name, "no job pins a declared floor"
+
+    def test_every_declared_floor_is_pinned_there(self, workflow: dict[str, Any]) -> None:
+        """AT-174 -- each one, at the version declared, so the resolver cannot lift one quietly.
+
+        ``>=`` rewritten as ``==``. Installing the extras and hoping is not this: a resolver handed
+        ``strands-agents>=1.54.0`` returns the newest release, which is what every other job already tests.
+        """
+        _, job = _floor_job(workflow)
+        script = _job_text(job)
+        for distribution, version in sorted(_declared_floors().items()):
+            assert f"{distribution}=={version}" in script, (
+                f"pyproject.toml declares {distribution}>={version} and the floor job does not install "
+                f"{distribution}=={version}, so that floor is a promise nothing checks"
+            )
+
+    def test_it_runs_the_tests_rather_than_only_resolving(self, workflow: dict[str, Any]) -> None:
+        """AT-174 -- a job that installs and stops asserts that pip can solve, which is not the claim."""
+        _, job = _floor_job(workflow)
+        assert "hatch run test" in _job_text(job), (
+            "the floor job installs the floors and never runs the suite against them, so it checks that "
+            "the versions resolve and not that the package works on them"
+        )
+
+    def test_it_runs_on_a_change_rather_than_on_the_schedule(self, workflow: dict[str, Any]) -> None:
+        """AT-174 -- the mirror of ``AT-107``: a floor breaks when the code moves, not when time passes."""
+        _, job = _floor_job(workflow)
+        declared = frozenset(str(key) for key in _triggers(workflow))
+        admitted = _admitted_events(job.get("if"), declared)
+        assert {"pull_request", "push"} <= admitted, (
+            f"the floor job runs on {sorted(admitted)}. An import added to a module is what invalidates a "
+            f"floor, and that arrives in a pull request"
+        )
+
+    def test_it_runs_the_oldest_interpreter_the_package_claims(self, workflow: dict[str, Any]) -> None:
+        """AT-174 -- because a resolver that hands back a floor is usually one an old Python constrained.
+
+        Compared against ``requires-python`` rather than against a literal, for the same reason the floors
+        are: raising the interpreter floor and leaving this job on 3.10 would test a combination the package
+        no longer claims.
+        """
+        _, job = _floor_job(workflow)
+        declared = str(_pyproject()["project"]["requires-python"])
+        oldest = declared.removeprefix(">=").strip()
+
+        versions = [
+            str(step["with"]["python-version"])
+            for step in job.get("steps", [])
+            if isinstance(step.get("with"), dict) and "python-version" in step["with"]
+        ]
+        assert versions, "the floor job pins no interpreter, so it runs whatever the runner defaults to"
+        assert versions == [oldest], (
+            f"the floor job runs Python {versions} and pyproject.toml declares requires-python "
+            f"{declared!r}; the floors describe the environment an old interpreter produces"
+        )
+
+
+#: Which contexts GitHub makes available at each job-level key, transcribed from the "Context
+#: availability" table in the Actions documentation. Only the keys these two workflows actually put an
+#: expression under are listed, and a key that is missing fails this gate rather than passing it: the
+#: honest answer for a row nobody transcribed is "go and read the table", not "assume it is allowed".
+#:
+#: The four contexts that make this worth checking are ``runner``, ``job``, ``env`` and ``steps``. None
+#: of them appears in any row below, and all four are available in every step key -- which is exactly why
+#: the mistake is easy to make and impossible to see by reading. They are not blanket step-only: the table
+#: does admit them at ``environment.url``, ``outputs.<id>``, ``container.env.<id>``, ``container.credentials``
+#: and the two ``services`` equivalents. Neither workflow uses any of those keys today, so none is
+#: transcribed; adding one lands here as a missing row rather than as a false failure.
+_JOB_LEVEL_CONTEXTS: dict[str, frozenset[str]] = {
+    "env": frozenset({"github", "needs", "strategy", "matrix", "vars", "secrets", "inputs"}),
+    "if": frozenset({"github", "needs", "vars", "inputs"}),
+    "name": frozenset({"github", "needs", "strategy", "matrix", "vars", "inputs"}),
+    "runs-on": frozenset({"github", "needs", "strategy", "matrix", "vars", "inputs"}),
+    "timeout-minutes": frozenset({"github", "needs", "strategy", "matrix", "vars", "inputs"}),
+    "concurrency": frozenset({"github", "needs", "strategy", "matrix", "vars", "inputs"}),
+    "strategy": frozenset({"github", "needs", "vars", "inputs"}),
+}
+
+#: Every context name GitHub defines. Used to filter the matcher below, because the same syntax that
+#: introduces a context also introduces a field of one: in ``github.event.pull_request.number`` only
+#: ``github`` is the context and the rest is a path through it. A name outside this set is a function
+#: call or a nested field, and either way it is not what this gate is about.
+_CONTEXT_NAMES = frozenset(
+    {"github", "env", "vars", "job", "jobs", "steps", "runner", "secrets", "strategy", "matrix", "needs", "inputs"}
+)
+
+#: An expression, and the contexts named at the head of a path inside one. The lookbehind is what
+#: distinguishes a context from a field: ``runner`` in ``runner.temp`` matches, ``event`` in
+#: ``github.event.pull_request`` does not, and ``hashFiles`` in ``hashFiles('x')`` is followed by a
+#: bracket this does not accept.
+_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+_CONTEXT_HEAD = re.compile(r"(?<![\w.])([A-Za-z][A-Za-z0-9_-]*)\s*[.\[]")
+
+
+def _expressions_in(value: Any) -> list[str]:
+    """Every ``${{ ... }}`` body anywhere inside a parsed YAML value, at any depth."""
+    if isinstance(value, str):
+        return [match.group(1) for match in _EXPRESSION.finditer(value)]
+    if isinstance(value, dict):
+        return [found for item in value.values() for found in _expressions_in(item)]
+    if isinstance(value, list):
+        return [found for item in value for found in _expressions_in(item)]
+    return []
+
+
+def _every_job() -> list[tuple[str, str, dict[str, Any]]]:
+    """Every job in the repository, as ``(workflow file, job key, job)``."""
+    out: list[tuple[str, str, dict[str, Any]]] = []
+    for path in (WORKFLOW_PATH, RELEASE_WORKFLOW_PATH):
+        parsed = yaml.safe_load(path.read_text())
+        assert isinstance(parsed, dict), f"{path.name} did not parse as a mapping"
+        out.extend((path.name, str(name), job) for name, job in (parsed.get("jobs") or {}).items())
+    return out
+
+
+def _job_level_expressions() -> list[tuple[str, str, str, str, frozenset[str]]]:
+    """Every expression outside ``steps``, as ``(file, job, job key, expression, contexts named)``.
+
+    Keyed by the job-level key rather than by the full path, because that is the granularity the
+    documented table has: ``jobs.<job_id>.env`` admits one set of contexts and every value under it
+    admits the same set.
+    """
+    found: list[tuple[str, str, str, str, frozenset[str]]] = []
+    for file_name, job_name, job in _every_job():
+        for key, value in job.items():
+            if key == "steps":
+                continue
+            # `if` is the one key whose value is an expression without being wrapped in one, and it is
+            # also the job-level key most likely to carry a context: all seven jobs in ci-python.yml
+            # choose their events with it. A walk that only looked for `${{` would have found three
+            # expressions across the two files and reported them clean.
+            bare = [str(value)] if key == "if" and "${{" not in str(value) else []
+            for expression in _expressions_in(value) + bare:
+                named = frozenset(_CONTEXT_HEAD.findall(expression)) & _CONTEXT_NAMES
+                found.append((file_name, job_name, str(key), expression.strip(), named))
+    return found
+
+
+class TestNoJobLevelKeyNamesAContextThatIsNotThere:
+    """``AT-175`` / ``REQ-E-169`` -- an expression GitHub refuses to start the run for.
+
+    The ``floors`` job shipped with ``PIP_CONSTRAINT: ${{ runner.temp }}/floors.txt`` in a job-level
+    ``env:`` block. ``runner`` is not one of the contexts available to ``jobs.<job_id>.env``; it exists
+    only once a runner has been assigned, which is after the point the workflow file is parsed. The
+    result is not a failing job. It is a failing *run*: the first push of that file completed in zero
+    seconds with no jobs, no annotations and no log, under the message "This run likely failed because of
+    a workflow file issue."
+
+    **Why every other gate in this module missed it.** They all parse the file with PyYAML and assert on
+    the structure, and the structure was fine -- valid YAML, correct keys, the pins present, the tests
+    invoked. What was wrong was a value that only GitHub's expression evaluator can reject, and the
+    fifty-odd tests that read this workflow had no opinion about values. The whole class is checkable from
+    a transcribed table, which is what ``_JOB_LEVEL_CONTEXTS`` is.
+
+    **And why it matters more than a broken job would.** A startup failure takes every gate down at once
+    and reports as a single red entry beside whatever third-party checks the organisation adds, so a pull
+    request whose entire test suite never ran looks, at a glance, like a pull request with one unrelated
+    problem.
+    """
+
+    def test_the_walk_reads_every_job_in_both_files(self) -> None:
+        """AT-175 -- a table lookup over an empty list is a clean report about nothing.
+
+        Two bounds rather than one, because the two failure modes are different. Reading no jobs is a
+        renamed file or a changed schema; reading every job and finding no expression would be a broken
+        matcher, and the ``if`` handling above is exactly the kind of thing that silently stops matching.
+        """
+        assert len({file for file, _, _ in _every_job()}) == 2, (
+            "the walk read one of the two workflow files, or neither; both paths are asserted to exist "
+            "elsewhere in this module, so this is the schema changing under it"
+        )
+        assert len(_every_job()) >= 11, f"the walk found {len(_every_job())} jobs and there were eleven"
+
+        found = _job_level_expressions()
+        assert len(found) >= 10, (
+            f"the walk found {len(found)} job-level expressions and there were ten when this was written; "
+            f"a matcher that resolves nothing passes"
+        )
+
+    def test_every_job_level_key_it_finds_has_a_transcribed_row(self) -> None:
+        """AT-175 -- the gate is a lookup, so an untranscribed key must fail rather than be skipped."""
+        missing = sorted({key for _, _, key, _, _ in _job_level_expressions() if key not in _JOB_LEVEL_CONTEXTS})
+        assert missing == [], (
+            f"these job-level keys carry an expression and are not in _JOB_LEVEL_CONTEXTS: {missing}. "
+            f"Read the row out of the Actions 'Context availability' table and add it, rather than "
+            f"leaving a key this gate silently has no opinion about"
+        )
+
+    def test_every_expression_names_only_contexts_available_where_it_sits(self) -> None:
+        """AT-175 -- the finding, generalised: the whole file, both files, every job-level key."""
+        offenders = [
+            f"{file}:{job}:{key} -> ${{{{ {expression} }}}} names {sorted(named - _JOB_LEVEL_CONTEXTS[key])}"
+            for file, job, key, expression, named in _job_level_expressions()
+            if key in _JOB_LEVEL_CONTEXTS and not named <= _JOB_LEVEL_CONTEXTS[key]
+        ]
+        assert offenders == [], (
+            f"these expressions name a context GitHub does not provide at that key, which fails the whole "
+            f"run at startup rather than the job: {offenders}. A value needing `runner`, `job`, `env` or "
+            f"`steps` belongs in a step -- write it into $GITHUB_ENV from one, as the floor job does"
+        )
+
+    def test_the_floor_job_exports_the_constraint_it_writes(self) -> None:
+        """AT-175 -- the outcome, not the side effect: an unexported constraint file constrains nothing.
+
+        Moving the two variables into a step is only a fix if they still reach the install. Written as a
+        gate rather than left to review because the failure is silent in the direction that matters:
+        ``pip`` with no ``PIP_CONSTRAINT`` resolves the newest of everything and the job passes, having
+        tested the same combination the matrix already tests.
+        """
+        _, job = _floor_job(yaml.safe_load(WORKFLOW_PATH.read_text()))
+        exported = "\n".join(
+            str(step.get("run") or "") for step in job.get("steps") or [] if "$GITHUB_ENV" in str(step.get("run") or "")
+        )
+        for variable in ("PIP_CONSTRAINT", "UV_CONSTRAINT"):
+            assert f"{variable}=" in exported, (
+                f"the floor job never puts {variable} into $GITHUB_ENV, so the constraint file it writes "
+                f"is read by nothing and `hatch run test` resolves whatever the `>=` specifiers allow"
             )
