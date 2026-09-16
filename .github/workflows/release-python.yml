@@ -61,6 +61,15 @@ jobs:
       - name: Install hatch
         run: pip install hatch
 
+      # The manifest against the schemas packaging tools validate it with, which `hatch build` does not do:
+      # a build succeeds on metadata PyPI's own validators refuse, and the refusal arrives at the upload.
+      # Subsecond, and it runs before the checks that take minutes so a manifest defect is reported first.
+      # `AT-183`.
+      - name: Validate the manifest
+        run: |
+          pip install --quiet validate-pyproject
+          validate-pyproject pyproject.toml
+
       - name: Check formatting
         run: hatch run format-check
 
@@ -182,6 +191,16 @@ jobs:
               sys.exit(f"wheel is {built}, tag says {Version(tag)} ({wheels[0].name})")
           print(f"{wheels[0].name} matches tag {tag}")
           PY
+
+      # The description PyPI will render, rendered here instead. `--strict`, not the bare form: `twine
+      # check` prints a warning about an unrenderable description and exits 0, which is the same shape as
+      # `ruff format` against `ruff format --check` and just as useless as a gate. The metadata is part of
+      # the version and a version is spent permanently, so this is the last moment it can be fixed for
+      # free. `AT-183`.
+      - name: The artifacts must render on PyPI
+        run: |
+          pip install --quiet twine
+          twine check --strict dist/*
 
       - name: Upload the artifact for the publish job
         uses: actions/upload-artifact@v7

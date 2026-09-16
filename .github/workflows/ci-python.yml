@@ -125,6 +125,15 @@ jobs:
       - name: Install hatch
         run: pip install hatch
 
+      # The manifest against the packaging schemas, which `hatch build` does not check and the tests here
+      # do not either -- `test_packaging.py` reads the values this package cares about, not the shape PyPI's
+      # validators require. The release gate runs the same command; this copy is what turns a manifest
+      # defect into a comment on a diff rather than a red job after a tag exists. `AT-183`.
+      - name: Validate the manifest
+        run: |
+          pip install --quiet validate-pyproject
+          validate-pyproject pyproject.toml
+
       # format-check, not format. `hatch run format` is `ruff format`, which rewrites the checkout and
       # exits 0, so a job built on it reports success on unformatted code. `format-check` is
       # `ruff format --check`, which exits 1 and changes nothing.

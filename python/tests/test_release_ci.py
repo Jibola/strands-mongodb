@@ -23,7 +23,7 @@ from __future__ import annotations
 import fnmatch
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
@@ -106,6 +106,26 @@ def _triggers(workflow: dict[str, Any]) -> dict[str, Any]:
 def _step_uses(job: dict[str, Any], action: str) -> list[dict[str, Any]]:
     """Every step in ``job`` invoking ``action``, ignoring the version after the ``@``."""
     return [step for step in _steps(job) if str(step.get("uses", "")).split("@")[0] == action]
+
+
+def _ancestors(jobs: dict[str, dict[str, Any]], name: str) -> set[str]:
+    """Every job ``name`` cannot start without, transitively.
+
+    Transitive rather than one edge deep, because that is what a gate's position in the graph means: a
+    check two jobs upstream still guards the release, and a job rewired to depend only on its immediate
+    neighbour would satisfy a direct-edge assertion while skipping everything behind it.
+    """
+    needs = jobs[name].get("needs")
+    needs = [needs] if isinstance(needs, str) else (needs or [])
+    found = set(needs)
+    for parent in needs:
+        found |= _ancestors(jobs, parent)
+    return found
+
+
+def _jobs_running(jobs: dict[str, dict[str, Any]], fragment: str) -> set[str]:
+    """The jobs with a ``run:`` block containing ``fragment``."""
+    return {name for name, job in jobs.items() if any(fragment in str(step.get("run", "")) for step in _steps(job))}
 
 
 class TestOnlyThePythonTagTriggersARelease:
@@ -272,30 +292,17 @@ class TestThePublishedArtifactIsTheVerifiedArtifact:
         publishers = [name for name, job in jobs.items() if _step_uses(job, PUBLISH_ACTION)]
         assert publishers, f"no job uses {PUBLISH_ACTION}"
 
-        def ancestors(name: str) -> set[str]:
-            needs = jobs[name].get("needs")
-            needs = [needs] if isinstance(needs, str) else (needs or [])
-            found = set(needs)
-            for parent in needs:
-                found |= ancestors(parent)
-            return found
-
-        def jobs_running(fragment: str) -> set[str]:
-            return {
-                name for name, job in jobs.items() if any(fragment in str(step.get("run", "")) for step in _steps(job))
-            }
-
         # Every gate, not merely the first one: the floors and the contract tier live in separate jobs,
         # and an ancestry check that accepts either would pass on a chain that skips the other.
         required = {
-            "the coverage floors": jobs_running("hatch run cov"),
-            "the contract tier": jobs_running("-m contract"),
+            "the coverage floors": _jobs_running(jobs, "hatch run cov"),
+            "the contract tier": _jobs_running(jobs, "-m contract"),
         }
         for label, owners in required.items():
             assert owners, f"no job runs {label}"
 
         for name in publishers:
-            reachable = ancestors(name)
+            reachable = _ancestors(jobs, name)
             for label, owners in required.items():
                 assert reachable & owners, (
                     f"job {name!r} can publish without {label} ({sorted(owners)}) having run: its "
@@ -396,6 +403,173 @@ class TestTheReleaseGateIsNoWeakerThanCI:
             assert job.get("services"), (
                 f"job {name!r} sets MONGODB_URI to {uri!r} but declares no `services:` container to answer it"
             )
+
+
+#: The two tools that check the artifact rather than the code in it. Named as data because both have a
+#: reporting form that exits 0 on the failure they exist to find, and the assertions below are about
+#: which form is invoked.
+MANIFEST_CHECK = "validate-pyproject"
+ARTIFACT_CHECK = "twine check"
+
+#: The action that hands the built files to the publisher, and the one that wrote them.
+DOWNLOAD_ACTION = "actions/download-artifact"
+UPLOAD_ACTION = "actions/upload-artifact"
+
+
+class TestTheArtifactIsCheckedAndNotOnlyTheCodeInIt:
+    """``AT-183`` / ``REQ-E-178`` -- two checks that a release answered for the first time on the release.
+
+    ``AT-136`` and ``AT-137`` are about the code the artifact contains: the gate is no weaker than CI, and
+    the version equals the tag. Neither looks at the distribution. Whether the manifest satisfies the
+    schemas packaging tools validate against, and whether the description PyPI renders actually renders,
+    were both first answered by the upload -- after a person had approved a deployment, and against a
+    version number that is spent whatever happens next.
+
+    Both pass in this tree today, which is why they are worth adding now rather than later: the run that
+    fails is the change that breaks them, and there is no backlog of existing failures to work through.
+    """
+
+    def test_the_manifest_is_validated_against_the_packaging_schemas(self, workflow: dict[str, Any]) -> None:
+        """Not `hatch build` succeeding, which tolerates a manifest PyPI's own validators refuse."""
+        jobs = _jobs(workflow)
+
+        assert _jobs_running(jobs, MANIFEST_CHECK), f"no job runs {MANIFEST_CHECK}, so the manifest is unchecked"
+
+    def test_the_built_artifacts_are_checked_for_a_description_pypi_can_render(self, workflow: dict[str, Any]) -> None:
+        """A description that does not render is part of the version, and a version cannot be replaced."""
+        jobs = _jobs(workflow)
+
+        assert _jobs_running(jobs, ARTIFACT_CHECK), (
+            f"no job runs {ARTIFACT_CHECK}, so the first render of this package's description happens on PyPI"
+        )
+
+    def test_the_artifact_check_is_the_strict_one(self, workflow: dict[str, Any]) -> None:
+        """``twine check`` warns and exits 0; ``twine check --strict`` fails.
+
+        The same distinction this file already asserts for ``ruff format`` against ``ruff format --check``,
+        and it is worth asserting twice because the two tools make the same mistake available: a gate whose
+        failing case exits 0 is not a gate, it is a log line nobody reads.
+        """
+        invocations = [
+            block
+            for job in _jobs(workflow).values()
+            for step in _steps(job)
+            if ARTIFACT_CHECK in (block := str(step.get("run", "")))
+        ]
+
+        assert invocations, f"no step runs {ARTIFACT_CHECK}"
+        for block in invocations:
+            assert re.search(rf"{re.escape(ARTIFACT_CHECK)}\s+--strict", block), (
+                f"this step runs the reporting form rather than the checking one, so an unrenderable "
+                f"description passes it: {block!r}"
+            )
+
+    def test_the_artifact_check_runs_before_the_artifact_leaves_the_job(self, workflow: dict[str, Any]) -> None:
+        """Order within the job, not merely presence somewhere in the file.
+
+        A check after the upload still reports the failure and the artifact has already been handed to a
+        job whose next action is irreversible. Asserted by step index, because ``needs:`` says nothing
+        about the order of steps inside one job.
+        """
+        for name, job in _jobs(workflow).items():
+            steps = _steps(job)
+            uploads = [i for i, step in enumerate(steps) if str(step.get("uses", "")).startswith(UPLOAD_ACTION)]
+            if not uploads:
+                continue
+            checks = [i for i, step in enumerate(steps) if ARTIFACT_CHECK in str(step.get("run", ""))]
+            assert checks, f"job {name!r} uploads the artifact and never runs {ARTIFACT_CHECK} on it"
+            assert min(checks) < min(uploads), (
+                f"job {name!r} runs {ARTIFACT_CHECK} at step {min(checks)} and uploads at step "
+                f"{min(uploads)}; the check has to happen before the artifact is handed on"
+            )
+
+    def test_the_manifest_check_guards_the_release_rather_than_reporting_on_it(self, workflow: dict[str, Any]) -> None:
+        """It runs in a job the publisher cannot start without, which is what makes it a gate."""
+        jobs = _jobs(workflow)
+        publishers = [name for name, job in jobs.items() if _step_uses(job, PUBLISH_ACTION)]
+        assert publishers, f"no job uses {PUBLISH_ACTION}"
+        owners = _jobs_running(jobs, MANIFEST_CHECK)
+
+        for name in publishers:
+            assert owners & _ancestors(jobs, name), (
+                f"job {name!r} can publish without {MANIFEST_CHECK} ({sorted(owners)}) having run: its "
+                f"ancestors are {sorted(_ancestors(jobs, name))}"
+            )
+
+
+class TestTheArtifactTheUploadWroteIsTheOneThePublisherReads:
+    """``AT-184`` / ``REQ-E-179`` -- three strings that have to match, none of which anything checked.
+
+    The upload's ``name`` and the download's ``name``; the download's ``path`` and the publish action's
+    ``packages-dir``. A typo in any of them produces a publish job that downloads nothing and hands an
+    empty directory to the uploader, at the single moment in this repository's life when somebody has
+    already clicked approve.
+
+    ``AT-136`` walks ``needs:`` from the publishing job and would not see it. That graph is about which
+    jobs run in what order and it is correct; this is about whether the payload arrives.
+    """
+
+    def _pair(self, workflow: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        """The one upload step and the one download step, as ``with:`` mappings."""
+        steps = [step for job in _jobs(workflow).values() for step in _steps(job)]
+        uploads = [step for step in steps if str(step.get("uses", "")).startswith(UPLOAD_ACTION)]
+        downloads = [step for step in steps if str(step.get("uses", "")).startswith(DOWNLOAD_ACTION)]
+
+        assert len(uploads) == 1, f"expected exactly one upload step, found {len(uploads)}"
+        assert len(downloads) == 1, f"expected exactly one download step, found {len(downloads)}"
+        return uploads[0].get("with") or {}, downloads[0].get("with") or {}
+
+    def test_exactly_one_job_uploads_and_exactly_one_downloads(self, workflow: dict[str, Any]) -> None:
+        """The vacuity guard for the two tests below, which compare a pair.
+
+        Two uploads under different names is the shape where the equality assertions below start passing
+        on whichever pair the walk happens to reach first.
+        """
+        self._pair(workflow)
+
+    def test_the_download_names_the_artifact_the_upload_wrote(self, workflow: dict[str, Any]) -> None:
+        """One name, spelled once in each direction, and nothing else in the file agrees them."""
+        upload, download = self._pair(workflow)
+
+        assert upload.get("name"), "the upload declares no artifact name, so the download cannot ask for one"
+        assert download.get("name") == upload.get("name"), (
+            f"the upload writes {upload.get('name')!r} and the download asks for {download.get('name')!r}; "
+            f"the publish job would receive nothing and the failure would arrive after the approval"
+        )
+
+    def test_the_directory_handed_to_the_publisher_is_the_one_the_download_wrote_into(
+        self, workflow: dict[str, Any]
+    ) -> None:
+        """``packages-dir`` against the download's ``path``, compared as paths rather than as strings.
+
+        ``dist/`` and ``dist`` are the same directory and a string comparison calls them different, which
+        is the kind of failure that gets a real assertion replaced with a weaker one.
+        """
+        _, download = self._pair(workflow)
+        publishers = [step for job in _jobs(workflow).values() for step in _step_uses(job, PUBLISH_ACTION)]
+        assert publishers, f"no step uses {PUBLISH_ACTION}"
+
+        for step in publishers:
+            packages = (step.get("with") or {}).get("packages-dir")
+            assert packages, f"{PUBLISH_ACTION} is handed no packages-dir, so it reads wherever it defaults to"
+            assert PurePosixPath(str(packages)) == PurePosixPath(str(download.get("path"))), (
+                f"the download writes into {download.get('path')!r} and the publisher reads "
+                f"{packages!r}; one of the two is the wrong directory and the artifact is nowhere"
+            )
+
+    def test_an_upload_that_finds_nothing_fails_rather_than_succeeding_empty(self, workflow: dict[str, Any]) -> None:
+        """``if-no-files-found`` defaults to ``warn``, which is a green job and an empty artifact.
+
+        The build step could fail to produce a wheel for a reason the version check never reaches -- a
+        renamed output directory, a hatch configuration change -- and the default turns that into a
+        release that uploads nothing to PyPI rather than into a red job.
+        """
+        upload, _ = self._pair(workflow)
+
+        assert upload.get("if-no-files-found") == "error", (
+            f"the upload sets if-no-files-found to {upload.get('if-no-files-found')!r}; anything but "
+            f"`error` lets an empty artifact through to the publish job"
+        )
 
 
 #: The release document, beside the package README rather than at the repository root: it is about
