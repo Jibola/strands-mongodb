@@ -294,6 +294,47 @@ def _paths_outside_the_package() -> set[str]:
     return {path for path in named if path.split("/")[0] != _PACKAGE_DIRECTORY and Path(path).name not in ignored}
 
 
+#: The triggers only somebody with write access to this repository can cause. An allowlist rather than a
+#: list of the dangerous ones, so a trigger nobody has thought about counts as reachable by a stranger
+#: until somebody decides otherwise. ``push`` and ``workflow_dispatch`` both require write access;
+#: ``schedule`` is pulled by a clock and by no party at all.
+TRIGGERS_NEEDING_WRITE_ACCESS = frozenset({"push", "schedule", "workflow_dispatch"})
+
+#: The triggers a change arrives on. A job gated off both of these does not gate a merge, and a job gated
+#: on either of them runs on somebody's commit rather than on a decision to run it.
+CHANGE_TRIGGERS = frozenset({"pull_request", "push"})
+
+#: One comparison of ``github.event_name`` against a quoted event name. The whole grammar this workflow
+#: uses, joined by ``||``; anything else is refused rather than guessed at.
+_EVENT_COMPARISON = re.compile(r"github\.event_name\s*(==|!=)\s*'([a-z_]+)'\Z")
+
+
+def _admitted_events(condition: str | None, triggers: frozenset[str]) -> frozenset[str]:
+    """Which of the declared triggers actually reach a job carrying this ``if:`` expression.
+
+    An interpreter rather than a string comparison, because that is the question every caller below has.
+    A literal can only answer "is this condition still spelled the way somebody spelled it when they
+    wrote the test down", which is a different question with the same green.
+
+    Refuses what it cannot read. A condition outside the grammar raises here instead of being treated as
+    reachable, because an unread condition is exactly the case where a wrong answer is most expensive:
+    the two readings differ by whether a secret-holding job is open to a fork.
+    """
+    if condition is None:
+        return triggers
+
+    admitted: set[str] = set()
+    for term in str(condition).split("||"):
+        match = _EVENT_COMPARISON.fullmatch(term.strip())
+        assert match is not None, (
+            f"this reader does not understand {term.strip()!r} in {condition!r}. Extend it rather than "
+            "letting a condition nothing reads count as reachable"
+        )
+        operator, event = match.groups()
+        admitted |= {t for t in triggers if (t == event) == (operator == "==")}
+    return frozenset(admitted)
+
+
 class TestTheGatesEveryChangeMustPass:
     """AT-104 / REQ-E-104 -- the four things a pull request has to clear before anyone reads it.
 
@@ -419,6 +460,81 @@ class TestTheTriggerWatchesEverythingTheSuiteReads:
         assert not _watched("AGENTS.md", []), "an empty filter watches nothing"
 
 
+class TestEveryJobCanBeStartedOnDemand:
+    """``AT-139`` / ``REQ-E-139`` -- the mirror of the class above, asked about jobs instead of files.
+
+    ``AT-138`` asks whether a change to an asserted file reaches a job. This asks whether a declared job
+    can be started by a person, and whether a declared trigger reaches anything at all.
+
+    It is not hypothetical. ``sdk-compat`` and ``atlas`` were gated on ``github.event_name ==
+    'schedule'`` against one weekly cron, and in the first thirty-four runs of this workflow neither had
+    executed once: eighteen on ``pull_request``, sixteen on ``push``, none on the schedule. Both reported
+    ``skipping`` on every pull request, which sits in the checks list beside a pass in the same colour.
+    The SDK canary had never run, and the two secrets the other job holds had never been used.
+
+    On demand rather than merely reachable, because a path existed the whole time -- it just took a week
+    and could not be walked twice. A job you can only reach by waiting cannot be debugged: the answer to
+    "did that fix it" is another week away.
+    """
+
+    #: The one trigger no person can pull. Everything else in an ``on:`` block is caused by somebody.
+    UNPULLABLE = "schedule"
+
+    def _declared(self, workflow: dict[str, Any]) -> frozenset[str]:
+        return frozenset(str(key) for key in _triggers(workflow))
+
+    def test_every_job_can_be_started_by_a_person(self, workflow: dict[str, Any]) -> None:
+        """AT-139 -- a job only the clock reaches is a job nobody can use to answer a question."""
+        declared = self._declared(workflow)
+        on_demand = declared - {self.UNPULLABLE}
+
+        stranded = {
+            name: job.get("if")
+            for name, job in workflow["jobs"].items()
+            if not (_admitted_events(job.get("if"), declared) & on_demand)
+        }
+        assert stranded == {}, (
+            f"the triggers a person can pull are {sorted(on_demand)}, and these jobs answer to none of "
+            f"them: {stranded}. Each can only be run by waiting for the cron, once"
+        )
+
+    def test_every_trigger_reaches_some_job(self, workflow: dict[str, Any]) -> None:
+        """AT-139 -- the other direction, and a guard rather than a finding.
+
+        A trigger gating no job still produces a run, and that run is green because it did nothing. An
+        absent check is a hole; a green one over an empty job list is a wrong answer.
+        """
+        declared = self._declared(workflow)
+        conditions = [job.get("if") for job in workflow["jobs"].values()]
+
+        idle = sorted(
+            trigger
+            for trigger in declared
+            if not any(trigger in _admitted_events(condition, declared) for condition in conditions)
+        )
+        assert idle == [], f"these triggers start a run in which every job is skipped: {idle}"
+
+    def test_the_reader_interprets_the_condition_rather_than_matching_it(self) -> None:
+        """AT-139 -- the vacuity guard. Both tests above pass on everything if the reader admits everything."""
+        declared = frozenset({"push", "pull_request", "schedule", "workflow_dispatch"})
+
+        assert _admitted_events(None, declared) == declared, "an ungated job runs on every declared trigger"
+        assert _admitted_events("github.event_name == 'schedule'", declared) == {"schedule"}
+        assert _admitted_events("github.event_name != 'schedule'", declared) == declared - {"schedule"}
+        assert _admitted_events(
+            "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'", declared
+        ) == {"schedule", "workflow_dispatch"}
+        assert _admitted_events("github.event_name == 'release'", declared) == frozenset(), (
+            "an event no trigger declares reaches nothing, which is the shape of the defect above"
+        )
+
+    def test_the_reader_refuses_a_condition_it_cannot_read(self) -> None:
+        """AT-139 -- the failure mode of a reader is answering anyway, and a wrong yes here reads as green."""
+        for condition in ("success()", "github.ref == 'refs/heads/main'", "github.event_name == 'push' && true"):
+            with pytest.raises(AssertionError, match="does not understand"):
+                _admitted_events(condition, frozenset({"push", "schedule"}))
+
+
 class TestTheMatrixCoversEveryVersionTheClassifiersClaim:
     """AT-105 / REQ-E-105 -- the matrix and the classifiers, compared as sets in both directions.
 
@@ -510,20 +626,30 @@ class TestTheWeeklyCanaryAgainstTheLatestSDK:
 
         assert crons == [CANARY_CRON], f"the schedule is {crons}, not the template's weekly {CANARY_CRON!r}"
 
-    def test_the_canary_runs_only_on_the_schedule(self, workflow: dict[str, Any]) -> None:
-        """Otherwise every pull request resolves the latest SDK and the pinned floor is never the thing tested."""
-        condition = workflow["jobs"]["sdk-compat"].get("if")
+    def test_the_canary_never_runs_on_a_change(self, workflow: dict[str, Any]) -> None:
+        """Otherwise every pull request resolves the latest SDK and the pinned floor is never the thing tested.
 
-        assert condition == "github.event_name == 'schedule'", (
-            f"the canary's condition is {condition!r}, so it runs outside the cron"
+        Off the change triggers rather than on the cron alone. Those are different claims, and it is the
+        first one that carries the reason: a maintainer starting the canary by hand has decided to resolve
+        the latest SDK, which is the job's entire point, while a contributor pushing a commit has not.
+        """
+        declared = frozenset(str(key) for key in _triggers(workflow))
+        on_a_change = sorted(_admitted_events(workflow["jobs"]["sdk-compat"].get("if"), declared) & CHANGE_TRIGGERS)
+
+        assert on_a_change == [], (
+            f"the canary runs on {on_a_change}, so an ordinary change resolves the latest SDK and the "
+            "pinned floor is never the version under test"
         )
 
     def test_the_change_triggered_jobs_sit_out_the_schedule(self, workflow: dict[str, Any]) -> None:
         """The mirror of the above. A cron that also runs the pinned jobs reports nothing new, weekly."""
+        declared = frozenset(str(key) for key in _triggers(workflow))
+
         for name in ("lint", "test", "coverage"):
-            condition = workflow["jobs"][name].get("if")
-            assert condition == "github.event_name != 'schedule'", (
-                f"the {name} job's condition is {condition!r}, so the weekly cron runs it too"
+            admitted = _admitted_events(workflow["jobs"][name].get("if"), declared)
+            assert "schedule" not in admitted, (
+                f"the {name} job's condition is {workflow['jobs'][name].get('if')!r}, so the weekly cron "
+                "runs it too and reports the same answer it reported on the commit"
             )
 
     def test_the_canary_upgrades_the_sdk_before_it_tests_anything(self, workflow: dict[str, Any]) -> None:
@@ -696,41 +822,82 @@ class TestTheContractTierRunsOnEveryChange:
         ``AT-107``'s subject rather than this one's. What this asserts is that a change does not merge
         without it.
         """
+        declared = frozenset(str(key) for key in _triggers(workflow))
         conditions = {name: job.get("if") for name, job in self._jobs_setting(workflow, "MONGODB_URI").items()}
+        on_a_change = {
+            name: sorted(_admitted_events(condition, declared) & CHANGE_TRIGGERS)
+            for name, condition in conditions.items()
+        }
 
-        assert "github.event_name != 'schedule'" in conditions.values(), (
+        assert any(on_a_change.values()), (
             f"no job runs the contract tier on a change; the jobs that set MONGODB_URI are {conditions}"
         )
 
 
-class TestTheTiersThatNeedAClusterRunOnlyOnTheSchedule:
-    """AT-131 / REQ-E-128 -- the other half, where a secret is unavoidable and a pull request is the wrong trigger.
+class TestTheTiersThatNeedAClusterAreNeverHandedToAStranger:
+    """AT-131 / REQ-E-128, and ``AT-140`` / ``REQ-E-140`` -- where a secret is unavoidable and a pull request
+    is the wrong trigger.
 
     ``integration`` needs mongot and ``autoembed`` needs a cluster with a registered embedding model, so
-    neither can be stood up by a container. Both therefore run against a repository secret, on the cron, for
-    two reasons that point the same way: a pull request from a fork receives no secret, so the tiers would
-    skip on exactly the contributions that most need checking and report the skip as a pass; and they cost
-    33 minutes of wall clock against a cloud cluster when measured, which is not a gate anybody keeps.
+    neither can be stood up by a container. Both therefore run against a repository secret, off the change
+    triggers, for two reasons that point the same way: a pull request from a fork receives no secret, so the
+    tiers would skip on exactly the contributions that most need checking and report the skip as a pass; and
+    they cost 33 minutes of wall clock against a cloud cluster when measured, which is not a gate anybody
+    keeps.
 
-    The trigger is what this class asserts, rather than the intent behind it.
+    This was once asserted as ``if:`` equalling ``"github.event_name == 'schedule'"``. That was right
+    about the file and wrong about the claim, in both directions: it broke on the change that added a
+    second trigger exactly as safe as the cron, and it would have passed a condition naming some other
+    safe-sounding event that a stranger can in fact cause. The claim is about who can pull the trigger,
+    so that is what is asked now.
     """
 
     #: The two variables that can only be satisfied by a cluster, and so can only arrive as secrets.
     CLUSTER_VARIABLES = ("MONGODB_ATLAS_URI", "MONGODB_AUTOEMBED_URI")
 
-    def test_every_job_holding_a_cluster_secret_runs_only_on_the_schedule(self, workflow: dict[str, Any]) -> None:
-        """One condition per job rather than per variable: a second job is as exposed as a second key."""
-        holders = {
-            name: job
+    def _exposure(self, workflow: dict[str, Any]) -> dict[str, list[str]]:
+        """Per secret-holding job, the declared triggers a party without write access can cause."""
+        declared = frozenset(str(key) for key in _triggers(workflow))
+        reachable_by_a_stranger = declared - TRIGGERS_NEEDING_WRITE_ACCESS
+
+        exposed = {}
+        for name, job in workflow["jobs"].items():
+            if not any(variable in (job.get("env") or {}) for variable in self.CLUSTER_VARIABLES):
+                continue
+            through = _admitted_events(job.get("if"), declared) & reachable_by_a_stranger
+            if through:
+                exposed[name] = sorted(through)
+        return exposed
+
+    def test_no_trigger_a_stranger_can_cause_reaches_a_cluster_secret(self, workflow: dict[str, Any]) -> None:
+        """AT-140 -- one condition per job rather than per variable: a second job is as exposed as a second key."""
+        holders = [
+            name
             for name, job in workflow["jobs"].items()
             if any(variable in (job.get("env") or {}) for variable in self.CLUSTER_VARIABLES)
-        }
+        ]
         assert holders, f"no job supplies {self.CLUSTER_VARIABLES}, so neither tier runs anywhere"
 
-        wrong = {
-            name: job.get("if") for name, job in holders.items() if job.get("if") != "github.event_name == 'schedule'"
-        }
-        assert wrong == {}, f"these jobs hold a cluster secret outside the cron: {wrong}"
+        assert self._exposure(workflow) == {}, (
+            f"these jobs supply a cluster credential under a trigger somebody without write access to this "
+            f"repository can cause: {self._exposure(workflow)}"
+        )
+
+    def test_the_exposure_check_can_actually_see_an_exposure(self, workflow: dict[str, Any]) -> None:
+        """AT-140 -- the vacuity guard, because the test above asserts that something is empty.
+
+        Two conditions that would hand a key to a stranger, and the second is the one worth writing down:
+        it never mentions a pull request at all. ``!=`` against the cron admits every other declared
+        trigger, which is how this would arrive -- as somebody copying the gate off ``lint``.
+        """
+        for condition in (None, "github.event_name != 'schedule'"):
+            rigged = {
+                **workflow,
+                "jobs": {name: {**job, "if": condition} for name, job in workflow["jobs"].items()},
+            }
+            assert self._exposure(rigged) != {}, (
+                f"a cluster job gated on {condition!r} is reachable from a pull request, and this missed it"
+            )
 
     def test_both_cluster_tiers_are_actually_selected(self, workflow: dict[str, Any]) -> None:
         """A secret supplied and a marker never selected is a credential in a repository for nothing."""

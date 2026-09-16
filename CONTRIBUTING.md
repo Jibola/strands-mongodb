@@ -88,7 +88,8 @@ that it formats the tree in place where CI only reads it:
 hatch run prepare
 ```
 
-Then the jobs in `.github/workflows/ci-python.yml`. Four gate a change; two run on the weekly cron:
+Then the jobs in `.github/workflows/ci-python.yml`. Four gate a change; two run on the weekly cron, or
+whenever a maintainer starts the workflow by hand from the Actions tab:
 
 | Job | Runs |
 |---|---|
@@ -96,11 +97,12 @@ Then the jobs in `.github/workflows/ci-python.yml`. Four gate a change; two run 
 | `Test - Python <version>` | The default tier on 3.10, 3.11, 3.12 and 3.13. No deployment, so no secrets |
 | `Contract tier` | `hatch run test -m contract` against a `mongo:8` service container. No secret: the tier's definition is any real MongoDB, and a container is one |
 | `Coverage floors` | `hatch run cov`: 90% aggregate and 70% per module, both enforced |
-| `Latest SDK compatibility` | Weekly, against the newest published `strands-agents` rather than the pinned one. Typechecks, then runs `compat`, then runs `contract` |
-| `Atlas tiers` | Weekly. `hatch run test -m "integration or autoembed"` against two repository secrets |
+| `Latest SDK compatibility` | Weekly or on demand, against the newest published `strands-agents` rather than the pinned one. Typechecks, then runs `compat`, then runs `contract` |
+| `Atlas tiers` | Weekly or on demand. `hatch run test -m "integration or autoembed"` against two repository secrets |
 
 The two tiers that need a cluster run on the schedule rather than on your pull request, because a pull
-request from a fork receives no secret and the resulting skip would report as a pass. So CI will not
+request from a fork receives no secret and the resulting skip would report as a pass. Starting the workflow
+by hand needs write access for the same reason, so neither route hands a fork a credential. So CI will not
 exercise search behaviour on your branch. A pull request that touches it should say which tiers the
 author ran locally, with `MONGODB_URI` and `MONGODB_ATLAS_URI` pointing at a deployment of their own.
 
