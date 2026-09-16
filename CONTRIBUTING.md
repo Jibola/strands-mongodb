@@ -94,7 +94,7 @@ whenever a maintainer starts the workflow by hand from the Actions tab:
 | Job | Runs |
 |---|---|
 | `Lint` | `hatch run format-check`, `hatch run lint`, `hatch run typecheck` |
-| `Test - Python <version>` | The default tier on 3.10, 3.11, 3.12 and 3.13. No deployment, so no secrets |
+| `Test - Python <version>` | The default tier on 3.10, 3.11, 3.12, 3.13 and 3.14. No deployment, so no secrets |
 | `Contract tier` | `hatch run test -m contract` against a `mongo:8` service container. No secret: the tier's definition is any real MongoDB, and a container is one |
 | `Coverage floors` | `hatch run cov`: 90% aggregate and 70% per module, both enforced |
 | `Latest SDK compatibility` | Weekly or on demand, against the newest published `strands-agents` rather than the pinned one. Typechecks, then runs `compat`, then runs `contract` |
