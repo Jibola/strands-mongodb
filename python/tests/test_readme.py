@@ -52,7 +52,7 @@ from pymongo.auth import MECHANISMS
 from pymongo.errors import OperationFailure
 from strands.types.exceptions import StorageError
 
-from strands_mongodb import _indexes
+from strands_mongodb import _indexes, _pipeline
 from strands_mongodb.memory_store import DEFAULT_COLLECTION, MongoDBMemoryStore
 from strands_mongodb.storage import MAX_DOCUMENT_BYTES, MAX_KEY_BYTES, MongoDBStorage
 from strands_mongodb.types import (
@@ -808,6 +808,67 @@ class _CommandNames(monitoring.CommandListener):
         """
 
 
+def _fused_score_examples() -> dict[str, str]:
+    """The two fused scores worth writing down, computed rather than remembered (``AT-151``).
+
+    Both documents quote these, and quoting a number is how a document goes stale. Deriving them from
+    :data:`_pipeline.RANK_FUSION_PENALTY` here means the test fails when the constant moves, instead of
+    passing against prose that is now wrong.
+
+    Returns:
+        Each score, rounded the way the documents write it, mapped to what it describes.
+    """
+    penalty = _pipeline.RANK_FUSION_PENALTY
+    both = 2 / (penalty + 1)
+    one = 1 / (penalty + 1)
+    return {f"{both:.3f}": "ranked first by both tiers", f"{one:.3f}": "ranked first by one tier"}
+
+
+class TestTheFusedScaleIsStatedWhereABoundIsChosen:
+    """AT-151 -- ``REQ-E-146``: the number a caller needs in order to pick a bound for the hybrid tier.
+
+    ``REQ-E-145`` protects a caller on ``"auto"`` by declining fusion when a bound is set. ``REQ-E-146``
+    removes that protection the moment they ask for ``"hybrid"`` by name, which is correct -- it is their
+    tier -- and leaves them owing a number they have no way to derive. Reciprocal rank fusion is not a
+    similarity, there is no 0-to-1 range to reason from, and the ceiling depends on a rank constant that
+    lives in the server.
+
+    So both documents state it, and both are checked against :data:`_pipeline.RANK_FUSION_PENALTY` rather
+    than against 60. The constant exists to be quoted; if it ever stops being 60, the document that still
+    says 60 should fail here rather than mislead someone into a floor that empties their result set.
+    """
+
+    def test_the_readme_explains_the_fused_scale_and_quotes_the_live_penalty(self) -> None:
+        """AT-151 -- the operator half, in the passage a reader reaches from the tier table."""
+        text = _PACKAGE_README.read_text()
+        assert "<!-- rrf -->" in text, f"no passage marked '<!-- rrf -->' in {_PACKAGE_README.name}"
+        section = text.split("<!-- rrf -->", 1)[1].split("\n## ", 1)[0]
+
+        assert str(_pipeline.RANK_FUSION_PENALTY) in section, (
+            f"the RRF passage does not state the rank constant, now {_pipeline.RANK_FUSION_PENALTY}"
+        )
+        for number, describes in _fused_score_examples().items():
+            assert number in section, f"the RRF passage does not state {number}, the score of a document {describes}"
+        assert "min_score" in section and "max_score" in section, (
+            "the RRF passage does not name the two keys whose values this scale governs"
+        )
+
+    def test_the_config_docstring_explains_it_where_the_bound_is_set(self) -> None:
+        """AT-151 -- the API half. A caller typing ``min_score=`` is in an editor, not in the README."""
+        doc = inspect.getdoc(MongoDBMemoryStoreConfig) or ""
+        bounds = doc.split("min_score:", 1)
+        assert len(bounds) == 2, "MongoDBMemoryStoreConfig no longer documents min_score"
+
+        assert "RANK_FUSION_PENALTY" in bounds[1], (
+            "the min_score documentation does not name the constant holding the rank penalty, so a "
+            "reader has to find the scale somewhere else or guess it"
+        )
+        assert all(number in bounds[1] for number in _fused_score_examples()), (
+            "the min_score documentation states no worked value, which is the part that makes the "
+            "difference between the two scales obvious rather than merely mentioned"
+        )
+
+
 class TestTheIndexAndPrivilegesReference:
     """``AT-096`` -- ``REQ-E-096``: the block an operator pastes, generated rather than written.
 
@@ -1221,3 +1282,42 @@ class TestTheTtlCaveatNamesTheMethodThatCreatesTheIndex:
             f"the index table still says nothing creates the storage TTL index: {ttl!r}"
         )
         assert "ensure_indexes()" in ttl, f"the index table's TTL row does not name the method: {ttl!r}"
+
+
+class TestTheReadmeSaysWhichSurfaceCreatesTheTtlIndex:
+    """``AT-158`` -- ``REQ-E-149``'s documentation half, made necessary and false in one step.
+
+    There was once one TTL story and the README told it once: you stamp ``expires_at``, nothing creates
+    the index, call ``ensure_indexes()``. The memory store has the opposite arrangement --
+    ``initialize()`` creates the index whether or not any store sets a ``ttl_seconds`` -- which turned
+    the single story into a claim that is true of one surface and wrong about the other. A reader who
+    believes the unscoped version calls a method that does not exist on ``MongoDBMemoryStore``; a reader
+    who believes its inverse leaves storage documents unexpiring forever. So both rows name their
+    surface.
+    """
+
+    def test_the_limits_row_scopes_itself_and_names_the_other_surface(self) -> None:
+        """AT-158 -- the caveat is about `MongoDBStorage`, and it says so before it says anything else."""
+        row = next((limit, value) for limit, value, _ in _limit_rows() if "ttl_seconds" in limit and "index" in limit)
+        limit, value = row
+
+        assert "MongoDBStorage" in limit, (
+            f"the limits row reads as a claim about both surfaces, and it is false on one: {limit!r}"
+        )
+        assert "initialize()" in value, (
+            f"the row does not say the memory store creates its own TTL index, so a reader goes looking "
+            f"for an ensure_indexes() that surface does not have: {value!r}"
+        )
+
+    def test_the_memory_index_row_names_the_method_that_creates_it(self) -> None:
+        """AT-158 -- the index table's memory row, which said what expires and not who armed it."""
+        text = _PACKAGE_README.read_text()
+        section = text.split("### What gets created", 1)[1].split("\n### ", 1)[0]
+        rows = [line for line in section.splitlines() if "strands_expires_at_ttl" in line]
+
+        assert len(rows) == 2, f"expected a TTL row per collection, found {len(rows)}: {rows!r}"
+        memory = next(line for line in rows if line.lstrip("| ").startswith("`memory`"))
+
+        assert "initialize()" in memory, (
+            f"the memory TTL row does not say initialize() creates it, which is the whole point: {memory!r}"
+        )

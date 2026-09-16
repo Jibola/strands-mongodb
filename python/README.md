@@ -275,6 +275,7 @@ and behave as they do for any store, with one exception noted below.
 | `filter` | `dict[str, Any]` | no | | Extra search predicate, composed as a narrowing conjunction. It cannot widen what this store can read. Paths must appear in `filter_fields`. |
 | `min_score` | `float` | no | | Relevance floor. Applied after the search, so it drops results without changing their order. |
 | `max_score` | `float` | no | | Relevance ceiling. Mutually exclusive with `min_score`. |
+| `ttl_seconds` | `int` | no | | How long a memory lives, measured from its own `created_at`. Absent means it never expires and stamps no field; `0` means "at the next sweep" and is a real value, not a disabled one. Set on insert, so re-remembering a fact does not extend it. Needs no `ensure_indexes()` call here — `initialize()` already creates the TTL index. |
 
 ### `MongoDBSearchQuery`
 
@@ -293,16 +294,20 @@ Every key is optional, but exactly one of `text` and `vector` has to be set.
 ## Search: what answers a query
 
 `search()` picks a tier from the query's **shape**, not from what you asked for, and reports which one
-ran in the `_search_type` metadata key. Two tiers exist in `0.1.0`:
+ran in the `_search_type` metadata key. Three tiers exist in `0.1.0`:
 
+<!-- tiers -->
 | Tier | Runs | Needs |
 |---|---|---|
+| `hybrid` | one `$rankFusion` over the two pipelines below | MongoDB 8.0 or later, **and** both of the other tiers available |
 | `vector` | `$vectorSearch` against `vector_index` | Atlas, or an Atlas CLI local deployment, plus a registered embedding model on the AutoEmbeddings path |
 | `text` | `$search` against `text_index` | Atlas Search, and no embedding model |
 
-`search_type` decides which of them `initialize()` prepares. `"auto"` prepares both and prefers `vector`;
-naming one prepares only that one, so a `text` store never builds a vector index it will never query, and
-a `vector` store fails rather than quietly answering a query lexically.
+`search_type` decides which of them `initialize()` prepares. `"auto"` prepares every tier the deployment
+offers and prefers the highest one it got; naming one prepares only that one, so a `text` store never
+builds a vector index it will never query, and a `vector` store fails rather than quietly answering a
+query lexically. Naming `hybrid` prepares both underlying indexes and fails at `initialize()` if the
+deployment cannot fuse, rather than falling back to half of what you asked for.
 
 Preparation can come up short without failing. A deployment with no search process at all gets its
 ordinary indexes and a warning, and the search call is what raises. A cluster with Atlas Search but no
@@ -310,8 +315,28 @@ registered embedding model rejects the `autoEmbed` index at creation, and a stor
 falls back to the text tier and says so in a warning. Both of those are visible only in your logs, which
 is worth knowing before you conclude that recall is bad.
 
-`hybrid` and `regex` are not here. `SearchType` is a `Literal` of the values that actually run, so a type
-checker rejects them today rather than a runtime raising on them later.
+`regex` is not here. `SearchType` is a `Literal` of the values that actually run, so a type checker
+rejects it today rather than a runtime raising on it later.
+
+### Hybrid scores are on a different scale
+
+<!-- rrf -->
+Fused results are **not** similarity scores, and a `min_score` or `max_score` chosen against the vector
+tier will not mean what you meant on this one. `$rankFusion` scores by reciprocal rank fusion:
+
+```
+RRFscore(d) = sum over tiers of  weight / (60 + rank of d in that tier)
+```
+
+The `60` is MongoDB's rank constant, and this package does not change it. With the two tiers weighted
+equally, a document ranked first by both scores about `0.033`; one ranked first by a single tier scores
+about `0.016`; everything else is smaller. So a `min_score` of `0.7`, a perfectly ordinary cosine floor,
+removes every result.
+
+Because that failure is silent — an empty list is what "no matches" looks like too — a store on `"auto"`
+with either bound configured stays on the vector tier and logs that it did. Asking for `search_type="hybrid"`
+by name overrides that: the bound is applied to the fused score, on the scale above, because you asked
+for this tier specifically.
 
 ### Supplying your own vectors
 
@@ -416,7 +441,7 @@ theirs, and they are stable: renaming one would be a breaking change.
 | `storage` | `strands_expires_at_ttl` | `expires_at` | Expires `ttl_seconds` documents. `MongoDBStorage` never creates it as a side effect of a write: call `ensure_indexes()`. |
 | `memory` | `strands_scope_store_content_hash_unique` | `scope`, `store_name`, `content_hash` | Makes a duplicate `add` a no-op instead of a second copy. Partial, so documents with no hash are unaffected. |
 | `memory` | `strands_scope_store_created_at` | `scope`, `store_name`, `created_at` desc | Every non-search read is scope plus store plus recency. |
-| `memory` | `strands_expires_at_ttl` | `expires_at` | Expires memories with a TTL. |
+| `memory` | `strands_expires_at_ttl` | `expires_at` | Expires memories whose store sets `ttl_seconds`. Unlike the storage one, `initialize()` creates it whether or not any store sets a TTL, so the first store to set one expires from its first write. |
 | `memory` | `vector_index` | `content` as `autoEmbed`, `scope` and `store_name` as filters | The vector tier. Atlas only. Name from `vector_index_name`. |
 | `memory` | `text_index` | `content` as a string field | The text tier. Atlas Search only. Name from `text_index_name`. |
 
@@ -523,7 +548,7 @@ and the last column names the requirement or the id where the detail lives.
 | Document size | 16 MB, the server's `BSON` ceiling. Checked before the write, so you get a `ValueError` naming the size instead of a driver error. Chunk, or store a pointer. | `MAX_DOCUMENT_BYTES` |
 | Storage key length | 1024 bytes, which keeps a key inside an index entry. Same early `ValueError`. | `MAX_KEY_BYTES` |
 | `list()` is unpaginated | The SDK's protocol takes a prefix and no cursor, so a prefix matching a million keys returns a million keys. Use narrower prefixes, or `namespace()`. | `Storage.list()` |
-| `ttl_seconds` needs an index nothing creates implicitly | `write` stamps `expires_at`, and the documents stay until the storage collection has its TTL index. No ordinary operation creates it, so the documents stay forever if nothing does. Call `await storage.ensure_indexes()` once at startup, or run the command above. | `MongoDBStorage.ensure_indexes()` |
+| On `MongoDBStorage`, `ttl_seconds` needs an index nothing creates implicitly | `write` stamps `expires_at`, and the documents stay until the storage collection has its TTL index. No ordinary operation creates it, so the documents stay forever if nothing does. Call `await storage.ensure_indexes()` once at startup, or run the command above. The memory store is the other way round: `initialize()` creates its TTL index unconditionally, so a `ttl_seconds` there expires from the first write with nothing to call. | `MongoDBStorage.ensure_indexes()` |
 | Vector dimensions | 8192 on the manual vector path, rejected at configuration time rather than by the server. | `MAX_DIMENSIONS` |
 | Results per search | 10 by default. Raise `max_search_results` on the store, or `limit` on a single query. | `DEFAULT_MAX_SEARCH_RESULTS` |
 | Vector candidates considered | 10 per result requested. Raise `oversampling_factor` for recall, lower it for latency. | `DEFAULT_OVERSAMPLING_FACTOR` |

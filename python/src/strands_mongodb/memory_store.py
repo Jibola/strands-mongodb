@@ -133,6 +133,45 @@ _BELOW_VECTOR = (
 )
 """``REQ-E-053``'s "warn when it lands below vector", at most once per store."""
 
+_NO_FUSION = (
+    "strands_mongodb: 'search_type' is 'hybrid' but %s cannot run it. The hybrid tier is a $rankFusion "
+    "over the vector and text pipelines, and that stage needs MongoDB 8.0 or later. Upgrade the "
+    "deployment, or set 'search_type' to 'auto' to let this store resolve to the tiers it does have."
+)
+"""Raised where an explicit ``"hybrid"`` meets a deployment too old for the stage (``REQ-E-144``).
+
+Fatal rather than a degrade, which is the rule a named ``search_type`` already follows: there is no
+second tier to fall through to, and answering from one the caller did not ask for changes what matches
+rather than only how it ranks. The remedy names both directions because only one of them is available
+to most readers -- an operator can upgrade, and an application author can only stop asking.
+"""
+
+_BOUND_DECLINED_FUSION = (
+    "strands_mongodb: 'search_type' is 'auto' and %s can run the hybrid tier, but '%s' is set to %s and "
+    "the two are on different scales, so queries resolve to the vector tier as they did before hybrid "
+    "existed. Reciprocal rank fusion scores sum to about 0.033 at best, while cosine scores land in "
+    "roughly 0 to 1. Remove the bound to get fused ranking, or set 'search_type' to 'hybrid' to keep "
+    "the bound and have it applied on the fusion's scale."
+)
+"""``REQ-E-145``'s log line, at most once per store, naming which bound was set.
+
+Which bound and its value, not just that one exists: the remedy differs by one word between the two and
+neither is guessable from an empty result set, which is what the caller would otherwise see.
+"""
+
+_NO_FUSION_FOR_QUERY = (
+    "strands_mongodb: this query sets both 'text' and 'vector', which only the hybrid tier reads, and "
+    "the hybrid tier is not available on %s. The tiers that are: %s. Drop one of the two keys to use "
+    "one of them, or see the initialization log for why the fused tier was not offered."
+)
+"""Raised where both query keys are set and nothing can fuse them (``REQ-E-151``).
+
+The config allowed the shape and the deployment then did not deliver the tier that reads it, so this is
+the second half of a check whose first half runs before any round trip. Answering from a single tier
+instead would drop one of the two keys the caller supplied and report the tier that ran, which is a
+true answer to a question nobody asked.
+"""
+
 _NO_TIER_FOR_QUERY = (
     "strands_mongodb: this query cannot be answered by any search tier prepared on %s, which is: %s. "
     "The text tier needs 'text' on the query. The vector tier needs %s, because %s. Supply that key, "
@@ -390,7 +429,8 @@ class MongoDBMemoryStore:
                 (``REQ-E-015``); if ``max_search_results`` is below 1 (``REQ-E-041``); if both
                 ``min_score`` and ``max_score`` are set (``REQ-E-059``); if the configured ``filter``
                 names an operator key or an undeclared path (``REQ-E-049``, ``REQ-E-050``); or if the
-                vector configuration selects two paths at once (``REQ-E-067``).
+                vector configuration selects two paths at once (``REQ-E-067``). Notably **not** for a
+                ``ttl_seconds`` of ``0``, which is a request rather than a mistake (``REQ-E-148``).
         """
         connection = config["config"]
         self.name = config["name"]
@@ -405,6 +445,11 @@ class MongoDBMemoryStore:
         self.filter: dict[str, Any] | None = config.get("filter")
         self.min_score: float | None = config.get("min_score")
         self.max_score: float | None = config.get("max_score")
+        # `.get` with no default, so absence stays `None` and is never confused with `0`. `0` is a
+        # request to expire at the next sweep and `None` is a request never to expire; they are the same
+        # falsy value in Python and opposite instructions to MongoDB, so every test of this attribute
+        # downstream is `is not None` rather than a truth test (`REQ-E-148`).
+        self.ttl_seconds: int | None = config.get("ttl_seconds")
 
         # Rejected here rather than on the first query. A store whose ceiling is zero can never answer
         # anything, and `BedrockKnowledgeBaseStore` raises in the same place for the same value.
@@ -438,10 +483,21 @@ class MongoDBMemoryStore:
         # Vector first, which is the preference order `auto` resolves down from. A named `search_type`
         # narrows the list to one, so a store asking for `text` never creates a vector index it will not
         # query, and one asking for `vector` fails rather than quietly answering lexically.
+        #
+        # `hybrid` is the exception, and it is the whole of `REQ-E-144` in one line: it names a tier
+        # built out of both of these, so the narrowing that serves the other named types would leave
+        # this store with no search index at all.
         self._specs = (
-            specs if self._search_type == "auto" else tuple(pair for pair in specs if pair[0] == self._search_type)
+            specs
+            if self._search_type in ("auto", "hybrid")
+            else tuple(pair for pair in specs if pair[0] == self._search_type)
         )
         self._index_names = {tier: spec.name for tier, spec in self._specs}
+        # Whether a query setting both 'text' and 'vector' could mean anything on this store, decided
+        # from the config alone so the check stays ahead of the first round trip (`REQ-E-151`). Only the
+        # manual-vector path: on the AutoEmbeddings path the fused tier reads `text` in both of its input
+        # pipelines, so a `vector` alongside it is as meaningless as it ever was.
+        self._fusion_possible = not self._mode.auto_embed and self._search_type in ("auto", "hybrid")
 
         self._config = config
         self._connection_config = connection
@@ -500,7 +556,14 @@ class MongoDBMemoryStore:
                 # Through the module rather than through a direct import, so this stays one observable
                 # call per connection that `AT-065b`'s counting spy can see.
                 support = await _indexes.search_support(collection)
-                capabilities = _client.Capabilities(search=support.available, no_search_code=support.code)
+                # Only where search exists. `REQ-E-144` makes hybrid need both search tiers, so on a
+                # deployment without mongot the version cannot change any outcome and the call is a
+                # round trip per connection for a value nothing reads. Not a hypothetical deployment:
+                # the CI contract tier is `mongo:8`, which reports 8.3.8 and has no search at all.
+                fusion = await _indexes.rank_fusion_support(collection) if support.available else False
+                capabilities = _client.Capabilities(
+                    search=support.available, no_search_code=support.code, rank_fusion=fusion
+                )
                 connection.capabilities = capabilities
                 if not capabilities.search:
                     logger.warning(_NO_SEARCH_SETUP, self._target, capabilities.no_search_code)
@@ -514,10 +577,16 @@ class MongoDBMemoryStore:
                 timeout=self._index_ready_timeout,
             )
 
-            self._tiers = await self._ensure_search_tiers(collection) if capabilities.search else ()
+            self._tiers = (
+                await self._ensure_search_tiers(collection, rank_fusion=capabilities.rank_fusion)
+                if capabilities.search
+                else ()
+            )
             self._initialized = True
 
-    async def _ensure_search_tiers(self, collection: AsyncCollection[dict[str, Any]]) -> tuple[ResolvedSearchType, ...]:
+    async def _ensure_search_tiers(
+        self, collection: AsyncCollection[dict[str, Any]], *, rank_fusion: bool = False
+    ) -> tuple[ResolvedSearchType, ...]:
         """Create each configured search index and return the tiers that came up (``REQ-E-067``).
 
         One ``ensure`` call per tier, deliberately, rather than one call carrying both specs. The vector
@@ -535,8 +604,15 @@ class MongoDBMemoryStore:
         Args:
             collection: This store's collection, already resolved.
 
+        Args:
+            collection: The collection to build indexes on.
+            rank_fusion: Whether the deployment can run ``$rankFusion``. Passed in rather than read off
+                the connection here, because this method's job is to decide from what it is given and
+                the probe belongs to ``initialize()``.
+
         Returns:
-            The tiers that can answer, in preference order. Vector first when both came up.
+            The tiers that can answer, in preference order. Hybrid first where it is on offer, then
+            vector, then text.
 
         Raises:
             StorageError: If no tier could be prepared, or if a named ``search_type``'s own tier failed.
@@ -560,13 +636,64 @@ class MongoDBMemoryStore:
         if not available:
             raise StorageError(_NO_TIER_PREPARED % self._target)
 
+        if self._hybrid_is_available(available, rank_fusion=rank_fusion):
+            # Instead of the other two under an explicit request, ahead of them under `auto`. The list
+            # is a fallback order for query *shapes*, so a manual-vector store on `auto` answering a
+            # text-only query needs the text tier still to be in it. A store that asked for `hybrid` by
+            # name has nothing to fall through to, by the same rule every other named `search_type`
+            # follows: falling back would answer lexically under a tier name that promises both.
+            if self._search_type == "hybrid":
+                return ("hybrid",)
+            available.insert(0, "hybrid")
+        elif self._search_type == "hybrid":
+            raise StorageError(_NO_FUSION % self._target)
+
         # Gated on `auto` as well as on the order, because the message says `auto` and a store configured
         # `search_type='text'` has exactly one tier by its own request. Warning there would describe the
         # caller's own configuration back to them as a degradation.
-        if self._search_type == "auto" and available[0] != "vector" and not self._warned_below_vector:
+        if self._search_type == "auto" and available[0] not in ("hybrid", "vector") and not self._warned_below_vector:
             self._warned_below_vector = True
             logger.warning(_BELOW_VECTOR, self._target, available[0])
         return tuple(available)
+
+    def _hybrid_is_available(self, available: list[ResolvedSearchType], *, rank_fusion: bool) -> bool:
+        """Decide whether the fused tier is on offer, and say so when a bound declined it.
+
+        Three conditions, and the third is the irregular one. The deployment must have the stage, both
+        single tiers must have come up (``REQ-E-144``), and no score bound may be configured
+        (``REQ-E-145``) — a tier resolution reading a key that has nothing to do with tiers.
+
+        That third condition exists because the failure it prevents has no error in it. ``min_score`` and
+        ``max_score`` are applied to whatever score the tier that ran reports. Cosine scores land in
+        roughly 0 to 1; fused scores are a sum of ``weight / (rank + 60)`` terms and top out near 0.033.
+        A caller who set ``min_score=0.7`` for the vector tier, never touched ``search_type``, and
+        upgraded would get an empty list — no error, no warning, and identical to an empty collection.
+        So the better tier is the one declined, which is the inversion that makes a degradation safe, and
+        the reason is logged because it is not recoverable from the result.
+
+        Silent where fusion was never on offer at all: nothing was declined, and a warning naming a tier
+        the deployment cannot run would be advice its reader cannot take.
+
+        Args:
+            available: The tiers that came up, in preference order.
+            rank_fusion: Whether the deployment can run ``$rankFusion``.
+
+        Returns:
+            Whether to put ``hybrid`` at the head of the list.
+        """
+        if not rank_fusion or not {"vector", "text"} <= set(available):
+            return False
+
+        bound = "min_score" if self.min_score is not None else "max_score" if self.max_score is not None else None
+        if bound is None:
+            return True
+        # Not for an explicit `search_type="hybrid"`: that is the caller's own request, applied to the
+        # fused score with the scale documented (`REQ-E-146`), and warning about it would describe their
+        # configuration back to them.
+        if self._search_type == "hybrid":
+            return True
+        logger.warning(_BOUND_DECLINED_FUSION, self._target, bound, getattr(self, bound))
+        return False
 
     @_reporting("adding a memory to")
     async def add(self, content: str, metadata: Metadata | None = None) -> MongoDBAddResult:
@@ -622,12 +749,23 @@ class MongoDBMemoryStore:
         }
         # `$setOnInsert`, not `$set`: a duplicate must leave the first-seen timestamp alone, or
         # `strands_scope_store_created_at` sorts by "last extraction attempt" rather than by recency.
+        created_at = datetime.datetime.now(datetime.timezone.utc)
         insert: dict[str, Any] = {
             _indexes.CONTENT_FIELD: content,
-            "created_at": datetime.datetime.now(datetime.timezone.utc),
+            "created_at": created_at,
         }
         if metadata:
             insert["metadata"] = dict(metadata)
+        # Derived from the `created_at` above rather than from a second clock read, so the document's
+        # two timestamps are exactly `ttl_seconds` apart and a reader can verify the expiry against the
+        # document instead of against the wall clock at the moment it was written (`REQ-E-147`).
+        #
+        # Inside `$setOnInsert` for the same reason `created_at` is: a re-extracted fact is the fact
+        # this store already holds, and refreshing its expiry would turn a TTL into a last-seen window.
+        # Nobody asked for that, and `REQ-E-042`'s deduplication is the statement that the second write
+        # is not a new memory.
+        if self.ttl_seconds is not None:
+            insert[_indexes.EXPIRES_FIELD] = created_at + datetime.timedelta(seconds=self.ttl_seconds)
 
         collection = self._collection()
         try:
@@ -714,14 +852,30 @@ class MongoDBMemoryStore:
         # `_pipeline.vector_stages` and cannot run here: on a manual-vector store a plain string is wrong
         # for the vector tier and exactly right for the text one, so rejecting it now would reject the
         # query `auto` is about to answer.
-        _pipeline.check_query_keys(query_text=query_text, query_vector=query_vector)
+        _pipeline.check_query_keys(
+            query_text=query_text, query_vector=query_vector, fusion_possible=self._fusion_possible
+        )
         if caller_filter:
             _filter.validate(caller_filter, declared_fields=self._declared_fields)
         query_filter = _filter.compose(self.filter, caller_filter, scope=self.scope, store_name=self.name)
 
         await self.initialize()
         tier = self._pick_tier(query_text=query_text, query_vector=query_vector)
-        if tier == "vector":
+        if tier == "hybrid":
+            # Not None on this branch: `_pick_tier` returns "hybrid" only where both keys its two
+            # branches need are present.
+            assert query_text is not None
+            stages = _pipeline.hybrid_stages(
+                mode=self._mode,
+                vector_index_name=self._index_names["vector"],
+                text_index_name=self._index_names["text"],
+                query_text=query_text,
+                limit=limit,
+                query_vector=query_vector,
+                query_filter=query_filter,
+                oversampling_factor=parts.get("oversampling_factor", DEFAULT_OVERSAMPLING_FACTOR),
+            )
+        elif tier == "vector":
             # Both keys pass through. `check_query_keys` has already rejected both-set, and `_pick_tier`
             # chose this tier only because the mode's own key is present, so the mode check inside
             # `vector_stages` is satisfied either way and a conditional here would only duplicate it.
@@ -790,6 +944,14 @@ class MongoDBMemoryStore:
             ValueError: If tiers exist but none fits this query's shape. A caller error, and the message
                 names the key to add.
         """
+        if query_text is not None and query_vector is not None and "hybrid" not in self._tiers:
+            # Reached only where the config permitted both keys and the deployment then could not fuse:
+            # no `$rankFusion`, or one of the two tiers did not come up. Raised rather than answered,
+            # because every remaining tier reads exactly one of the two keys and would silently drop the
+            # other -- the text tier would answer this lexically and report `_search_type: "text"`,
+            # which is true and is not what was asked (`REQ-E-151`).
+            raise ValueError(_NO_FUSION_FOR_QUERY % (self._target, ", ".join(self._tiers) or "none"))
+
         if not self._tiers:
             capabilities = self._connection.capabilities
             if capabilities is None or not capabilities.search:
@@ -801,11 +963,14 @@ class MongoDBMemoryStore:
             raise StorageError(_NO_TIER_PREPARED % self._target)
 
         for tier in self._tiers:
+            # Both branches or nothing. `$search` has nothing to search with absent `text`, and the
+            # vector branch needs the key its own mode reads -- which on the AutoEmbeddings path is
+            # `text` again, so there a plain string fits the fused tier whole.
+            if tier == "hybrid" and query_text is not None and self._vector_key(query_text, query_vector) is not None:
+                return "hybrid"
             if tier == "text" and query_text is not None:
                 return "text"
-            # The vector tier's own key follows the configured path: AutoEmbeddings embeds `text` on the
-            # deployment, and the manual path indexes an embedding the caller computed.
-            if tier == "vector" and (query_text if self._mode.auto_embed else query_vector) is not None:
+            if tier == "vector" and self._vector_key(query_text, query_vector) is not None:
                 return "vector"
 
         needed, because = (
@@ -814,6 +979,23 @@ class MongoDBMemoryStore:
             else ("'vector'", "'embedding_dimensions' and 'similarity' select the manual-vector path")
         )
         raise ValueError(_NO_TIER_FOR_QUERY % (self._target, ", ".join(self._tiers), needed, because))
+
+    def _vector_key(self, query_text: str | None, query_vector: list[float] | None) -> Any:
+        """Return whichever query key the vector tier reads on this store's path, or ``None``.
+
+        The vector tier's own key follows the configured path: AutoEmbeddings embeds ``text`` on the
+        deployment, and the manual path searches an embedding the caller computed. Extracted
+        because the hybrid tier asks the same question about the same key, and two spellings of one rule
+        is how the two tiers would drift apart.
+
+        Args:
+            query_text: What the caller put in ``text``, if anything.
+            query_vector: What the caller put in ``vector``, if anything.
+
+        Returns:
+            The key this store's vector path needs, or ``None`` if the query has not supplied it.
+        """
+        return query_text if self._mode.auto_embed else query_vector
 
     def _within_bounds(self, scored: list[tuple[float, MemoryEntry]]) -> list[MemoryEntry]:
         """Apply the configured score bound, in Python, after the query (``REQ-E-059``).

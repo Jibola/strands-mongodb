@@ -33,7 +33,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple
 
@@ -52,7 +52,7 @@ except ImportError as error:  # pragma: no cover - exercised in a subprocess by 
     missing_extra("storage", error, module=__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable
 
     from pymongo.asynchronous.collection import AsyncCollection
 
@@ -72,6 +72,8 @@ __all__ = [
     "ensure",
     "memory_search_specs",
     "memory_specs",
+    "RANK_FUSION_MIN_MAJOR",
+    "rank_fusion_support",
     "readiness",
     "search_support",
     "storage_specs",
@@ -133,6 +135,18 @@ POLL_INTERVAL_SECONDS: Final[float] = 0.5
 _READY_STATUS: Final[str] = "READY"
 _FAILED_STATUS: Final[str] = "FAILED"
 _NAMESPACE_EXISTS: Final[int] = 48
+
+RANK_FUSION_MIN_MAJOR: Final[int] = 8
+"""Major version of ``mongod`` from which ``$rankFusion`` exists (``REQ-E-143``).
+
+Eight, not 8.1. The MongoDB 8.0 manual carries the stage with its own compatibility note and a worked
+example putting ``$vectorSearch`` in an input pipeline; 8.2 is where ``$scoreFusion`` arrives and 8.3
+where ``$rerank`` does. Atlas hands out 8.0.23 by default, so an off-by-one-minor floor here would have
+switched hybrid search off for most of the deployments it was written for.
+
+A major-version integer and not a full version tuple because the stage has not changed since it landed:
+there is no 8.0.x patch to exclude, and a finer floor would be a claim this package cannot support.
+"""
 
 SEARCH_UNSUPPORTED_CODES: Final[frozenset[int]] = frozenset({31082, 115, 6047401})
 """Server error codes meaning "this deployment has no Atlas Search", as ``list_search_indexes()`` reports.
@@ -533,6 +547,13 @@ def memory_specs() -> tuple[IndexSpec, ...]:
     fails loudly instead, as one more index in the block an operator provisions, and it costs nothing at
     rest because a TTL index is inert for documents that carry no ``expires_at``.
 
+    **That argument described a situation that could not arise until this package added**
+    ``ttl_seconds`` to ``MongoDBMemoryStoreConfig``: before it, nothing on this surface wrote
+    ``expires_at`` at all, and this index was inert on every document in every collection this package
+    had ever created. It is now load-bearing, and the unconditional choice is what makes ``REQ-E-149``
+    true -- a store that gains a ``ttl_seconds`` expires its existing documents on the next sweep, with
+    no migration, because the index was there the whole time.
+
     Returns:
         Three specs: the unique partial dedup index, the recency index, and the TTL index.
     """
@@ -641,6 +662,54 @@ async def search_support(collection: AsyncCollection[Any]) -> SearchSupport:
             f"{collection.database.name}.{collection.name} failed: {error}"
         ) from error
     return SearchSupport(available=True)
+
+
+async def rank_fusion_support(collection: AsyncCollection[Any]) -> bool:
+    """Report whether this deployment can run ``$rankFusion`` (``REQ-E-143``).
+
+    A version read, which is the probe :func:`search_support` spends a paragraph refusing. The two are
+    asking about different processes and the difference is the whole justification. Atlas Search is
+    **mongot**, attached or not attached independently of ``mongod``'s version: ``mongo:8`` reports
+    8.3.8 with no search, an Atlas CLI local deployment reports the same empty ``modules`` list and has
+    search, and ``mongod`` 7.0.12 reports ``modules: ['enterprise']`` and has none -- on the four
+    measured deployments the version document points the wrong way. ``$rankFusion`` is an aggregation
+    stage inside ``mongod`` itself, so that same document is authoritative for it.
+
+    The floor is major version 8. Not 8.1: the MongoDB 8.0 manual gives 8.0 in the stage's own
+    compatibility note and lists ``$vectorSearch`` among the stages an input pipeline may contain, with
+    a worked example. ``$scoreFusion`` is the one that needs 8.2, and ``$rerank`` needs 8.3 plus Native
+    Reranking enabled in Atlas project settings plus a Voyage AI key; neither is used here.
+
+    ``versionArray`` rather than the ``version`` string, because the server computes it as integers and
+    the string carries suffixes like ``-rc1`` whose parsing this package would otherwise own.
+
+    Every failure reads as ``False``, which is the opposite of :func:`search_support`'s closed-set raise
+    and is the right asymmetry. That probe's answer decides whether search runs at all, so a wrong
+    password must not read as a missing cluster. This one only decides which of two working tiers is
+    preferred: degrading costs the caller the better ranking, while guessing ``True`` costs them a query
+    that fails on every search. Only one of the two is recoverable, and a deployment that will not
+    answer ``buildInfo`` has a problem the next call surfaces anyway.
+
+    Args:
+        collection: Any collection on the deployment to probe. Need not exist -- ``buildInfo`` is a
+            database command and does not read it.
+
+    Returns:
+        ``True`` if the server reports major version :data:`RANK_FUSION_MIN_MAJOR` or later.
+    """
+    try:
+        build_info = await collection.database.command("buildInfo")
+    except PyMongoError:
+        return False
+    version = build_info.get("versionArray") if isinstance(build_info, Mapping) else None
+    if not isinstance(version, Sequence) or isinstance(version, str) or not version:
+        return False
+    major = version[0]
+    # `bool` is a subclass of `int` and `True >= 8` is `False`, so it would answer correctly by
+    # accident. Excluded anyway: a server sending a boolean here is not a server whose version is known.
+    if not isinstance(major, int) or isinstance(major, bool):
+        return False
+    return major >= RANK_FUSION_MIN_MAJOR
 
 
 async def ensure(

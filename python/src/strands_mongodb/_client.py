@@ -62,8 +62,10 @@ class Capabilities:
     A record rather than a bare ``bool`` on ``_Connection``, for two reasons that both come from the
     field it replaces being ``Any | None``. ``None`` has to keep meaning *not probed yet*, and
     ``bool | None`` makes that a three-state flag whose ``if capabilities:`` reads as "has search" while
-    also being false for "unknown". And search support is the first of these, not the last: hybrid
-    search and ``$rerank`` are v0.2.0 and are probed the same way.
+    also being false for "unknown". And search support is the first of these, not the last:
+    ``rank_fusion`` sits beside it, exactly as this docstring predicted, and ``$rerank`` is the next
+    one — 8.3, plus Native Reranking enabled in the Atlas project, plus a Voyage AI key, so it is three
+    conditions rather than one and it is not in v0.1.0.
 
     Attributes:
         search: Whether the deployment runs Atlas Search. A property of the deployment rather than of a
@@ -74,10 +76,22 @@ class Capabilities:
             probe, and ``search()`` needs it on every later call to name it in what it raises. Three
             codes mean this and they differ by server version and build, so the one this deployment used
             is not derivable from anything else on hand (``REQ-E-053a``).
+        rank_fusion: Whether the deployment's ``mongod`` is new enough for ``$rankFusion``, which is the
+            hybrid tier (``REQ-E-143``). Defaults to ``False`` so that the value a
+            store reads when the probe was skipped is the one that costs nothing: hybrid also needs both
+            search tiers, so this is never probed on a deployment without search and the default is what
+            that deployment's stores see. ``False`` there means "resolve as you did before hybrid
+            existed", while a default of ``True`` would mean "send a stage this server has never heard
+            of".
+
+            Unlike ``search``, this one is a version read. The two probes disagree about that on
+            purpose: Atlas Search is a separate process whose presence no version predicts, and
+            ``$rankFusion`` is a stage inside the process ``buildInfo`` describes.
     """
 
     search: bool
     no_search_code: int | None = None
+    rank_fusion: bool = False
 
 
 @dataclass

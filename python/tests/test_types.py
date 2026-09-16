@@ -90,11 +90,16 @@ class TestMemoryStoreConfigExtendsTheSdkConfig:
         """
         assert set(MemoryStoreConfig.__annotations__) <= set(MongoDBMemoryStoreConfig.__annotations__)
 
-    def test_it_adds_the_mongodb_fields_from_plan_8_1(self) -> None:
-        """The six fields beyond the SDK's, named so a rename is deliberate."""
+    def test_it_adds_the_documented_mongodb_fields(self) -> None:
+        """The seven fields beyond the SDK's, named so a rename is deliberate.
+
+        Six before ``ttl_seconds``. Widening this set is the expected way for the config to
+        grow and the assertion is written as equality anyway, so the widening is a line in a diff rather
+        than something a reviewer has to notice the absence of.
+        """
         added = set(MongoDBMemoryStoreConfig.__annotations__) - set(MemoryStoreConfig.__annotations__)
 
-        assert added == {"config", "collection", "scope", "filter", "min_score", "max_score"}
+        assert added == {"config", "collection", "scope", "filter", "min_score", "max_score", "ttl_seconds"}
 
     def test_mypy_requires_both_name_and_config(
         self, run_mypy: Callable[[str], subprocess.CompletedProcess[str]]
@@ -290,30 +295,47 @@ class TestTheModuleImportsWithoutADriver:
 class TestTheSearchTierVocabulary:
     """AT-056d — two literals, because asking for a tier and reporting one are different domains."""
 
-    def test_the_requestable_tiers_are_the_three_that_v0_1_0_runs(self) -> None:
-        """A ``Literal`` in the config is a promise the caller can typecheck against, so
-        it holds only values that actually run. ``hybrid`` and ``regex`` both arrive with
-        v0.2.0, and widening a ``Literal`` is backwards compatible.
+    def test_the_requestable_tiers_are_the_four_that_run(self) -> None:
+        """``AT-141`` / ``REQ-E-141``. A ``Literal`` in the config is a promise the caller can
+        typecheck against, so it holds only values that actually run. ``hybrid`` runs as of the
+        hybrid tier's arrival; ``regex`` still does not, so it is still absent.
+
+        This assertion widened rather than moved, which is the prediction this alias was written on:
+        every value that typechecked before still does, so no caller was broken by the widening.
 
         Asserted against the named alias rather than the field annotation, which is a string under
         postponed annotations and would need resolving before ``get_args`` saw anything.
         """
-        assert get_args(SearchType) == ("auto", "vector", "text")
+        assert get_args(SearchType) == ("auto", "vector", "text", "hybrid")
 
-    def test_the_reportable_tiers_are_the_two_that_can_answer_a_v0_1_0_query(self) -> None:
-        """``REQ-E-054`` puts the answering tier in ``_search_type`` so a silent fallback is visible.
+    def test_the_reportable_tiers_are_the_three_that_can_answer_a_query(self) -> None:
+        """``AT-141`` / ``REQ-E-054``, ``REQ-E-141``. ``_search_type`` carries the answering tier so
+        a silent fallback is visible in the returned data.
 
-        The SDK's own key takes four values. Two of them cannot occur in v0.1.0: ``hybrid`` is out of
-        scope and ``regex`` is reachable only through a ``search_type`` value that ``SearchType`` does
-        not accept. Listing them anyway would make a caller matching on this key handle branches that
-        never run, which is the same mistake the config avoids.
+        The two literals differ by ``auto`` alone, which is the distinction that justified separating
+        them: ``auto`` is a request and can never be an answer. They moved by different amounts here
+        -- three-to-four and two-to-three -- which is the demonstration that a single union would
+        have had to move by both at once.
         """
-        assert get_args(ResolvedSearchType) == ("vector", "text")
+        assert get_args(ResolvedSearchType) == ("vector", "text", "hybrid")
 
-    def test_mypy_rejects_a_tier_that_v0_1_0_does_not_run(
+    def test_the_two_vocabularies_differ_by_auto_alone(self) -> None:
+        """``AT-141``. The property the split exists for, asserted directly rather than inferred from
+        the two tuples above -- so that a future widening that adds a value to one and forgets the
+        other fails here and names it.
+        """
+        assert set(get_args(SearchType)) - set(get_args(ResolvedSearchType)) == {"auto"}
+        assert not set(get_args(ResolvedSearchType)) - set(get_args(SearchType))
+
+    def test_mypy_accepts_the_hybrid_tier_at_the_config_site(
         self, run_mypy: Callable[[str], subprocess.CompletedProcess[str]]
     ) -> None:
-        """The point of the narrow literal: ``hybrid`` fails at the config site, not at query time."""
+        """``AT-142`` / ``REQ-E-141``, and the inversion of what this test used to assert.
+
+        It previously required ``hybrid`` to fail here, which was the correct assertion about a value
+        that did not run and is the wrong one about a value that does. The requirement it tested has
+        not changed -- the config rejects tiers that cannot answer -- only the membership has.
+        """
         result = run_mypy(
             """
             from strands_mongodb.types import MongoDBConfig
@@ -322,8 +344,24 @@ class TestTheSearchTierVocabulary:
             """
         )
 
+        assert result.returncode == 0, result.stdout
+
+    def test_mypy_rejects_a_tier_that_still_does_not_run(
+        self, run_mypy: Callable[[str], subprocess.CompletedProcess[str]]
+    ) -> None:
+        """``AT-142``. The narrow-literal property survives the widening, which is the half that
+        would otherwise be lost: ``regex`` fails at the config site, not at query time.
+        """
+        result = run_mypy(
+            """
+            from strands_mongodb.types import MongoDBConfig
+
+            config: MongoDBConfig = {"database": "agents", "search_type": "regex"}
+            """
+        )
+
         assert result.returncode == 1, result.stdout
-        assert "hybrid" in result.stdout, result.stdout
+        assert "regex" in result.stdout, result.stdout
 
 
 class TestTheSearchQueryWidensTheProtocolQuery:

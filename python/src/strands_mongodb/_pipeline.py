@@ -48,13 +48,32 @@ if TYPE_CHECKING:
     from strands_mongodb._indexes import VectorMode
 
 __all__ = [
+    "FUSION_SCORE_META",
     "MAX_NUM_CANDIDATES",
+    "RANK_FUSION_PENALTY",
     "candidate_count",
     "check_candidate_count",
     "check_query_keys",
+    "hybrid_stages",
     "text_stages",
     "vector_stages",
 ]
+
+RANK_FUSION_PENALTY: Final[int] = 60
+"""Rank constant the server adds inside ``$rankFusion``, fixed and not configurable here.
+
+The reason this is a named constant in a package that never sends it: it sets the *scale* of every
+score the hybrid tier returns, and that scale is nothing like the other two tiers'. A fused score is
+``sum over the tiers that ranked it of weight x 1/(rank + 60)``, so a document first in one tier scores
+about ``1/61``, or ``0.016``, and one first in both about ``0.033``, while ``cosine``
+similarity and BM25 both land in roughly 0 to 1. A ``min_score`` chosen against either of those and
+applied to a fused score filters out every result and looks exactly like an empty collection
+(``REQ-E-145``, premortem ``P-2``).
+
+So the number is here to be *quoted*: the config docstring and the README operator reference both
+resolve their stated range against this constant rather than against a remembered 60, which is what
+``AT-151`` asserts.
+"""
 
 MAX_NUM_CANDIDATES: Final[int] = 10000
 """Upper bound the server enforces on ``numCandidates``.
@@ -67,6 +86,19 @@ deployment rather than trusting this line.
 
 VECTOR_SCORE_META: Final[str] = "vectorSearchScore"
 """``$meta`` name carrying a ``$vectorSearch`` score. Not interchangeable with the text one."""
+
+FUSION_SCORE_META: Final[str] = "score"
+"""``$meta`` name carrying a ``$rankFusion`` score, and the third name that is not interchangeable.
+
+The plainest of the three, and the one most likely to be mistaken for a field rather than metadata:
+``{"$meta": "score"}`` reads almost like ``"$score"`` and means something else entirely. It is also the
+only one of the three whose stage does *not* project it for you -- ``$rankFusion`` emits the fused
+documents with no score field at all, so without the ``$set`` this module appends outside the stage,
+every hybrid result would arrive scoring ``0.0`` and any ``min_score`` would empty the result list.
+That failure is silent and looks exactly like an empty collection, which is premortem ``P-2``.
+
+Available since 8.0, the same floor as the stage itself (:data:`_indexes.RANK_FUSION_MIN_MAJOR`).
+"""
 
 TEXT_SCORE_META: Final[str] = "searchScore"
 """``$meta`` name carrying a ``$search`` score.
@@ -169,6 +201,7 @@ def vector_stages(
     query_vector: list[float] | None = None,
     query_filter: Mapping[str, Any] | None = None,
     oversampling_factor: int = DEFAULT_OVERSAMPLING_FACTOR,
+    score: bool = True,
 ) -> list[dict[str, Any]]:
     """Build the vector tier: one ``$vectorSearch`` and the score projection it does not include.
 
@@ -189,9 +222,12 @@ def vector_stages(
         query_filter: Validated MQL pre-filter over declared filterable paths. Omitted from the stage
             when empty, since ``{}`` and absent mean the same thing and look different to the planner.
         oversampling_factor: Multiplier behind ``numCandidates``.
+        score: Whether to append the score projection. ``False`` only from :func:`hybrid_stages`, where
+            the stage would be both dead weight and illegal: ``$rankFusion`` ranks by position inside
+            each input pipeline and accepts only selection stages there (``REQ-E-142``).
 
     Returns:
-        Two stages: the search and ``{"$set": {"score": {"$meta": "vectorSearchScore"}}}``.
+        The search stage, and the ``$set`` projection when ``score``.
 
     Raises:
         ValueError: If the query's shape contradicts ``mode``, if neither or both query fields are
@@ -220,7 +256,7 @@ def vector_stages(
         assert query_vector is not None
         stage = vector_search_stage(query_vector=query_vector, **shared)
 
-    return [stage, _score_stage(VECTOR_SCORE_META)]
+    return [stage, _score_stage(VECTOR_SCORE_META)] if score else [stage]
 
 
 def text_stages(
@@ -229,6 +265,7 @@ def text_stages(
     index_name: str,
     limit: int,
     query_filter: Mapping[str, Any] | None = None,
+    score: bool = True,
 ) -> list[dict[str, Any]]:
     """Build the full-text tier, in the order that makes a filtered query return its full count.
 
@@ -255,9 +292,12 @@ def text_stages(
         limit: Resolved result ceiling, applied last.
         query_filter: Validated MQL predicate, applied as a ``$match`` before the limit. Dropped when
             empty rather than emitted as ``{"$match": {}}``.
+        score: Whether to include the score projection, as ``include_scores`` on the builder. ``False``
+            only from :func:`hybrid_stages`. Note the projection is not last here -- ``$limit`` follows
+            it -- so dropping it is a keyword rather than a slice of the returned list.
 
     Returns:
-        ``$search``, ``$match`` when there is a filter, ``$set`` for the score, then ``$limit``.
+        ``$search``, ``$match`` when there is a filter, ``$set`` when ``score``, then ``$limit``.
     """
     return list(
         text_search_stage(
@@ -266,9 +306,81 @@ def text_stages(
             index_name=index_name,
             limit=limit,
             filter=dict(query_filter) if query_filter else None,
-            include_scores=True,
+            include_scores=score,
         )
     )
+
+
+def hybrid_stages(
+    *,
+    mode: VectorMode,
+    vector_index_name: str,
+    text_index_name: str,
+    query_text: str,
+    limit: int,
+    query_vector: list[float] | None = None,
+    query_filter: Mapping[str, Any] | None = None,
+    oversampling_factor: int = DEFAULT_OVERSAMPLING_FACTOR,
+) -> list[dict[str, Any]]:
+    """Build the hybrid tier: one ``$rankFusion`` over the two pipelines this module already builds.
+
+    ``REQ-E-142``. The whole function is a wrapper, and that is the point of it. Reciprocal rank fusion
+    is not hard to write -- ``pymongo_search_utils.combine_pipelines`` writes it, over ``$unionWith``
+    and a ``$group``, and ``langchain-mongodb`` ships it -- but writing it makes this package the owner
+    of the weights, the penalties, the tie-breaking and the merge of documents that both tiers return.
+    The server owns all four in a stage that has existed since 8.0.
+
+    Both input pipelines are built with ``score=False``. ``$rankFusion`` ranks documents by their
+    **position** within each input pipeline, so a ``$meta`` projection inside one is read by nothing --
+    and an input pipeline may contain only selection stages, so the server rejects it rather than
+    ignoring it.
+
+    No weights are emitted: both pipelines carry the server's default of 1, and ``{"vector": 1, "text":
+    1}`` is the same instruction spelled longer. No ``scoreDetails`` either, which is the per-tier
+    breakdown and not the score.
+
+    The score itself is a second stage, outside the fusion. ``$rankFusion`` returns fused documents
+    carrying no score field, so the ``$set`` reading ``{"$meta": "score"}`` is what makes ``min_score``
+    and ``_relevance_score`` mean anything on this tier -- see :data:`FUSION_SCORE_META` for what its
+    absence would look like, and :data:`RANK_FUSION_PENALTY` for the scale it lands on.
+
+    Args:
+        mode: Resolved vector path, passed through to :func:`vector_stages`.
+        vector_index_name: Atlas Vector Search index for the vector branch.
+        text_index_name: Atlas Search index for the text branch. Separate arguments because the two
+            tiers are separate indexes and a single ``index_name`` would silently query one twice.
+        query_text: Natural-language query. Required here, unlike on the vector path, because the text
+            branch has nothing else to search with -- which is why ``REQ-E-144`` makes a vector-only
+            query ineligible for this tier rather than degrading it.
+        limit: Resolved result ceiling, applied within each branch. The fusion returns at most the
+            union of the two, which is at most ``2 * limit`` before the caller's own limit applies.
+        query_vector: Pre-computed embedding, on the manual path only.
+        query_filter: Validated MQL predicate. Goes to both branches, where each builder puts it where
+            its own tier needs it -- inside the stage for vector, in a ``$match`` for text.
+        oversampling_factor: Multiplier behind ``numCandidates`` on the vector branch.
+
+    Returns:
+        Two stages: the ``$rankFusion`` and the ``$set`` projecting its fused score.
+
+    Raises:
+        ValueError: Whatever the two builders raise, unchanged. Validation is theirs, and reusing them
+            means reusing the rejections and not only the happy path.
+    """
+    vector = vector_stages(
+        mode=mode,
+        index_name=vector_index_name,
+        limit=limit,
+        query_text=query_text if mode.auto_embed else None,
+        query_vector=query_vector,
+        query_filter=query_filter,
+        oversampling_factor=oversampling_factor,
+        score=False,
+    )
+    text = text_stages(
+        query_text=query_text, index_name=text_index_name, limit=limit, query_filter=query_filter, score=False
+    )
+    fusion = {"$rankFusion": {"input": {"pipelines": {"vector": vector, "text": text}}}}
+    return [fusion, _score_stage(FUSION_SCORE_META)]
 
 
 def _score_stage(meta: str) -> dict[str, Any]:
@@ -284,7 +396,9 @@ def _score_stage(meta: str) -> dict[str, Any]:
     return {"$set": {SCORE_FIELD: {"$meta": meta}}}
 
 
-def check_query_keys(*, query_text: str | None, query_vector: list[float] | None) -> None:
+def check_query_keys(
+    *, query_text: str | None, query_vector: list[float] | None, fusion_possible: bool = False
+) -> None:
     """Reject the two query shapes no tier can answer, without needing a mode (``REQ-E-074a``).
 
     Split out of :func:`_check_query_shape` so the memory store can run it before it knows which tier
@@ -295,15 +409,22 @@ def check_query_keys(*, query_text: str | None, query_vector: list[float] | None
     Args:
         query_text: What the caller put in ``text``, if anything.
         query_vector: What the caller put in ``vector``, if anything.
+        fusion_possible: Whether this store's *configuration* could put both keys to work, which is the
+            manual-vector path with ``search_type`` left at ``auto`` or set to ``hybrid``
+            (``REQ-E-151``). Both-set stops being nonsense there: the fused tier reads ``text`` in one
+            input pipeline and ``vector`` in the other. Deliberately a fact about the config and not
+            about the deployment, so this stays the check that runs before the first round trip --
+            whether the server can actually fuse is settled later, by the tier list.
 
     Raises:
-        ValueError: If both query fields are set, or if neither is.
+        ValueError: If both query fields are set where nothing could use both, or if neither is.
     """
-    if query_text is not None and query_vector is not None:
+    if query_text is not None and query_vector is not None and not fusion_possible:
         raise ValueError(
-            "strands_mongodb: the query sets both 'text' and 'vector', and there is no interpretation "
-            "that uses both. Set 'text' to have the deployment embed it, or 'vector' to supply the "
-            "embedding yourself."
+            "strands_mongodb: the query sets both 'text' and 'vector', and this store has no "
+            "interpretation that uses both. Set 'text' to have the deployment embed it, or 'vector' to "
+            "supply the embedding yourself. Both together are read only by the hybrid tier on a "
+            "manual-vector store, where each key feeds one half of the fusion."
         )
     if query_text is None and query_vector is None:
         raise ValueError(
