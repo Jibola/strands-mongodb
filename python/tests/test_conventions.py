@@ -37,9 +37,11 @@ from conftest import TIER_VARIABLES
 if sys.version_info >= (3, 11):
     import tomllib
 else:  # pragma: no cover - exercised only on the 3.10 floor
-    tomllib = None  # type: ignore[assignment]
-
-_NEEDS_TOMLLIB = pytest.mark.skipif(tomllib is None, reason="tomllib is 3.11+; the 3.10 job covers the rest")
+    # `tomli` is the parser `tomllib` was adopted from, and 2.x is the API `tomllib` shipped, so the
+    # alias makes the two interchangeable and every caller below reads one name. It is a dev dependency
+    # declared without a version marker on purpose; `pyproject.toml` says why, and the reason is mypy
+    # rather than this branch.
+    import tomli as tomllib
 
 # tests/ -> python/ -> the repository root, which is where a contributor lands.
 _PACKAGE = Path(__file__).resolve().parent.parent
@@ -157,7 +159,6 @@ def _config() -> dict[str, Any]:
     Returns:
         The parsed document.
     """
-    assert tomllib is not None
     with _PYPROJECT.open("rb") as handle:
         return tomllib.load(handle)
 
@@ -363,7 +364,6 @@ class TestBothConventionDocumentsExist:
         assert restated == [], f"CONTRIBUTING.md restates the conventions instead of linking them: {restated}"
 
 
-@_NEEDS_TOMLLIB
 @pytest.mark.parametrize("document", _CONVENTION_DOCUMENTS, ids=lambda path: path.name)
 class TestEveryClaimResolvesAgainstThisRepository:
     """``AT-113`` — ``REQ-E-111``, the six classes of claim a copied conventions document gets wrong.
@@ -439,7 +439,6 @@ class TestEveryClaimResolvesAgainstThisRepository:
         assert untracked == [], f"{document.name} holds placeholders nothing has claimed: {untracked}"
 
 
-@_NEEDS_TOMLLIB
 class TestTheDocumentsAndTheRepositoryAgreeBothWays:
     """``AT-113``, the reverse direction: what the repository has and the documents do not mention.
 
@@ -548,7 +547,6 @@ class TestNoShippedDocumentCarriesACredential:
         assert not _CREDENTIALED_URI.search(redacted.read_text()), "the redacted form must not read as a leak"
 
 
-@_NEEDS_TOMLLIB
 class TestTheHouseConventionsAreEnforcedNotDescribed:
     """``AT-115`` — ``REQ-E-112``: the nine conventions ``AGENTS.md`` states, checked against the package.
 

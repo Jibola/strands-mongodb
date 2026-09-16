@@ -98,6 +98,19 @@ dev = [
     # across that range. This adds nothing to any runtime extra: a partner package must not bring
     # its own OTel dependency, and `dependencies`, `storage`, `memory` and `all` are all unchanged.
     "opentelemetry-sdk>=1.30.0",
+    # Five test modules parse this file to check it against the workflow, the README and the examples.
+    # `tomllib` is 3.11+, so on the oldest interpreter the package supports those assertions were skipped
+    # -- 38 of them, which left the 3.10 job green for a different reason than the other four. `tomli` is
+    # the parser `tomllib` was adopted from and its 2.x API is `tomllib`'s, so the import sites read
+    # `import tomli as tomllib` and nothing downstream knows which one it got.
+    #
+    # Deliberately NOT marked `python_version < '3.11'`, though the import only reaches it there. mypy is
+    # configured at `python_version = "3.10"`, so it reads the floor's branch of that import on every
+    # interpreter; with `tomli` absent and `ignore_missing_imports` on, the module resolves to `Any` and
+    # every `tomllib.load` call silently returns `Any` into a `dict[str, Any]`. A marker would make the
+    # type checker wrong everywhere to keep a 15 KiB pure-Python package off four interpreters that
+    # never import it. This is a dev extra: no user installs it.
+    "tomli>=2.0.0",
 ]
 
 [project.urls]
@@ -141,6 +154,7 @@ dependencies = [
     "pyyaml>=6.0.0",
     "types-PyYAML>=6.0.0",
     "opentelemetry-sdk>=1.30.0",
+    "tomli>=2.0.0",
 ]
 
 [tool.hatch.envs.default.scripts]

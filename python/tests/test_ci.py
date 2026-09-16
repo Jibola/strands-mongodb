@@ -38,7 +38,11 @@ from test_gate import _narrowing
 if sys.version_info >= (3, 11):
     import tomllib
 else:  # pragma: no cover - exercised only on the 3.10 floor
-    tomllib = None  # type: ignore[assignment]
+    # `tomli` is the parser `tomllib` was adopted from, and 2.x is the API `tomllib` shipped, so the
+    # alias makes the two interchangeable and every caller below reads one name. It is a dev dependency
+    # declared without a version marker on purpose; `pyproject.toml` says why, and the reason is mypy
+    # rather than this branch.
+    import tomli as tomllib
 
 # tests/ -> python/ -> the repository root, which is where `.github/` belongs.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -152,15 +156,12 @@ def _triggers(workflow: dict[str, Any]) -> dict[str, Any]:
 
 
 def _pyproject() -> dict[str, Any]:
-    """The manifest, parsed. Callers must gate on ``tomllib`` being importable."""
-    assert tomllib is not None, "tomllib is unavailable; the caller should have skipped"
+    """The manifest, parsed.
+
+    Returns:
+        The parsed document.
+    """
     return tomllib.loads(PYPROJECT_PATH.read_text())
-
-
-_NEEDS_TOMLLIB = pytest.mark.skipif(
-    tomllib is None,
-    reason="tomllib is 3.11+, and this compares the workflow against pyproject.toml",
-)
 
 
 #: Every module the suite collects, walked for the paths it names. ``conftest.py`` is included: it reads
@@ -722,7 +723,6 @@ class TestTheMatrixCoversEveryVersionTheClassifiersClaim:
     honest fix for that is a new classifier, not a quieter test.
     """
 
-    @_NEEDS_TOMLLIB
     def test_the_matrix_equals_the_versions_the_classifiers_claim(self, workflow: dict[str, Any]) -> None:
         """Read from both files, so neither list can be edited alone."""
         claimed = {
@@ -767,7 +767,6 @@ class TestBothCoverageFloorsAreEnforced:
             "no step runs `hatch run cov`, so neither coverage floor is enforced anywhere automatic"
         )
 
-    @_NEEDS_TOMLLIB
     def test_the_coverage_script_is_still_both_floors(self, workflow: dict[str, Any]) -> None:
         """The workflow delegates, so the delegate is asserted here too.
 

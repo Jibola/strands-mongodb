@@ -49,7 +49,11 @@ import pytest
 if sys.version_info >= (3, 11):
     import tomllib
 else:  # pragma: no cover - exercised only on the 3.10 floor
-    tomllib = None  # type: ignore[assignment]
+    # `tomli` is the parser `tomllib` was adopted from, and 2.x is the API `tomllib` shipped, so the
+    # alias makes the two interchangeable and every caller below reads one name. It is a dev dependency
+    # declared without a version marker on purpose; `pyproject.toml` says why, and the reason is mypy
+    # rather than this branch.
+    import tomli as tomllib
 
 # tests/ -> python/
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -545,14 +549,7 @@ class TestTheExamplesAreInsideEveryFileSet:
     """
 
     def test_ruff_mypy_the_sdist_and_the_marker_all_know_about_examples(self) -> None:
-        """The directory is in three file sets, and the marker is declared.
-
-        Skips on the 3.10 floor, where ``tomllib`` is not in the standard library, for the same reason
-        ``test_packaging.py`` does: these are build-configuration assertions and CI runs them on the
-        newer interpreters. Adding ``tomli`` to read our own manifest is not worth a test dependency.
-        """
-        if tomllib is None:
-            pytest.skip("tomllib needs Python 3.11+; manifest assertions run on the newer interpreters")
+        """The directory is in three file sets, and the marker is declared."""
         configuration = tomllib.loads(_PYPROJECT.read_text())
         tools = configuration["tool"]
 

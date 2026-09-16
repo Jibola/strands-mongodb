@@ -18,7 +18,8 @@ session management and context offloading without a separate session-manager cla
 > **Under construction. Both halves have their operations; neither is released.** `MongoDBStorage`
 > implements all five `Storage` contract methods plus `namespace()` and `delete_prefix()`, so an
 > `Agent` given one gets working sessions, context offloading and context history.
-> `MongoDBMemoryStore` has `initialize()`, `add()`, `search()` across a vector tier and a text tier,
+> `MongoDBMemoryStore` has `initialize()`, `add()`, `search()` across a vector tier, a text tier and a
+> `hybrid` tier fusing the two with `$rankFusion`,
 > `delete()`, `delete_all()` and `get_tools()`. `add_messages()` is absent on purpose: the SDK's
 > `MemoryManager` feature-detects it, and a present one would take extraction away from the SDK's own
 > extractor and hand it to one this package would have to write.
@@ -26,18 +27,22 @@ session management and context offloading without a separate session-manager cla
 > | Version | Contains |
 > |---|---|
 > | `0.0.1` | Package metadata, extras, import paths, public names |
-> | `0.1.0` | `MongoDBStorage` + `MongoDBMemoryStore`, vector search, docs, tests |
+> | `0.1.0` | `MongoDBStorage` + `MongoDBMemoryStore`, the three search tiers, record expiry, docs, tests |
 >
 > Storage `search()` ranks by token overlap in a single aggregation over the key space. Measured over 1,000
 > keys carrying 400-byte payloads: 2 wire commands and 9 ms, against 1,041 commands and 210 ms for the
 > SDK's default, for the same ranking. Scores come from keys rather than payload text, so a word that
 > appears only inside a stored value will not match.
 >
-> One caveat on the storage half: `ttl_seconds` stamps an expiry field without provisioning the TTL
-> index that acts on it, so documents written by a TTL store do not currently expire.
+> Record expiry is armed differently on each surface. `MongoDBMemoryStore.initialize()` provisions the
+> TTL index itself, so a store configured with `ttl_seconds` expires its records without further work.
+> `MongoDBStorage` leaves it to an explicit `await storage.ensure_indexes()` at startup, because an
+> `Agent` builds its storage in a code path the operator never sees and DDL should not be issued from
+> one. Stamping the field is not the same as provisioning the index that acts on it, and only one of
+> the two surfaces can safely do both on its own.
 >
 > Verified against two deployments rather than one: MongoDB 8.3.8 with a local mongot, and cloud
-> Atlas 8.0.30. The two report search index state differently in six places, and the tests read both
+> Atlas 8.0.32. The two report search index state differently in six places, and the tests read both
 > spellings, because a suite pinned to one deployment passes everywhere it was written and nowhere
 > else.
 
