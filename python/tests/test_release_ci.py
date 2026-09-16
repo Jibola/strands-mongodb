@@ -613,3 +613,57 @@ class TestNoReleaseJobCanRunForSixHours:
                 f"{_TIMEOUT_CEILING_MINUTES}. Nothing here runs a cluster tier, so there is no job in this "
                 f"workflow with a reason to approach it"
             )
+
+
+#: A git object name. What makes a reference immutable is that it names the content rather than a place
+#: the content currently sits.
+_DIGEST = re.compile(r"\A[0-9a-f]{40}\Z")
+
+
+class TestTheActionThatUploadsIsPinnedToContentRatherThanToAPlace:
+    """``AT-170`` / ``REQ-E-164`` -- the one mutable reference that matters.
+
+    ``pypa/gh-action-pypi-publish@release/v1`` is a branch: not a tag, not a digest. It runs in the only
+    job in the repository that raises ``id-token: write``, the token PyPI exchanges for an upload
+    credential for ``strands-mongodb``, so whoever controls that branch controls what runs there and the
+    blast radius is every install of this package.
+
+    **This is not a repository-wide pinning policy, and must not become one.** MongoDB's own zizmor
+    configuration is ``actions/*: ref-pin`` with ``mongodb-labs/drivers-github-tools/*: hash-pin``, so
+    ``actions/checkout@v7`` throughout these workflows is correct by that standard and moving it to
+    digests would be a deviation from it. PyMongo hash-pins this one action and ref-pins the rest. The
+    scope of this gate is therefore the job holding the credential, not the file.
+
+    **What a pin costs.** A digest does not update itself. ``REQ-E-166`` is what keeps it current, and the
+    two requirements are worth less apart than together.
+    """
+
+    def test_exactly_one_job_holds_the_publishing_credential(self, workflow: dict[str, Any]) -> None:
+        """AT-170 -- the vacuity guard, and the premise the scope of this gate rests on."""
+        holders = [
+            name for name, job in workflow["jobs"].items() if (job.get("permissions") or {}).get("id-token") == "write"
+        ]
+        assert len(holders) == 1, (
+            f"{len(holders)} jobs raise id-token: write ({holders}). This gate is scoped to the job that "
+            f"holds the upload credential, so which job that is has to be unambiguous"
+        )
+
+    def test_every_action_it_runs_is_pinned_to_a_digest(self, workflow: dict[str, Any]) -> None:
+        """AT-170 -- the finding."""
+        for name, job in workflow["jobs"].items():
+            if (job.get("permissions") or {}).get("id-token") != "write":
+                continue
+            uses = [step["uses"] for step in job.get("steps") or [] if step.get("uses")]
+            assert uses, f"job {name!r} holds the upload credential and runs no action, which cannot be right"
+            unpinned = [reference for reference in uses if not _DIGEST.match(reference.partition("@")[2])]
+            assert unpinned == [], (
+                f"job {name!r} holds the credential PyPI exchanges for an upload token and runs {unpinned} "
+                f"from a mutable reference. A branch or a tag can be moved; a digest names the content"
+            )
+
+    def test_the_reader_can_tell_a_digest_from_a_branch(self) -> None:
+        """AT-170 -- the matcher, against the two references this repository actually uses."""
+        assert _DIGEST.match("dc37677b2e1c63e2034f94d8a5b11f265b73ba33")
+        assert not _DIGEST.match("release/v1")
+        assert not _DIGEST.match("v7")
+        assert not _DIGEST.match("v7.0.0")

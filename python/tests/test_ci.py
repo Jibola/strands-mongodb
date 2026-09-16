@@ -178,6 +178,7 @@ _PACKAGE_DIRECTORY = "python"
 _READ_AT_LEAST = (
     ".github/workflows/ci-python.yml",
     ".github/workflows/release-python.yml",
+    ".github/dependabot.yml",
     "AGENTS.md",
     "CONTRIBUTING.md",
     ".gitignore",
@@ -1017,11 +1018,13 @@ class TestTheTiersThatNeedAClusterAreNeverHandedToAStranger:
     is the wrong trigger.
 
     ``integration`` needs mongot and ``autoembed`` needs a cluster with a registered embedding model, so
-    neither can be stood up by a container. Both therefore run against a repository secret, off the change
-    triggers, for two reasons that point the same way: a pull request from a fork receives no secret, so the
-    tiers would skip on exactly the contributions that most need checking and report the skip as a pass; and
-    they cost 33 minutes of wall clock against a cloud cluster when measured, which is not a gate anybody
-    keeps.
+    neither can be stood up by a container. Both therefore run against a repository secret, and off
+    ``pull_request`` in particular, for two reasons that point the same way: a pull request from a fork
+    receives no secret, so the tiers would skip on exactly the contributions that most need checking and
+    report the skip as a pass; and they cost 33 minutes of wall clock against a cloud cluster when
+    measured, which is not a gate anybody keeps. ``REQ-E-165`` later added ``push`` to the same job, which
+    this class permits and ``AT-171`` requires: a push to ``main`` needs write access, so it is not a
+    trigger a stranger can pull.
 
     This was once asserted as ``if:`` equalling ``"github.event_name == 'schedule'"``. That was right
     about the file and wrong about the claim, in both directions: it broke on the change that added a
@@ -1343,4 +1346,285 @@ class TestNoJobCanRunForSixHours:
                 f"job {name!r} budgets {budget} minutes. The slowest job in this workflow is the Atlas tier "
                 f"at 36 minutes observed, so anything above {_TIMEOUT_CEILING_MINUTES} is the "
                 f"{_DEFAULT_TIMEOUT_MINUTES}-minute default with a different number on it"
+            )
+
+
+#: The other workflow. Three of the four gates below are about a property no single file can have on its
+#: own: a credential left in a checkout is left in whichever job checked out, and there are nine of them
+#: across the two files.
+RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release-python.yml"
+
+#: The automated update source for the actions these workflows run. Outside ``python/``, so ``AT-138``
+#: requires both change triggers to watch it once this module names it.
+DEPENDABOT_PATH = REPO_ROOT / ".github" / "dependabot.yml"
+
+
+def _checkout_steps(parsed: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Every ``actions/checkout`` step in a parsed workflow, paired with the job that runs it.
+
+    Matched on the action rather than the reference, so a version bump does not quietly empty the walk.
+    """
+    found: list[tuple[str, dict[str, Any]]] = []
+    for job_name, job in (parsed.get("jobs") or {}).items():
+        for step in job.get("steps") or []:
+            uses = step.get("uses")
+            if isinstance(uses, str) and uses.split("@")[0] == "actions/checkout":
+                found.append((job_name, step))
+    return found
+
+
+def _every_checkout() -> list[tuple[str, str, dict[str, Any]]]:
+    """Every checkout in the repository, as ``(workflow file, job, step)``."""
+    out: list[tuple[str, str, dict[str, Any]]] = []
+    for path in (WORKFLOW_PATH, RELEASE_WORKFLOW_PATH):
+        parsed = yaml.safe_load(path.read_text())
+        assert isinstance(parsed, dict), f"{path.name} did not parse as a mapping"
+        out.extend((path.name, job, step) for job, step in _checkout_steps(parsed))
+    return out
+
+
+class TestNoCheckoutLeavesACredentialBehind:
+    """``AT-169`` / ``REQ-E-163`` -- the token ``actions/checkout`` writes into ``.git/config``.
+
+    By default the action stores an ``http.extraheader`` carrying the job's ``GITHUB_TOKEN`` in the
+    checked-out repository's config and leaves it there for the rest of the job. Nothing in either
+    workflow pushes, tags or comments, so no step after a checkout has any use for it -- and the contract
+    tier runs a shipped example as a subprocess in an environment where ``pip`` has just resolved a
+    dependency tree.
+
+    **What this is worth, stated plainly.** Both workflows declare ``permissions: contents: read``, so the
+    persisted credential is read-scoped, and the one job that raises ``id-token: write`` checks nothing
+    out. This is defence in depth, not a live escalation, and the requirement says so.
+    """
+
+    def test_the_walk_actually_finds_the_checkouts(self) -> None:
+        """AT-169 -- a gate over an empty list is a gate that passes for the wrong reason."""
+        checkouts = _every_checkout()
+        assert len(checkouts) >= 9, (
+            f"the walk found {len(checkouts)} checkouts across the two workflows and there were nine when "
+            f"this was written; a matcher that resolves nothing reports a clean result"
+        )
+
+    def test_every_checkout_refuses_to_persist_the_credential(self) -> None:
+        """AT-169 -- read from the step, so a checkout added later has to answer the question too."""
+        offenders = [
+            f"{file}:{job}"
+            for file, job, step in _every_checkout()
+            if (step.get("with") or {}).get("persist-credentials") is not False
+        ]
+        assert offenders == [], (
+            f"these checkouts leave the job's GITHUB_TOKEN readable in .git/config for every later step: "
+            f"{offenders}. Nothing in either workflow pushes, so set `persist-credentials: false`"
+        )
+
+
+#: The two variables that name a real cluster. A job that sets either is a job this gate is about.
+_CLUSTER_VARIABLES = ("MONGODB_ATLAS_URI", "MONGODB_AUTOEMBED_URI")
+
+
+def _cluster_jobs(workflow: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Every job that hands itself a cluster credential, keyed by job name.
+
+    Identified by the variables it sets rather than by its key, so renaming the job does not silently
+    empty this gate.
+    """
+    return {
+        name: job
+        for name, job in workflow["jobs"].items()
+        if any(variable in (job.get("env") or {}) for variable in _CLUSTER_VARIABLES)
+    }
+
+
+class TestTheClusterTiersRunOnEveryMerge:
+    """``AT-171`` / ``REQ-E-165`` -- a seven-day window on the branch tags are cut from.
+
+    The job admitted ``schedule`` and ``workflow_dispatch`` and nothing else. A push to ``main`` triggers
+    this workflow but did not trigger this job, so a merge received no ``integration`` and no
+    ``autoembed`` coverage until the following Monday -- and ``release-python.yml`` runs only the gate and
+    contract tiers, so a tag could be published having never exercised ``$vectorSearch`` with
+    ``autoEmbed``, this package's default search mode, against a cluster at all.
+
+    The reason the job stays off the *change* triggers is unchanged: a fork's pull request receives no
+    secret, ``conftest.py`` reports both tiers as skipped, and a skip and a pass are the same colour. A
+    push to ``main`` is not a fork.
+    """
+
+    def test_there_is_a_job_that_needs_a_cluster(self, workflow: dict[str, Any]) -> None:
+        """AT-171 -- the vacuity guard. Every assertion below is over this set."""
+        assert _cluster_jobs(workflow), (
+            f"no job sets any of {_CLUSTER_VARIABLES}, so the three assertions below are about nothing"
+        )
+
+    def test_a_merge_to_main_runs_them(self, workflow: dict[str, Any]) -> None:
+        """AT-171 -- the finding. A commit on main is the commit a tag is cut from."""
+        triggers = frozenset(_triggers(workflow))
+        for name, job in _cluster_jobs(workflow).items():
+            admitted = _admitted_events(job.get("if"), triggers)
+            assert "push" in admitted, (
+                f"job {name!r} runs on {sorted(admitted)} and not on a push to main, so a merge gets no "
+                f"cluster coverage until the next cron and a tag can be cut from a commit no cluster saw"
+            )
+
+    def test_they_stay_off_the_trigger_a_fork_can_pull(self, workflow: dict[str, Any]) -> None:
+        """AT-171 -- widening this job must not widen it to the one event that hands a stranger the wheel."""
+        triggers = frozenset(_triggers(workflow))
+        for name, job in _cluster_jobs(workflow).items():
+            admitted = _admitted_events(job.get("if"), triggers)
+            assert "pull_request" not in admitted, (
+                f"job {name!r} admits pull_request. A fork's pull request receives no secret, so both "
+                f"tiers would skip and report the same green as a run that passed"
+            )
+
+    def test_a_person_can_still_start_them(self, workflow: dict[str, Any]) -> None:
+        """AT-171 -- the property AT-139 holds workflow-wide, asserted here because this gate edits the condition."""
+        triggers = frozenset(_triggers(workflow))
+        for name, job in _cluster_jobs(workflow).items():
+            admitted = _admitted_events(job.get("if"), triggers)
+            assert "workflow_dispatch" in admitted, (
+                f"job {name!r} no longer admits workflow_dispatch, so the only way to ask this question "
+                f"is to merge something or wait for Monday"
+            )
+
+
+#: The ecosystem whose versions nothing in this repository raises by hand.
+_ACTIONS_ECOSYSTEM = "github-actions"
+
+#: The ecosystem this repository deliberately does not configure. `pyproject.toml` declares floors with no
+#: upper bounds and a paragraph of rationale for each; an automated pull request that raises one would
+#: narrow the range this package promises to work on while looking like housekeeping.
+_REFUSED_ECOSYSTEMS = frozenset({"pip", "uv", "poetry"})
+
+
+@pytest.fixture(scope="module")
+def dependabot() -> dict[str, Any]:
+    """The parsed update configuration.
+
+    Fails rather than skips when absent, for the reason the workflow fixture gives: absence is the defect.
+    """
+    assert DEPENDABOT_PATH.is_file(), f"REQ-E-166: no update configuration at {DEPENDABOT_PATH}"
+    parsed = yaml.safe_load(DEPENDABOT_PATH.read_text())
+    assert isinstance(parsed, dict), "the update configuration did not parse as a mapping"
+    return parsed
+
+
+class TestTheActionsHaveAnUpdateSourceAndTheFloorsDoNot:
+    """``AT-172`` / ``REQ-E-166`` -- two halves, and the second one is a refusal.
+
+    Nothing raises an action version in this repository, and ``REQ-E-164`` has just added a digest that
+    will not raise itself. Both peer repositories run Dependabot on ``github-actions`` with an identical
+    seven-day cooldown -- the window in which a yanked or compromised release is usually caught.
+
+    The refusal is the half specific to this package. A library ships its floors: ``strands-agents>=1.48.0``
+    and the three beside it are the contract, not an artefact of how a requirements file was written. A
+    bot that raises one revokes a promise, so the Python ecosystems are asserted *absent* rather than
+    merely left out, because leaving something out is not a decision anybody can see.
+    """
+
+    def test_it_watches_the_actions(self, dependabot: dict[str, Any]) -> None:
+        """AT-172 -- the first half. Nine checkouts and a digest, and nothing raising any of them."""
+        ecosystems = [entry.get("package-ecosystem") for entry in dependabot.get("updates") or []]
+        assert _ACTIONS_ECOSYSTEM in ecosystems, (
+            f"the update configuration watches {ecosystems} and not {_ACTIONS_ECOSYSTEM!r}, so the action "
+            f"references in both workflows -- including the digest REQ-E-164 pins -- go stale unwatched"
+        )
+
+    def test_every_entry_waits_before_proposing_a_release(self, dependabot: dict[str, Any]) -> None:
+        """AT-172 -- a cooldown, because the day a release lands is the day a bad one is still a release."""
+        for entry in dependabot.get("updates") or []:
+            ecosystem = entry.get("package-ecosystem")
+            cooldown = (entry.get("cooldown") or {}).get("default-days")
+            assert isinstance(cooldown, int) and cooldown >= 7, (
+                f"the {ecosystem!r} entry declares default-days {cooldown!r}. Both peer repositories wait "
+                f"seven, which is the window a yanked release is usually caught in"
+            )
+
+    def test_nothing_proposes_a_new_dependency_floor(self, dependabot: dict[str, Any]) -> None:
+        """AT-172 -- the refusal, asserted rather than assumed."""
+        configured = {entry.get("package-ecosystem") for entry in dependabot.get("updates") or []}
+        overreach = sorted(configured & _REFUSED_ECOSYSTEMS)
+        assert overreach == [], (
+            f"the update configuration watches {overreach}, which proposes new dependency floors. The "
+            f"floors in pyproject.toml are the range this package promises to work on and each one has a "
+            f"reason written beside it; raising one is a decision, not maintenance"
+        )
+
+
+#: The marker expression that selects the tier which runs a shipped example as a subprocess.
+_CONTRACT_SELECTION = "-m contract"
+
+#: What the gate has to run. `--porcelain` is the machine-readable form and, unlike a bare `git status`,
+#: it is empty on a clean tree -- which is what makes it usable as a condition.
+_TREE_QUERY = "git status --porcelain"
+
+
+def _jobs_running_shipped_code() -> list[tuple[str, str, dict[str, Any]]]:
+    """Every job in the repository that selects the contract tier, as ``(workflow file, job, job body)``.
+
+    Found by what the job runs rather than by its name, because two of the three are not called
+    ``contract``.
+    """
+    out: list[tuple[str, str, dict[str, Any]]] = []
+    for path in (WORKFLOW_PATH, RELEASE_WORKFLOW_PATH):
+        parsed = yaml.safe_load(path.read_text())
+        for name, job in (parsed.get("jobs") or {}).items():
+            if any(_CONTRACT_SELECTION in block for block in _run_blocks(job)):
+                out.append((path.name, name, job))
+    return out
+
+
+class TestTheTierThatRunsShippedCodeLeavesNothingBehind:
+    """``AT-173`` / ``REQ-E-167`` -- an example that writes a file beside itself.
+
+    ``-m contract`` selects the storage quickstart alongside the tier, so one of the two examples in
+    ``examples/`` is executed as a subprocess against a real server on every change rather than merely
+    linted. A shipped example that leaves a file behind is a defect every reader inherits by copying it,
+    and nothing in this repository observed whether one did.
+
+    **Every job that selects the tier, not just the one called ``contract``.** Three do: the contract job
+    here, the SDK canary, and the release gate's own contract job. A rule with an exception is a rule
+    somebody has to remember.
+
+    **What it cannot catch.** ``--porcelain`` respects ``.gitignore``, so the caches and coverage files
+    that file already names stay invisible. What is left is a path nobody declared, which is the shape a
+    stray artifact actually has.
+    """
+
+    def test_there_are_jobs_that_run_shipped_code(self) -> None:
+        """AT-173 -- the vacuity guard. The count has moved before: the release workflow's own contract
+        job was the third, and was added after the other two.
+        """
+        found = _jobs_running_shipped_code()
+        assert len(found) >= 3, (
+            f"the walk found {len(found)} jobs selecting {_CONTRACT_SELECTION!r} and there were three when "
+            f"this was written; a matcher that resolves nothing reports a clean result"
+        )
+
+    def test_each_of_them_asks_whether_the_tree_is_still_clean(self) -> None:
+        """AT-173 -- the gate itself."""
+        offenders = [
+            f"{file}:{name}"
+            for file, name, job in _jobs_running_shipped_code()
+            if not any(_TREE_QUERY in block for block in _run_blocks(job))
+        ]
+        assert offenders == [], (
+            f"these jobs run a shipped example as a subprocess and never ask what it left behind: "
+            f"{offenders}. Add a step running `{_TREE_QUERY}` and failing on any output"
+        )
+
+    def test_the_question_is_asked_after_the_tier_rather_than_before(self) -> None:
+        """AT-173 -- a clean tree before the run is the state every job starts in and proves nothing."""
+        for file, name, job in _jobs_running_shipped_code():
+            steps = job.get("steps") or []
+            ran = next(
+                (index for index, step in enumerate(steps) if _CONTRACT_SELECTION in (step.get("run") or "")),
+                None,
+            )
+            asked = next(
+                (index for index, step in enumerate(steps) if _TREE_QUERY in (step.get("run") or "")),
+                None,
+            )
+            assert ran is not None and asked is not None, f"{file}:{name} is missing one of the two steps"
+            assert asked > ran, (
+                f"{file}:{name} checks the working tree at step {asked} and runs the tier at step {ran}. "
+                f"Asked first, it reports the state the runner handed the job"
             )

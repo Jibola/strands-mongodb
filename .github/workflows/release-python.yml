@@ -50,6 +50,7 @@ jobs:
           # silently falls back to 0.0.0 — which is exactly the mistake `fallback_version` was made
           # unmistakable to catch.
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v7.0.0
@@ -103,6 +104,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v7.0.0
@@ -122,6 +124,18 @@ jobs:
       - name: Run the contract tier
         run: hatch run test -m contract
 
+      # Here the gate guards the build rather than the tier: `build` checks out afresh, but a tier that
+      # writes into the tree is a tier that could write into what gets packaged, and a tag is the worst
+      # moment to find out. `REQ-E-167`.
+      - name: Assert the tier left the working tree clean
+        run: |
+          dirty="$(git status --porcelain)"
+          if [ -n "$dirty" ]; then
+            echo "The contract tier left files behind:"
+            echo "$dirty"
+            exit 1
+          fi
+
   build:
     name: Build and verify the artifact
     needs: [gate, contract]
@@ -133,6 +147,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v7.0.0
@@ -197,15 +212,23 @@ jobs:
       id-token: write
 
     steps:
+      # Both actions in this job are pinned to a digest rather than to a tag, which is a stricter rule
+      # than the one the rest of these workflows follow and is deliberately scoped to this job alone.
+      # MongoDB's own zizmor policy is `actions/*: ref-pin`, so `actions/checkout@v7` elsewhere is correct
+      # by that standard; what makes this job different is `id-token: write` below. `REQ-E-164`.
       - name: Download the artifact the build job verified
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: python-dist
           path: dist/
 
       # No `password:`. Trusted publishing supplies the credential; supplying a token here would defeat
       # the point of the environment binding above.
+      # `release/v1` is a branch: whoever can move it can change what runs in the only job in this
+      # repository holding the token PyPI exchanges for an upload credential, and the blast radius is
+      # every install of this package. This digest is that branch as of 2026-07-28, and is the pin
+      # `mongo-python-driver` carries for this same action.
       - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # release/v1
         with:
           packages-dir: dist/
