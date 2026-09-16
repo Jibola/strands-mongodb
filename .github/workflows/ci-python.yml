@@ -173,15 +173,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15  # An install that resolves nothing current, then the unit tier. Budgeted as `test`.
 
-    env:
-      # pip reads this on every invocation, including the ones hatch makes when it builds its environment,
-      # which is what makes `hatch run test` below run against the pinned set rather than against whatever
-      # the `>=` specifiers resolve to. `UV_CONSTRAINT` is the same file for the same reason, so this keeps
-      # working if hatch's installer is ever switched. Written under `runner.temp` rather than into the
-      # checkout, so the job leaves the working tree alone.
-      PIP_CONSTRAINT: ${{ runner.temp }}/floors.txt
-      UV_CONSTRAINT: ${{ runner.temp }}/floors.txt
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -203,13 +194,29 @@ jobs:
       # a floor added to an extra and not added below fails on the change that adds it.
       - name: Pin every declared floor
         run: |
-          cat > "${PIP_CONSTRAINT}" <<'EOF'
+          cat > "${RUNNER_TEMP}/floors.txt" <<'EOF'
           strands-agents==1.54.0
           pymongo==4.14.0
           typing-extensions==4.13.2
           pymongo-search-utils==0.3.0
           EOF
-          cat "${PIP_CONSTRAINT}"
+          cat "${RUNNER_TEMP}/floors.txt"
+          # pip reads PIP_CONSTRAINT on every invocation, including the ones hatch makes when it builds its
+          # environment, which is what makes `hatch run test` below run against the pinned set rather than
+          # against whatever the `>=` specifiers resolve to. `UV_CONSTRAINT` is the same file for the same
+          # reason, so this keeps working if hatch's installer is ever switched. Under `$RUNNER_TEMP` rather
+          # than in the checkout, so the job leaves the working tree alone.
+          #
+          # Exported into `$GITHUB_ENV` from a step, rather than declared in a job-level `env:` block, which
+          # is where this started and where it cannot work: `runner` is not one of the contexts available to
+          # `jobs.<job_id>.env`, and a workflow that names it there does not fail the job -- it fails the
+          # whole run at startup, before any job exists to report it. Observed on the first push: a run that
+          # completed in 0s with no jobs, no annotations and no log. `AT-175` is the gate that catches it
+          # without a push.
+          {
+            echo "PIP_CONSTRAINT=${RUNNER_TEMP}/floors.txt"
+            echo "UV_CONSTRAINT=${RUNNER_TEMP}/floors.txt"
+          } >> "$GITHUB_ENV"
 
       - name: Install hatch
         run: pip install hatch

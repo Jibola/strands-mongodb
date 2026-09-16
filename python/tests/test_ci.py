@@ -1777,3 +1777,166 @@ class TestSomethingInstallsTheFloorsThePackageShips:
             f"the floor job runs Python {versions} and pyproject.toml declares requires-python "
             f"{declared!r}; the floors describe the environment an old interpreter produces"
         )
+
+
+#: Which contexts GitHub makes available at each job-level key, transcribed from the "Context
+#: availability" table in the Actions documentation. Only the keys these two workflows actually put an
+#: expression under are listed, and a key that is missing fails this gate rather than passing it: the
+#: honest answer for a row nobody transcribed is "go and read the table", not "assume it is allowed".
+#:
+#: The four contexts that make this worth checking are ``runner``, ``job``, ``env`` and ``steps``. None
+#: of them appears in any row below, and all four are available in every step key -- which is exactly why
+#: the mistake is easy to make and impossible to see by reading. They are not blanket step-only: the table
+#: does admit them at ``environment.url``, ``outputs.<id>``, ``container.env.<id>``, ``container.credentials``
+#: and the two ``services`` equivalents. Neither workflow uses any of those keys today, so none is
+#: transcribed; adding one lands here as a missing row rather than as a false failure.
+_JOB_LEVEL_CONTEXTS: dict[str, frozenset[str]] = {
+    "env": frozenset({"github", "needs", "strategy", "matrix", "vars", "secrets", "inputs"}),
+    "if": frozenset({"github", "needs", "vars", "inputs"}),
+    "name": frozenset({"github", "needs", "strategy", "matrix", "vars", "inputs"}),
+    "runs-on": frozenset({"github", "needs", "strategy", "matrix", "vars", "inputs"}),
+    "timeout-minutes": frozenset({"github", "needs", "strategy", "matrix", "vars", "inputs"}),
+    "concurrency": frozenset({"github", "needs", "strategy", "matrix", "vars", "inputs"}),
+    "strategy": frozenset({"github", "needs", "vars", "inputs"}),
+}
+
+#: Every context name GitHub defines. Used to filter the matcher below, because the same syntax that
+#: introduces a context also introduces a field of one: in ``github.event.pull_request.number`` only
+#: ``github`` is the context and the rest is a path through it. A name outside this set is a function
+#: call or a nested field, and either way it is not what this gate is about.
+_CONTEXT_NAMES = frozenset(
+    {"github", "env", "vars", "job", "jobs", "steps", "runner", "secrets", "strategy", "matrix", "needs", "inputs"}
+)
+
+#: An expression, and the contexts named at the head of a path inside one. The lookbehind is what
+#: distinguishes a context from a field: ``runner`` in ``runner.temp`` matches, ``event`` in
+#: ``github.event.pull_request`` does not, and ``hashFiles`` in ``hashFiles('x')`` is followed by a
+#: bracket this does not accept.
+_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+_CONTEXT_HEAD = re.compile(r"(?<![\w.])([A-Za-z][A-Za-z0-9_-]*)\s*[.\[]")
+
+
+def _expressions_in(value: Any) -> list[str]:
+    """Every ``${{ ... }}`` body anywhere inside a parsed YAML value, at any depth."""
+    if isinstance(value, str):
+        return [match.group(1) for match in _EXPRESSION.finditer(value)]
+    if isinstance(value, dict):
+        return [found for item in value.values() for found in _expressions_in(item)]
+    if isinstance(value, list):
+        return [found for item in value for found in _expressions_in(item)]
+    return []
+
+
+def _every_job() -> list[tuple[str, str, dict[str, Any]]]:
+    """Every job in the repository, as ``(workflow file, job key, job)``."""
+    out: list[tuple[str, str, dict[str, Any]]] = []
+    for path in (WORKFLOW_PATH, RELEASE_WORKFLOW_PATH):
+        parsed = yaml.safe_load(path.read_text())
+        assert isinstance(parsed, dict), f"{path.name} did not parse as a mapping"
+        out.extend((path.name, str(name), job) for name, job in (parsed.get("jobs") or {}).items())
+    return out
+
+
+def _job_level_expressions() -> list[tuple[str, str, str, str, frozenset[str]]]:
+    """Every expression outside ``steps``, as ``(file, job, job key, expression, contexts named)``.
+
+    Keyed by the job-level key rather than by the full path, because that is the granularity the
+    documented table has: ``jobs.<job_id>.env`` admits one set of contexts and every value under it
+    admits the same set.
+    """
+    found: list[tuple[str, str, str, str, frozenset[str]]] = []
+    for file_name, job_name, job in _every_job():
+        for key, value in job.items():
+            if key == "steps":
+                continue
+            # `if` is the one key whose value is an expression without being wrapped in one, and it is
+            # also the job-level key most likely to carry a context: all seven jobs in ci-python.yml
+            # choose their events with it. A walk that only looked for `${{` would have found three
+            # expressions across the two files and reported them clean.
+            bare = [str(value)] if key == "if" and "${{" not in str(value) else []
+            for expression in _expressions_in(value) + bare:
+                named = frozenset(_CONTEXT_HEAD.findall(expression)) & _CONTEXT_NAMES
+                found.append((file_name, job_name, str(key), expression.strip(), named))
+    return found
+
+
+class TestNoJobLevelKeyNamesAContextThatIsNotThere:
+    """``AT-175`` / ``REQ-E-169`` -- an expression GitHub refuses to start the run for.
+
+    The ``floors`` job shipped with ``PIP_CONSTRAINT: ${{ runner.temp }}/floors.txt`` in a job-level
+    ``env:`` block. ``runner`` is not one of the contexts available to ``jobs.<job_id>.env``; it exists
+    only once a runner has been assigned, which is after the point the workflow file is parsed. The
+    result is not a failing job. It is a failing *run*: the first push of that file completed in zero
+    seconds with no jobs, no annotations and no log, under the message "This run likely failed because of
+    a workflow file issue."
+
+    **Why every other gate in this module missed it.** They all parse the file with PyYAML and assert on
+    the structure, and the structure was fine -- valid YAML, correct keys, the pins present, the tests
+    invoked. What was wrong was a value that only GitHub's expression evaluator can reject, and the
+    fifty-odd tests that read this workflow had no opinion about values. The whole class is checkable from
+    a transcribed table, which is what ``_JOB_LEVEL_CONTEXTS`` is.
+
+    **And why it matters more than a broken job would.** A startup failure takes every gate down at once
+    and reports as a single red entry beside whatever third-party checks the organisation adds, so a pull
+    request whose entire test suite never ran looks, at a glance, like a pull request with one unrelated
+    problem.
+    """
+
+    def test_the_walk_reads_every_job_in_both_files(self) -> None:
+        """AT-175 -- a table lookup over an empty list is a clean report about nothing.
+
+        Two bounds rather than one, because the two failure modes are different. Reading no jobs is a
+        renamed file or a changed schema; reading every job and finding no expression would be a broken
+        matcher, and the ``if`` handling above is exactly the kind of thing that silently stops matching.
+        """
+        assert len({file for file, _, _ in _every_job()}) == 2, (
+            "the walk read one of the two workflow files, or neither; both paths are asserted to exist "
+            "elsewhere in this module, so this is the schema changing under it"
+        )
+        assert len(_every_job()) >= 11, f"the walk found {len(_every_job())} jobs and there were eleven"
+
+        found = _job_level_expressions()
+        assert len(found) >= 10, (
+            f"the walk found {len(found)} job-level expressions and there were ten when this was written; "
+            f"a matcher that resolves nothing passes"
+        )
+
+    def test_every_job_level_key_it_finds_has_a_transcribed_row(self) -> None:
+        """AT-175 -- the gate is a lookup, so an untranscribed key must fail rather than be skipped."""
+        missing = sorted({key for _, _, key, _, _ in _job_level_expressions() if key not in _JOB_LEVEL_CONTEXTS})
+        assert missing == [], (
+            f"these job-level keys carry an expression and are not in _JOB_LEVEL_CONTEXTS: {missing}. "
+            f"Read the row out of the Actions 'Context availability' table and add it, rather than "
+            f"leaving a key this gate silently has no opinion about"
+        )
+
+    def test_every_expression_names_only_contexts_available_where_it_sits(self) -> None:
+        """AT-175 -- the finding, generalised: the whole file, both files, every job-level key."""
+        offenders = [
+            f"{file}:{job}:{key} -> ${{{{ {expression} }}}} names {sorted(named - _JOB_LEVEL_CONTEXTS[key])}"
+            for file, job, key, expression, named in _job_level_expressions()
+            if key in _JOB_LEVEL_CONTEXTS and not named <= _JOB_LEVEL_CONTEXTS[key]
+        ]
+        assert offenders == [], (
+            f"these expressions name a context GitHub does not provide at that key, which fails the whole "
+            f"run at startup rather than the job: {offenders}. A value needing `runner`, `job`, `env` or "
+            f"`steps` belongs in a step -- write it into $GITHUB_ENV from one, as the floor job does"
+        )
+
+    def test_the_floor_job_exports_the_constraint_it_writes(self) -> None:
+        """AT-175 -- the outcome, not the side effect: an unexported constraint file constrains nothing.
+
+        Moving the two variables into a step is only a fix if they still reach the install. Written as a
+        gate rather than left to review because the failure is silent in the direction that matters:
+        ``pip`` with no ``PIP_CONSTRAINT`` resolves the newest of everything and the job passes, having
+        tested the same combination the matrix already tests.
+        """
+        _, job = _floor_job(yaml.safe_load(WORKFLOW_PATH.read_text()))
+        exported = "\n".join(
+            str(step.get("run") or "") for step in job.get("steps") or [] if "$GITHUB_ENV" in str(step.get("run") or "")
+        )
+        for variable in ("PIP_CONSTRAINT", "UV_CONSTRAINT"):
+            assert f"{variable}=" in exported, (
+                f"the floor job never puts {variable} into $GITHUB_ENV, so the constraint file it writes "
+                f"is read by nothing and `hatch run test` resolves whatever the `>=` specifiers allow"
+            )
