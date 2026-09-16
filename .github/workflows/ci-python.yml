@@ -27,6 +27,7 @@ on:
       - 'AGENTS.md'
       - 'CONTRIBUTING.md'
       - 'README.md'
+      - 'SECURITY.md'
       - '.gitignore'
   push:
     branches: [ main ]
@@ -42,6 +43,7 @@ on:
       - 'AGENTS.md'
       - 'CONTRIBUTING.md'
       - 'README.md'
+      - 'SECURITY.md'
       - '.gitignore'
   schedule:
     # Weekly canary against the newest SDK release, and the only mitigation for an unpinned SDK floor. The floor
