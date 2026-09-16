@@ -508,6 +508,7 @@ point the contract tier at, because role definitions belong to the server and ca
 | `insert` | `write`, `add` | no | yes |
 | `update` | `write` overwriting an existing key | no | yes |
 | `remove` | `delete`, `delete_all` | no | yes |
+| `listCollections` | The collation preflight, before any index, on both surfaces | yes | yes |
 | `listIndexes` | Verify mode, ordinary indexes | yes | yes |
 | `listSearchIndexes` | Verify mode, search indexes | yes | yes |
 | `createIndex` | Ensure mode, ordinary indexes | no | yes |
@@ -517,12 +518,21 @@ point the contract tier at, because role definitions belong to the server and ca
 So `readWrite` covers everything including index creation, and `read` is enough for a search-only store
 in verify mode. The interesting case is the one in between: an application that writes memories but must
 not create indexes. No built-in role expresses that, so it takes a custom role granting the four data
-actions and the two `list` ones, and `ensure_indexes: False`. Keep `insert` in that role even though this
-package never sends an `insert` command: every write it makes is an upsert, and a role holding `update`
+actions and the three metadata reads, and `ensure_indexes: False`. Keep `insert` in that role even though
+this package never sends an `insert` command: every write it makes is an upsert, and a role holding `update`
 without `insert` is refused one.
 
+`listCollections` is not optional and is not about indexes. Every `initialize()` reads the collection's
+collation before anything else, because a collection that folds case cannot keep two scopes apart, and
+`listCollections` is the only command that reports it. A role without it fails at `initialize()` and not
+later, which is the intended direction: the alternative is a store that runs and compares strings by rules
+nothing declared.
+
 Self-managed MongoDB reads the same. Measured on 6.0.28, 7.0.40 and 8.3.8 started with `--auth`, none of
-them running a search process: all eight rows above are identical to Atlas, `createSearchIndexes` included.
+them running a search process: all nine rows that existed then are identical to Atlas, `createSearchIndexes`
+included. `listCollections` arrived afterwards and is measured on 8.0.32 only — though every row is read out
+of the deployment's own `rolesInfo` by the contract tier, so a version that grants any of them differently
+fails a test rather than misleading a reader.
 A role says what the server would authorize, not what it can do, so `readWrite` carries that action on a
 deployment with no search at all.
 

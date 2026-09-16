@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 
@@ -1371,6 +1371,182 @@ class TestSearchIndexesAgainstAFake:
         statuses = [record.getMessage() for record in caplog.records if spec.name in record.getMessage()]
         assert sum("BUILDING" in message for message in statuses) == 1, statuses
         assert sum("READY" in message for message in statuses) == 1, statuses
+
+
+class TestReadinessIsAboutTheDefinitionAndNotOnlyTheStatus:
+    """AT-180 / ``REQ-E-175`` — the poll loop watched a name where it needed to watch a definition.
+
+    ``_ensure_search`` checks each existing index's definition on its cold read, then hands whatever is
+    still building to ``_wait_until_ready``, which read ``status`` and nothing else. A production-readiness
+    review found that gap. Two ways through it, both measured against this fake before the recheck existed
+    and refused after it:
+
+    * an index found BUILDING with a covering definition, dropped and recreated by another actor while
+      this loop polls, reporting READY with a definition that no longer covers this package's. A search
+      index cannot be redefined in place, which is what the cold-path message says, but drop-and-recreate
+      is exactly the remedy that message *prints* -- so the racing actor is as likely to be an operator
+      following this package's own instructions as anything else;
+    * an index this package created itself one call earlier, whose build was never compared with what was
+      asked for at all. The cold read found nothing, so ``_ensure_search`` had no document to check, and
+      the only later document went to a branch that looked at ``status``.
+
+    Accepting either is premortem **P-2** with its loudest symptom removed: every index reports READY,
+    ``initialize()`` returns, and searches quietly return nothing or the wrong thing. The cost of closing
+    it is one containment check over a document already in hand.
+
+    No contract sibling is added, because two already cover the risk the recheck introduces. The recheck's
+    only way to be *wrong* is to be over-strict about what a real mongot reports back, and
+    ``test_the_vector_definition_the_server_reports_back_is_the_one_we_sent`` and
+    ``test_the_text_definition_is_covered_whether_or_not_the_server_rewrites_it`` both run ``ensure`` with
+    ``create=True`` against Atlas over a fresh collection -- which is to say both now poll a real build to
+    READY through this branch, and both fail if the containment rule stops covering the rewrite mongot 8.3.8
+    performs.
+    """
+
+    DRIFTED: Final[dict[str, Any]] = {
+        "fields": [{"type": "autoEmbed", "path": "content", "model": "voyage-3-lite", "modality": "text"}]
+    }
+    """The declared vector definition with a different embedding model and both filter paths gone.
+
+    Not an arbitrary edit. A cheaper model is the single most plausible thing somebody changes by hand,
+    and dropping ``filter`` on ``scope`` is the change that makes ``$vectorSearch`` refuse the scope term
+    ``_filter.compose`` pins on every read -- which is to say the drift that matters is the drift that
+    silently un-scopes the store.
+    """
+
+    @staticmethod
+    def _spec() -> _indexes.SearchIndexSpec:
+        """The vector spec, whose definition has three declared fields to drift away from."""
+        return _indexes.memory_search_specs({"database": "d"})[0]
+
+    async def test_a_definition_that_drifts_during_the_build_is_refused_when_it_reports_ready(self) -> None:
+        """The reviewer's case. Covering on the read before the poll, not covering on the read that ends it."""
+        from strands.types.exceptions import StorageError
+
+        spec = self._spec()
+        collection: Any = FakeAsyncCollection(
+            search_states={
+                spec.name: [
+                    [{"name": spec.name, "status": "BUILDING", "latestDefinition": spec.definition}],
+                    [{"name": spec.name, "status": "READY", "latestDefinition": self.DRIFTED}],
+                ]
+            }
+        )
+
+        with pytest.raises(StorageError) as caught:
+            await _indexes.ensure(collection, search=[spec], create=False, interval=0)
+
+        assert "voyage-4-lite" in str(caught.value)
+
+    async def test_an_index_this_package_created_is_checked_against_what_the_server_built(self) -> None:
+        """The second way in, and the one that needs no other actor at all.
+
+        Absent on the cold read, so ``_ensure_search`` creates it and appends it to ``waiting`` with no
+        document to check. Everything known about that index afterwards arrives through the poll. Before
+        the recheck, nothing compared it with the model that was sent.
+        """
+        from strands.types.exceptions import StorageError
+
+        spec = self._spec()
+        collection: Any = FakeAsyncCollection(
+            search_states={spec.name: [[], [{"name": spec.name, "status": "READY", "latestDefinition": self.DRIFTED}]]}
+        )
+
+        with pytest.raises(StorageError, match="does not cover"):
+            await _indexes.ensure(collection, search=[spec], create=True, interval=0)
+
+        assert collection.created_search_indexes != []
+
+    async def test_the_refusal_carries_the_same_remedy_as_the_cold_path(self) -> None:
+        """One message for one condition, wherever it is noticed.
+
+        The recheck reuses ``_check_definition`` rather than composing its own sentence, so an operator who
+        hits this on the second ``initialize()`` and an operator who hits it on the first read the same two
+        commands. Asserted because a hand-written message here is the obvious shortcut.
+        """
+        from strands.types.exceptions import StorageError
+
+        spec = self._spec()
+        collection: Any = FakeAsyncCollection(
+            search_states={
+                spec.name: [
+                    [{"name": spec.name, "status": "BUILDING", "latestDefinition": spec.definition}],
+                    [{"name": spec.name, "status": "READY", "latestDefinition": self.DRIFTED}],
+                ]
+            }
+        )
+
+        with pytest.raises(StorageError) as caught:
+            await _indexes.ensure(collection, search=[spec], create=False, interval=0)
+
+        message = str(caught.value)
+        assert "dropSearchIndex" in message
+        assert "createSearchIndex" in message
+
+    async def test_a_build_whose_definition_still_covers_is_accepted(self) -> None:
+        """The vacuity guard. A recheck that refused every polled index would pass all three tests above
+        and make every asynchronous build unusable, which is most of what ``REQ-E-062`` is for."""
+        spec = self._spec()
+        collection: Any = FakeAsyncCollection(
+            search_states=search_states(spec.name, "BUILDING", "READY", definition=spec.definition)
+        )
+
+        await _indexes.ensure(collection, search=[spec], create=False, interval=0)
+
+    async def test_a_report_that_carries_no_definition_is_not_a_gap(self) -> None:
+        """``latestDefinition`` absent means *unknown*, and unknown is not *wrong*.
+
+        mongot 8.3.8 sends it on every read, so this is a shape the fake produces more readily than a
+        deployment does. It is still the right default: the alternative is a recheck that turns a field
+        this package does not control into a hard failure at the end of a 300 second build. ``REQ-E-069``
+        already made that choice for the cold path; the recheck inherits it rather than deciding again.
+        """
+        spec = self._spec()
+        collection: Any = FakeAsyncCollection(search_states=search_states(spec.name, "BUILDING", "READY"))
+
+        await _indexes.ensure(collection, search=[spec], create=False, interval=0)
+
+    async def test_the_recheck_reads_nothing_the_poll_was_not_already_reading(self) -> None:
+        """The cost claim, asserted rather than asserted-in-a-comment.
+
+        A recheck implemented as its own ``list_search_indexes`` would double the reads on every poll of
+        every build -- 1200 aggregations over a 300 second one. The document is already in hand from the
+        status read, so the count is the count the loop had before: one per read of the index, and this
+        script needs two of them. The cold read in ``_ensure_search`` finds BUILDING and the first poll
+        finds READY, which is also why the definition has to be rechecked at all -- the loop's own reads
+        are the only ones that ever see the finished build.
+        """
+        spec = self._spec()
+        collection: Any = FakeAsyncCollection(
+            search_states=search_states(spec.name, "BUILDING", "READY", definition=spec.definition)
+        )
+
+        await _indexes.ensure(collection, search=[spec], create=False, interval=0)
+
+        # The cold read consumes BUILDING, the first poll consumes READY. Measured, not predicted: the
+        # count is 2 and not 3, because `_ensure_search`'s read is one of the two rather than an extra one.
+        assert collection._search_reads[spec.name] == 2
+
+    async def test_one_drifted_index_beside_one_clean_one_names_the_drifted_one(self) -> None:
+        """Two indexes are waited on together, and the message has to say which of them is the problem."""
+        from strands.types.exceptions import StorageError
+
+        vector, text = _indexes.memory_search_specs({"database": "d"})
+        collection: Any = FakeAsyncCollection(
+            search_states={
+                vector.name: [[{"name": vector.name, "status": "READY", "latestDefinition": vector.definition}]],
+                text.name: [
+                    [{"name": text.name, "status": "BUILDING", "latestDefinition": text.definition}],
+                    [{"name": text.name, "status": "READY", "latestDefinition": {"mappings": {"dynamic": True}}}],
+                ],
+            }
+        )
+
+        with pytest.raises(StorageError) as caught:
+            await _indexes.ensure(collection, search=[vector, text], create=False, interval=0)
+
+        assert text.name in str(caught.value)
+        assert vector.name not in str(caught.value)
 
 
 class TestTheCapabilityProbeAgainstAFake:

@@ -294,6 +294,7 @@ class MongoDBStorage:
                 :data:`MAX_KEY_BYTES`, or would build a document over :data:`MAX_DOCUMENT_BYTES`. Also
                 if the write fails, with the driver's error chained.
         """
+        await self._require_binary_keys()
         document_id = self._id_for(key)
         expires = self._ttl_seconds is not None
         size = _encoded_size(document_id, data, expires=expires)
@@ -334,6 +335,7 @@ class MongoDBStorage:
             StorageError: If the key is invalid or too long, or if the read fails for any reason other
                 than the key being absent, with the driver's error chained (``REQ-E-022``).
         """
+        await self._require_binary_keys()
         document = await self._collection().find_one({"_id": self._id_for(key)})
         if document is None:
             return None
@@ -359,6 +361,7 @@ class MongoDBStorage:
             StorageError: If the key is invalid or too long, or if the delete fails, with the driver's
                 error chained.
         """
+        await self._require_binary_keys()
         await self._collection().delete_one({"_id": self._id_for(key)})
 
     @_reporting("listing")
@@ -382,6 +385,7 @@ class MongoDBStorage:
             StorageError: If the prefix contains a ``..`` segment, or if the scan fails at any point,
                 including part way through draining the cursor.
         """
+        await self._require_binary_keys()
         cursor = self._collection().find(self._range_for(query), {"_id": 1})
         # Only this instance's prefix comes off, never the queried one: a caller passing `sessions/` has
         # to get keys it can hand back to `read`.
@@ -417,6 +421,10 @@ class MongoDBStorage:
             # `KeywordSearchStrategy` short circuits here too. Without it the server would scan the whole
             # namespace to score every key zero and hand back the same empty list (`REQ-E-032a`).
             return []
+        # After the short circuit above, not before it. `REQ-E-032a` is that a query tokenizing to
+        # nothing costs no round trip, and a preflight ahead of it would spend one -- on a call that
+        # never reaches the key space and so has nothing to be protected from.
+        await self._require_binary_keys()
         cursor = await self._collection().aggregate(self._search_pipeline(tokens))
         offset = len(self._prefix)
         return [
@@ -497,6 +505,7 @@ class MongoDBStorage:
         Raises:
             StorageError: If the prefix contains a ``..`` segment, or if the delete fails.
         """
+        await self._require_binary_keys()
         result = await self._collection().delete_many(self._range_for(prefix))
         return int(result.deleted_count)
 
@@ -561,6 +570,11 @@ class MongoDBStorage:
                 absent and ``ensure_indexes`` is ``False``, or if the driver refuses the call. The
                 server's own code and message arrive chained.
         """
+        # Before the index, and this is the one call where the collation is not about the keys: a TTL
+        # index over a date field is unaffected by it. It refuses anyway, because provisioning a
+        # collection that cannot hold this key space is work whose only outcome is a store that fails at
+        # its first write with the index in place.
+        await self._require_binary_keys()
         # No `@_reporting`: that decorator names the method's second positional argument in its
         # message and there is none here, so it would render an empty quoted key. `_indexes.ensure`
         # already turns every driver error into a `StorageError` naming the operation and namespace.
@@ -570,6 +584,37 @@ class MongoDBStorage:
             create=self._config.get("ensure_indexes", True),
             timeout=self._index_ready_timeout,
         )
+
+    async def _require_binary_keys(self) -> None:
+        """Refuse a collection whose collation would not compare this instance's keys byte by byte.
+
+        ``REQ-E-170``, and the reasoning for refusing rather than overriding is on
+        :func:`_indexes.require_binary_comparison`. What this method owns is *when*: before the first
+        operation on a collection, once, rather than at construction or in ``ensure_indexes``.
+
+        Not at construction, because ``__init__`` is synchronous and a store is built in code paths the
+        SDK runs for the user -- making it do a round trip would put a network failure in a constructor
+        that today cannot make one. Not in ``ensure_indexes``, because nothing in this package calls that
+        (``REQ-E-121``) and a guard a caller has to opt into does not guard the caller who did not.
+
+        Deliberately without the connection lock. What it protects is a read with no side effect, so two
+        stores racing on the first operation issue one ``listCollections`` each and reach the same answer,
+        which is cheaper than serialising every store's first operation behind a lock. Adding to a ``set``
+        is atomic, and the answer cannot differ between the two racers.
+
+        A refusal caches nothing, so every later operation asks again and refuses again. That is the
+        intended shape: the collection may be fixed while the process runs, and a store that had cached
+        the refusal would keep reporting a problem that no longer exists.
+
+        Raises:
+            StorageError: If the collection's default collation is not binary, or if reading it fails.
+        """
+        target = (self._database_name, self._collection_name)
+        connection = self._connection
+        if target in connection.binary_keys:
+            return
+        await _indexes.require_binary_comparison(self._collection())
+        connection.binary_keys.add(target)
 
     @property
     def _target(self) -> str:

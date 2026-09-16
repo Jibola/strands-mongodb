@@ -561,7 +561,11 @@ class TestNoRegexTierIsReachable:
     What is testable is the vacuity. ``AT-056d`` pins that neither ``SearchType`` nor
     ``ResolvedSearchType`` admits ``regex``, so no config value and no result value selects the tier.
     These two add that no module emits the operator either, so there is no unselectable back door.
-    ``REQ-E-050`` already stops a caller from smuggling one in through ``filter``, at any depth.
+    ``REQ-E-050`` stops a caller from naming the operator through ``filter``, at any depth, and
+    ``REQ-E-174`` stops the other route to the same matching: a native ``re.Pattern`` or ``bson.Regex``
+    *value*, which ``$match`` dispatches on exactly as it would the operator, without the operator ever
+    being written down. That second half was missing until ``AT-179``; the sentence that used to stand here
+    claimed ``REQ-E-050`` alone was enough, and it measurably was not.
 
     Both fail the day the regex tier lands, which is the day ``re.escape`` has to be there.
     """
@@ -1281,12 +1285,24 @@ class _SetupRecorder:
         fusion_probes: The collection name for each ``$rankFusion`` probe. Separate from ``probes``
             because the count that matters is per probe, not per initialize: ``AT-146``'s zero case is
             a deployment where ``probes`` has one entry and this one must have none.
+        collations: The collection name for each collation preflight, in call order (``AT-176``). Its own
+            list for the same reason ``fusion_probes`` is: what the requirement bounds is how many times
+            *this* call happens, and a count folded into ``probes`` could not tell the two apart.
+        refuse_collation: Whether the preflight should refuse, standing in for a collection created with
+            a case-folding collation.
     """
 
     def __init__(
-        self, *, available: bool = True, failing: frozenset[str] = frozenset(), rank_fusion: bool = False
+        self,
+        *,
+        available: bool = True,
+        failing: frozenset[str] = frozenset(),
+        rank_fusion: bool = False,
+        refuse_collation: bool = False,
     ) -> None:
         self.rank_fusion = rank_fusion
+        self.refuse_collation = refuse_collation
+        self.collations: list[str] = []
         self.fusion_probes: list[str] = []
         self.probes: list[str] = []
         self.ordinary: list[tuple[str, ...]] = []
@@ -1294,6 +1310,30 @@ class _SetupRecorder:
         self.timeouts: list[float | None] = []
         self.failing = failing
         self.available = available
+
+    async def require_binary_comparison(self, collection: Any) -> None:
+        """Stand in for ``_indexes.require_binary_comparison``, the preflight ``AT-176`` added.
+
+        Suspends for the reason :meth:`probe` does. It is also the first thing ``initialize()`` calls, so a
+        fake that returned without yielding would let two concurrent initializes interleave differently
+        here than they do against a deployment.
+
+        Args:
+            collection: The collection being checked. Its name is what is recorded: the requirement is
+                one preflight per collection, not per store.
+
+        Raises:
+            StorageError: If :attr:`refuse_collation`, in the shape the real function raises it -- the
+                word ``collation`` is in the message because callers of this fake assert on it.
+        """
+        self.collations.append(collection.name)
+        await asyncio.sleep(0)
+        if self.refuse_collation:
+            raise StorageError(
+                f"strands_mongodb: the collection appdb.{collection.name} was created with the collation "
+                f"'en', and this package cannot store keys in a collection whose string comparison is "
+                f"not binary."
+            )
 
     async def probe(self, collection: Any) -> _indexes.SearchSupport:
         """Stand in for ``_indexes.search_support``.
@@ -1362,17 +1402,21 @@ def _patch_setup(
     available: bool = True,
     failing: frozenset[str] = frozenset(),
     rank_fusion: bool = False,
+    refuse_collation: bool = False,
 ) -> _SetupRecorder:
-    """Replace both calls ``initialize()`` makes, so it runs to completion with no deployment.
+    """Replace every call ``initialize()`` makes, so it runs to completion with no deployment.
 
     Patched on the module rather than on the store, which is what makes the count meaningful:
-    ``initialize()`` reaches both through ``_indexes`` deliberately, so one store doing the work twice and
-    ten stores doing it once each are both visible here (``AT-065``'s precedent).
+    ``initialize()`` reaches all of them through ``_indexes`` deliberately, so one store doing the work
+    twice and ten stores doing it once each are both visible here (``AT-065``'s precedent).
 
     Args:
         monkeypatch: The fixture, so both patches are undone with the test.
         available: What the capability probe answers.
         failing: Search index names to refuse.
+        refuse_collation: Whether the collation preflight refuses (``AT-176``). Defaults to ``False``,
+            which is what a collection created without a collation reports and therefore what every test
+            written before ``AT-176`` assumed without saying so.
         rank_fusion: What the ``$rankFusion`` probe answers. Defaults to ``False``, which is the one
             place in this file a fake's default deliberately does not match the common deployment:
             Atlas hands out 8.0.23 and would answer ``True``. It is ``False`` here because that is
@@ -1384,7 +1428,10 @@ def _patch_setup(
     Returns:
         The recorder, holding what was asked for once the test has run.
     """
-    recorder = _SetupRecorder(available=available, failing=failing, rank_fusion=rank_fusion)
+    recorder = _SetupRecorder(
+        available=available, failing=failing, rank_fusion=rank_fusion, refuse_collation=refuse_collation
+    )
+    monkeypatch.setattr(_indexes, "require_binary_comparison", recorder.require_binary_comparison)
     monkeypatch.setattr(_indexes, "search_support", recorder.probe)
     monkeypatch.setattr(_indexes, "rank_fusion_support", recorder.probe_fusion)
     monkeypatch.setattr(_indexes, "ensure", recorder.ensure)
@@ -1676,6 +1723,101 @@ class TestWhatInitializeDecides:
 
         assert "'vector'" in str(caught.value)
         assert "embedding_dimensions" in str(caught.value)
+
+
+class TestTheMemoryStoreRefusesACollationThatFoldsCase:
+    """AT-176 / ``REQ-E-170`` — the second surface's half of one preflight, on the field it isolates by.
+
+    ``test_storage.py`` carries the finding and the reasoning. What is different here is the field at
+    stake. The storage surface keeps its namespaces apart in ``_id``; this one keeps its scopes apart in
+    ``scope``, because ``_filter.compose`` pins ``{"scope": self.scope, "store_name": self.name}`` on
+    every read, update and delete. A collation that folds case therefore turns ``scope="tenant-b"`` into a
+    filter that matches documents written under ``Tenant-B``, which is premortem **P-1** — a cross-scope
+    read — arriving through the collection's comparison rules rather than through a caller's filter, and
+    so past every check ``TestEveryCallerInputIsCheckedBeforeTheNetwork`` makes.
+
+    ``initialize()`` is the only place the check needs to be, and that is a claim rather than a
+    convenience: ``search``, ``add`` and both deletes call it first (``AT-045b``), so there is no public
+    coroutine on this surface that reaches the collection without passing through here. The storage
+    surface has no such funnel and needed seven call sites.
+
+    Where in ``initialize()`` is also a claim. It runs before the capability probe and before any
+    ``ensure``, so a refusal leaves no index behind: provisioning a collection that cannot hold the
+    scopes apart is work whose only product is a store that must not be used.
+    """
+
+    async def test_initialize_refuses_and_says_collation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The finding on this surface, and the type is ``StorageError`` because the remedy is the
+        deployment's: no argument to this package can make a folded collection safe."""
+        _patch_setup(monkeypatch, refuse_collation=True)
+        store = _store()
+
+        with pytest.raises(StorageError) as caught:
+            await store.initialize()
+
+        assert "collation" in str(caught.value)
+
+    async def test_the_refusal_precedes_the_probe_and_every_index(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Ordering, which is the part no message can show. A preflight that ran after ``ensure`` would
+        raise the same error having already created three indexes on a collection nothing may use."""
+        recorder = _patch_setup(monkeypatch, refuse_collation=True)
+        store = _store()
+
+        with pytest.raises(StorageError):
+            await store.initialize()
+
+        assert recorder.collations == ["memory"]
+        assert recorder.probes == [], "the capability probe ran on a collection that had been refused"
+        assert recorder.ordinary == []
+        assert recorder.search == []
+
+    async def test_a_collection_that_compares_bytes_is_checked_once_and_then_set_up(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The vacuity guard for the two tests above: they would both pass against an ``initialize()``
+        that refused every collection, and so would every other test in this file that expects a raise."""
+        recorder = _patch_setup(monkeypatch)
+        store = _store()
+
+        await store.initialize()
+
+        assert recorder.collations == ["memory"]
+        assert recorder.ordinary != []
+
+    async def test_a_refusal_is_not_cached_so_the_collection_can_be_fixed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``_initialized`` stays ``False`` through a refusal, so the second call asks again.
+
+        The alternative -- a store that remembers it failed -- would make a fixed deployment need a
+        restarted process, and the flag is set at the end of ``initialize()`` for exactly this reason. The
+        second half of the test is what makes it a claim about caching rather than about one call: the
+        preflight stops refusing, and the same store initializes.
+        """
+        recorder = _patch_setup(monkeypatch, refuse_collation=True)
+        store = _store()
+
+        with pytest.raises(StorageError):
+            await store.initialize()
+        assert store._initialized is False
+
+        recorder.refuse_collation = False
+        await store.initialize()
+
+        assert store._initialized is True
+        assert recorder.collations == ["memory", "memory"]
+
+    async def test_ten_stores_on_one_connection_check_once_between_them(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """One round trip per collection, not per store (``AT-065b``'s precedent, and the reason the cache
+        lives on the connection rather than on the store)."""
+        recorder = _patch_setup(monkeypatch)
+        stores = [_store(name=f"facts{index}") for index in range(10)]
+
+        for store in stores:
+            await store.initialize()
+
+        assert recorder.collations == ["memory"]
+        assert len(recorder.probes) == 1
 
 
 class TestTheHybridTierIsAStatementAboutTwoOthers:

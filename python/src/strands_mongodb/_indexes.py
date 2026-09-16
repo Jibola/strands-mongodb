@@ -175,6 +175,14 @@ a member matching it would be unreachable. ``AT-053d`` asserts the exclusion so 
 _COLLECTION_ABSENT: Final[int] = 26
 """Server error code for a namespace that does not exist. Not an error when reading indexes."""
 
+SIMPLE_LOCALE: Final[str] = "simple"
+"""The one collation locale that compares strings byte by byte, which is what a key space needs.
+
+Every other locale is a language-aware comparison, and every language-aware comparison is a comparison
+this package's ``_id`` key model cannot be built on: see :func:`require_binary_comparison`. Public
+because ``AT-176`` asserts against it and the refusal message names it.
+"""
+
 Readiness = Literal["ready", "building", "failed"]
 """The three states ``REQ-E-062`` distinguishes, because the remedy differs between them."""
 
@@ -664,6 +672,92 @@ async def search_support(collection: AsyncCollection[Any]) -> SearchSupport:
     return SearchSupport(available=True)
 
 
+async def default_collation(collection: AsyncCollection[Any]) -> dict[str, Any] | None:
+    """Report the collection's default collation, or ``None`` when it has none.
+
+    ``listCollections`` filtered to one name, which is the only way to ask: a collation is fixed at
+    creation and lives in the collection's options, and nothing on ``AsyncCollection`` carries it. The
+    filter is not an optimisation -- an unfiltered call reads every collection in the database to answer
+    a question about one, and on a database an application shares that is a listing it has no business
+    producing.
+
+    Args:
+        collection: The collection to ask about. Need not exist.
+
+    Returns:
+        The collation document the server reports, or ``None`` if the collection has no collation or does
+        not exist yet. The two are the same answer here on purpose: a collection this package creates
+        implicitly is created without one.
+
+        Measured on 8.0.32, because the shape is the whole contract of this function and it is not
+        derivable from the documentation: a collection created with ``{locale: "en", strength: 2}`` is
+        reported with the resolved ten-field document under ``options.collation``, and a collection
+        created with ``{locale: "simple"}`` is reported with ``options`` **empty**. The server does not
+        store a simple collation, so on that version the only collation this ever returns is one worth
+        refusing. :func:`require_binary_comparison` still admits ``simple`` explicitly, for a server that
+        reports what it was asked for.
+
+    Raises:
+        StorageError: If the call fails. Unlike :func:`search_support` there is no code to forgive: an
+            absent collection is an empty result rather than an error, so anything that arrives here is
+            a real failure and reporting the collection as uncollated would be reporting a guess.
+    """
+    try:
+        cursor = await collection.database.list_collections(filter={"name": collection.name})
+        async for document in cursor:
+            options = document.get("options") or {}
+            collation = options.get("collation")
+            return dict(collation) if collation is not None else None
+    except PyMongoError as error:
+        raise StorageError(
+            f"strands_mongodb: reading the collation of {collection.database.name}.{collection.name} failed: {error}"
+        ) from error
+    return None
+
+
+async def require_binary_comparison(collection: AsyncCollection[Any]) -> None:
+    """Refuse a collection whose default collation is not binary (``REQ-E-170``).
+
+    A collation is a property of the collection, and every query against that collection inherits it
+    unless it names another. This package's key space is one document per key with the key in ``_id``, so
+    equality on a key, the range bounds behind a prefix scan, and the uniqueness of ``_id_`` are all
+    string comparisons it does not choose. Under a case-folding collation a namespaced read matches
+    another namespace's document, a prefix delete removes it, and two keys that differ only in case stop
+    being two keys -- so the refusal here is about isolation and about the key model, not about ordering.
+
+    Overriding per query was the alternative and it is worse. ``collation={"locale": "simple"}`` on each
+    call restores binary matching and makes the ``_id`` index unusable for it, turning the two operations
+    the key layout exists to keep on that index -- ``list`` and ``delete_prefix`` -- into collection
+    scans; and ``_id_`` is the one index whose collation cannot be chosen, so the uniqueness would stay
+    folded and a legitimate second key would arrive as a duplicate. A collection like this cannot host
+    this key space, and saying so once is more use than working incorrectly in a way that reads as
+    working.
+
+    Args:
+        collection: The collection about to be operated on.
+
+    Raises:
+        StorageError: If the collection has a collation whose locale is not
+            :data:`SIMPLE_LOCALE`, naming the locale found and the remedy.
+    """
+    collation = await default_collation(collection)
+    if collation is None or collation.get("locale") == SIMPLE_LOCALE:
+        return
+    namespace = f"{collection.database.name}.{collection.name}"
+    raise StorageError(
+        f"strands_mongodb: the collection {namespace} was created with the collation "
+        f"{collation.get('locale')!r}, and this package cannot store keys in a collection whose string "
+        f"comparison is not binary. Keys live in '_id': a read is an equality match on it, a prefix "
+        f"listing is a range over it, and a namespace is part of it, so a collation that folds case or "
+        f"accents lets one namespace read and delete another's documents, and makes two keys differing "
+        f"only in case collide on the unique '_id' index. A collation cannot be changed in place. Point "
+        f"this store at a collection created without one -- the 'collection' argument -- or recreate "
+        f"this one with db.createCollection({collection.name!r}) and no collation, or with "
+        f"{{collation: {{locale: {SIMPLE_LOCALE!r}}}}}, which is binary comparison stated explicitly. "
+        f"Reported: {collation!r}."
+    )
+
+
 async def rank_fusion_support(collection: AsyncCollection[Any]) -> bool:
     """Report whether this deployment can run ``$rankFusion`` (``REQ-E-143``).
 
@@ -1049,6 +1143,10 @@ async def _wait_until_ready(
 
     Transitions are logged as they happen. A two-minute wait with no output reads as a hang, and the
     status is the only thing that distinguishes a slow build from a stuck one.
+
+    Readiness is a claim about two things, so both are checked before an index leaves ``pending``: the
+    status the server reports, and the definition it reports alongside it (``REQ-E-175``). See the
+    comment on the ``ready`` branch for what drifts and how.
     """
     deadline = time.monotonic() + timeout
     pending = {spec.name: spec for spec in specs}
@@ -1071,6 +1169,24 @@ async def _wait_until_ready(
                 # document, so the fallback below is for the type checker rather than for a caller.
                 raise StorageError(_failed_message(collection.name, namespace, pending[name], document or {}))
             if state == "ready":
+                # Rechecked here, and not only on the cold read before the poll began
+                # (``REQ-E-175``). The status is not the whole answer: a definition that was right when
+                # the wait started can be wrong when it ends, because a search index cannot be redefined
+                # in place but it can be dropped and recreated, and mongot will happily build the
+                # replacement under the same name while this loop watches the name rather than the
+                # definition. Two ways in, both measured against the fake:
+                #
+                # * an index found BUILDING with a covering definition, dropped and recreated by another
+                #   actor mid-build, reporting READY with a definition that no longer covers this
+                #   package's;
+                # * an index this package created itself one call earlier, whose build was never checked
+                #   against what was asked for at all -- the cold read found nothing, so
+                #   ``_ensure_search`` had no document to check and never got another.
+                #
+                # Accepting either ships premortem **P-2** with the loudest symptom removed: searches run,
+                # return nothing or the wrong thing, and every index reports READY. One extra containment
+                # check over a document already in hand is the whole cost; there is no additional read.
+                _check_definition(collection.name, namespace, pending[name], document or {})
                 del pending[name]
 
         if not pending:

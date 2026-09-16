@@ -115,17 +115,48 @@ class FakeAggregationCursor:
 
 
 class FakeStorageDatabase:
-    """The database half of the fake, which exists for one attribute: ``name``.
+    """The database half of the fake: ``name``, and the one call that reads collection options.
 
     ``_indexes._ensure_ordinary`` builds its namespace from ``collection.database.name`` and puts it in
     every message it raises, so a fake without this raises ``AttributeError`` from inside the module
     under test rather than the ``StorageError`` the requirement describes. Unlike ``test_indexes.py``'s
     version there is no ``create_collection`` here: that call belongs to the search path, and the
     storage collection has no search index at all.
+
+    ``list_collections`` answers the collation preflight (``REQ-E-170``). Its default is a collection
+    created without a collation, which is what the server reports for one nobody asked to be different
+    and what every other test in this file is written against: the preflight has to be invisible to them
+    or it is a preflight that changed what it was guarding.
     """
 
-    def __init__(self, *, name: str = "appdb") -> None:
+    def __init__(
+        self, *, name: str = "appdb", collation: Mapping[str, Any] | None = None, absent: bool = False
+    ) -> None:
         self.name = name
+        #: What ``listCollections`` puts in ``options.collation``. ``None`` is a collection with no
+        #: collation at all, which is the absence of the key rather than a ``simple`` locale in it.
+        self.collation = dict(collation) if collation is not None else None
+        #: A collection that does not exist yet, which ``listCollections`` answers with no documents.
+        self.absent = absent
+        self.list_collections_filters: list[dict[str, Any]] = []
+
+    async def list_collections(self, filter: Mapping[str, Any] | None = None) -> FakeAggregationCursor:
+        """Report this collection's creation options, the way ``listCollections`` does.
+
+        ``async def`` returning the cursor, not a cursor directly: ``AsyncDatabase.list_collections`` is
+        a coroutine and ``MP-001`` pins the direction, because getting it wrong is ``AttributeError`` on
+        a coroutine against the driver and silently fine against a looser fake.
+        """
+        self.list_collections_filters.append(dict(filter or {}))
+        if self.absent:
+            return FakeAggregationCursor(())
+        options = {"collation": dict(self.collation)} if self.collation is not None else {}
+        return FakeAggregationCursor([{"name": dict(filter or {}).get("name", "storage"), "options": options}])
+
+    @property
+    def list_collections_calls(self) -> int:
+        """How many times the preflight asked, which is the claim about caching rather than about YAML."""
+        return len(self.list_collections_filters)
 
 
 class FakeStorageCollection:
@@ -1382,6 +1413,201 @@ class TestNoOrdinaryOperationTouchesAnIndex:
         }
 
 
+#: Every public coroutine that touches the key space, with arguments enough to reach its first round
+#: trip. Used two ways below: as the walk, and as its own vacuity guard, since a walk over a list nobody
+#: maintains is a walk that silently stops covering the class.
+#:
+#: ``close`` is the one public coroutine deliberately absent. It releases a connection and reads no key,
+#: and a store that could not be closed because its collection has the wrong collation would leak the
+#: pool it was refusing to use -- a preflight is not worth a resource leak in the teardown path.
+_KEY_OPERATIONS: Final[dict[str, tuple[Any, ...]]] = {
+    "write": ("k", b"v"),
+    "read": ("k",),
+    "delete": ("k",),
+    "list": ("",),
+    "search": ("q",),
+    "delete_prefix": ("",),
+    "ensure_indexes": (),
+}
+
+#: A collation that folds case, which is the one this package cannot host a key space on. ``strength: 2``
+#: is what makes it fold: level 1 is base letters, 2 adds accents, 3 adds case, so anything below 3
+#: compares ``A`` and ``a`` equal. Spelled the way ``listCollections`` reports it rather than the way a
+#: caller writes it, because what the preflight reads is the server's resolved document.
+_CASE_INSENSITIVE: Final[dict[str, Any]] = {
+    "locale": "en",
+    "caseLevel": False,
+    "caseFirst": "off",
+    "strength": 2,
+    "numericOrdering": False,
+    "alternate": "non-ignorable",
+    "maxVariable": "punct",
+    "normalization": False,
+    "backwards": False,
+    "version": "57.1",
+}
+
+
+class TestAKeySpaceNeedsACollectionThatComparesBytes:
+    """``AT-176`` / ``REQ-E-170`` -- every key operation inherits the collection's collation.
+
+    This package's whole key model is one document per key with the key in ``_id``: ``read`` is an
+    equality match on it, ``list`` and ``delete_prefix`` are a range over it, and ``namespace()`` scopes
+    by making the prefix part of it. All three of those are string comparisons, and none of them chooses
+    how strings compare. The collection does, through the default collation it was created with, and
+    every query inherits it unless it names another.
+
+    On a collection created with a case-folding collation the consequences are not subtle and not
+    contained:
+
+    * ``namespace("tenant-a").read("private")`` matches a document written as ``Tenant-A/private``,
+      because the equality is no longer binary. That is a cross-namespace read, and namespacing is the
+      only isolation this class offers.
+    * ``namespace("tenant-a").delete_prefix("")`` is ``{"_id": {"$gte": "tenant-a/", "$lt": "tenant-a0"}}``
+      and those bounds are compared the same folded way, so it removes the other namespace's documents.
+    * The ``_id`` index is unique and it also inherits the collation, so ``write("A")`` after ``write("a")``
+      stops being a second key and becomes a duplicate. The key space does not merely leak, it collapses.
+
+    **Why refusing rather than overriding.** Passing ``collation={"locale": "simple"}`` on each query
+    would restore binary comparison for the matching, and was rejected for two reasons that are not
+    stylistic. A query whose collation differs from the collection's cannot use the ``_id`` index, so
+    ``list`` and ``delete_prefix`` -- the two operations the ``_id`` key layout exists to keep on that
+    index -- would become collection scans. And it fixes nothing about uniqueness: ``_id_`` is the one
+    index whose collation cannot be chosen, so ``write("A")`` and ``write("a")`` would still collide,
+    now with a ``DuplicateKeyError`` from a call that had done everything right. A collection like this
+    cannot host this key space, so the honest move is to say so at the first operation rather than to
+    half-fix it.
+
+    Reported by a production-readiness review as its one P1, against ``storage.py:337`` and
+    ``storage.py:500``. Confirmed by reading: there was no ``collation`` anywhere in the module.
+    """
+
+    def _refusing(self) -> tuple[MongoDBStorage, FakeStorageCollection]:
+        """A store over a collection whose reported collation folds case."""
+        collection = FakeStorageCollection(database=FakeStorageDatabase(collation=_CASE_INSENSITIVE))
+        return unit_storage(collection), collection
+
+    def test_the_walk_covers_every_public_coroutine_that_touches_a_key(self) -> None:
+        """AT-176 -- the vacuity guard, and the one exclusion, asserted rather than assumed."""
+        public = {
+            name
+            for name, member in inspect.getmembers(MongoDBStorage, inspect.iscoroutinefunction)
+            if not name.startswith("_")
+        }
+        assert public == set(_KEY_OPERATIONS) | {"close"}, (
+            f"the walk below covers {sorted(_KEY_OPERATIONS)} and excludes 'close', but the class now has "
+            f"{sorted(public)}. A new public coroutine either takes the preflight or is listed here as "
+            f"deliberately outside it"
+        )
+
+    @pytest.mark.parametrize("operation", sorted(_KEY_OPERATIONS))
+    async def test_every_operation_refuses_the_collection(self, operation: str) -> None:
+        """AT-176 -- the finding, once per operation the reviewer's two line numbers stand for."""
+        storage, collection = self._refusing()
+        with pytest.raises(StorageError) as error:
+            await getattr(storage, operation)(*_KEY_OPERATIONS[operation])
+        assert "collation" in str(error.value)
+        assert collection.names_called == [], (
+            f"{operation}() refused, but only after issuing {collection.names_called}. The preflight has "
+            f"to come before the operation or the operation it was protecting has already run"
+        )
+
+    async def test_a_collection_with_no_collation_is_accepted(self) -> None:
+        """AT-176 -- the negative case, which is every collection anybody has."""
+        collection = FakeStorageCollection()
+        storage = unit_storage(collection)
+        await storage.write("k", b"v")
+        assert await storage.read("k") == b"v"
+
+    async def test_the_simple_locale_is_accepted(self) -> None:
+        """AT-176 -- ``simple`` *is* binary comparison, so it is the one locale that passes.
+
+        Measured on 8.0.32: a collection created with ``{locale: "simple"}`` is reported with ``options``
+        empty, so the server does not store it and this shape does not arrive from that version. The
+        branch is admitted anyway, and this test is what keeps it honest rather than dead: a server that
+        reported what it was asked for would otherwise have its correctly-configured collection refused,
+        and the check would be reading for the key's absence while claiming to read the locale.
+        """
+        collection = FakeStorageCollection(database=FakeStorageDatabase(collation={"locale": "simple"}))
+        storage = unit_storage(collection)
+        await storage.write("k", b"v")
+        assert await storage.read("k") == b"v"
+
+    async def test_a_collection_that_does_not_exist_yet_is_accepted(self) -> None:
+        """AT-176 -- nothing to inherit.
+
+        ``listCollections`` answers with no documents, and the collection this package goes on to create
+        implicitly is created without a collation. Refusing here would make a first write to an empty
+        database fail, which is the ordinary way this package is used.
+        """
+        collection = FakeStorageCollection(database=FakeStorageDatabase(absent=True))
+        storage = unit_storage(collection)
+        await storage.write("k", b"v")
+        assert await storage.read("k") == b"v"
+
+    async def test_the_preflight_is_one_round_trip_per_collection(self) -> None:
+        """AT-176 -- cached on the connection, so this is not a round trip per operation.
+
+        Six operations, one ``listCollections``. The cache is keyed by database and collection and lives
+        on the connection rather than on the store, because N stores over one collection share the answer
+        and the collation of a collection cannot be changed in place.
+        """
+        database = FakeStorageDatabase()
+        collection = FakeStorageCollection(database=database)
+        storage = unit_storage(collection)
+        for operation, arguments in _KEY_OPERATIONS.items():
+            await getattr(storage, operation)(*arguments)
+        assert database.list_collections_calls == 1, (
+            f"{len(_KEY_OPERATIONS)} operations asked {database.list_collections_calls} times. The "
+            f"preflight is cached per collection, not per call"
+        )
+        assert database.list_collections_filters == [{"name": collection.name}], (
+            "the preflight has to name the one collection it is about: an unfiltered listCollections "
+            "reads every collection in the database to answer a question about one"
+        )
+
+    async def test_a_second_store_on_the_same_collection_does_not_ask_again(self) -> None:
+        """AT-176 -- the cache is on the connection, which is the claim the ``namespace()`` case rests on.
+
+        A namespaced store is a second ``MongoDBStorage`` over the same collection (``REQ-E-039``), so a
+        cache on the instance would ask once per namespace. Both stores here share a config, and so share
+        the registry entry the answer is cached on.
+        """
+        database = FakeStorageDatabase()
+        collection = FakeStorageCollection(database=database)
+        storage = unit_storage(collection)
+        await storage.read("k")
+        scoped = storage.namespace("tenant-a")
+        scoped._collection = lambda: collection  # type: ignore[assignment, return-value]
+        await scoped.read("k")
+        assert database.list_collections_calls == 1
+
+    async def test_the_refusal_says_what_is_wrong_and_what_to_do(self) -> None:
+        """AT-176 -- the message, which is the whole remedy a reader gets.
+
+        Naming the locale matters as much as naming the collection: an operator looking at a refusal has
+        to be able to tell a collation somebody chose on purpose from one a framework created for them.
+        """
+        storage, _ = self._refusing()
+        with pytest.raises(StorageError) as error:
+            await storage.read("k")
+        message = str(error.value)
+        assert "appdb.storage" in message, "the refusal has to name the collection it is about"
+        assert "'en'" in message or '"en"' in message, "the refusal has to name the locale it found"
+        assert "simple" in message, "the refusal has to name what would be acceptable"
+        assert "cannot be changed" in message, (
+            "a collation cannot be altered in place, so a reader told only 'fix the collation' has been "
+            "sent to look for a command that does not exist"
+        )
+
+    async def test_the_refusal_does_not_stop_the_store_being_closed(self) -> None:
+        """AT-176 -- the exclusion, exercised rather than only documented in ``_KEY_OPERATIONS``."""
+        storage, _ = self._refusing()
+        with pytest.raises(StorageError):
+            await storage.read("k")
+        await storage.close()
+
+
 class TestTheFakeMatchesTheDriver:
     """MP-001 — the parity contract for ``FakeStorageCollection`` and ``FakeCursor``.
 
@@ -1468,6 +1694,24 @@ class TestTheFakeMatchesTheDriver:
         """
         assert isinstance(self._collection_class().database, property)
         assert FakeStorageCollection().database.name == "appdb"
+
+    def test_list_collections_is_a_coroutine_on_the_database_on_both(self) -> None:
+        """``REQ-E-170``'s preflight, and the third instance of the trap this class exists for.
+
+        ``AsyncDatabase.list_collections`` is a coroutine returning a cursor -- ``aggregate``'s shape, and
+        the opposite of ``find`` -- so the cursor arrives from the ``await`` and not from iterating the
+        call. Against a fake that handed the cursor back directly, ``async for`` over the un-awaited call
+        is a ``TypeError`` on a deployment and silently fine here, which is ``MP-001`` exactly.
+
+        The ``filter`` keyword is bound rather than assumed. An unfiltered ``listCollections`` would
+        answer the same question by reading every collection in the database, and if the keyword were
+        misspelled that is silently what this would do.
+        """
+        from pymongo.asynchronous.database import AsyncDatabase
+
+        assert inspect.iscoroutinefunction(AsyncDatabase.list_collections)
+        assert inspect.iscoroutinefunction(FakeStorageDatabase.list_collections)
+        inspect.signature(AsyncDatabase.list_collections).bind(None, filter={"name": "storage"})
 
     def test_the_delete_result_carries_the_attribute_delete_prefix_reads(self) -> None:
         """``REQ-E-031`` returns a count, and ``DeleteResult.deleted_count`` is where it comes from."""
@@ -2056,3 +2300,115 @@ class TestEnsureIndexesAgainstARealDeployment:
                 await asyncio.sleep(self.EXPIRY_POLL_SECONDS)
         finally:
             await storage.close()
+
+
+@pytest.mark.contract
+class TestACaseFoldingCollectionAgainstARealDeployment:
+    """AT-176 / ``REQ-E-170`` — boundary **B-1**. The refusal, and what it is refusing, measured.
+
+    The unit tier above asserts that a reported collation stops every operation. This asserts that the
+    report is real and that what it predicts is real, because both halves were assumptions when the
+    finding arrived: that ``listCollections`` puts the collation in ``options.collation``, and that a
+    case-folding one does to a key space what the refusal says it does.
+
+    Measured here on whatever the contract tier is pointed at, and recorded from 8.0.32 while writing it:
+
+    * a collection created ``{locale: "en", strength: 2}`` reports the resolved ten-field document, and
+      one created ``{locale: "simple"}`` reports ``options`` **empty** -- the server does not store a
+      simple collation, which is why the check reads for a locale that is not ``simple`` rather than for
+      the key's presence;
+    * ``find_one({"_id": "tenant-a/private"})`` returns the document written as ``Tenant-A/private``;
+    * a second insert of ``tenant-a/private`` beside it is a ``DuplicateKeyError``, so the unique ``_id``
+      index folds too and two keys differing only in case are one key;
+    * ``{"$gte": "tenant-a/", "$lt": "tenant-a0"}`` -- the bounds ``delete_prefix`` builds -- matches
+      ``Tenant-A/private``.
+
+    The last three are the cross-namespace read, the collapsed key space and the cross-namespace delete,
+    in the driver rather than in a paragraph. They run against the raw collection deliberately: a
+    ``MongoDBStorage`` over it refuses, which is the point, so demonstrating what it is refusing needs the
+    collection underneath.
+    """
+
+    FOLDING: Final[dict[str, Any]] = {"locale": "en", "strength": 2}
+
+    @pytest.fixture
+    async def folded_collection(self, contract_database: Any, unique_collection_name: str) -> Any:
+        """A collection created with a case-folding collation, in this test's own namespace."""
+        await contract_database.create_collection(unique_collection_name, collation=self.FOLDING)
+        return contract_database[unique_collection_name]
+
+    async def test_the_server_reports_the_collation_where_the_preflight_reads_it(self, folded_collection: Any) -> None:
+        """AT-176 — the premise the whole check rests on, asserted against the server."""
+        collation = await _indexes.default_collation(folded_collection)
+
+        assert collation is not None, "listCollections did not report the collation the collection was made with"
+        assert collation["locale"] == "en"
+        assert collation["strength"] == 2
+
+    async def test_an_uncollated_collection_reports_nothing(
+        self, contract_database: Any, unique_collection_name: str
+    ) -> None:
+        """AT-176 — the negative, and the vacuity guard for the test above: a check that reported a
+        collation for every collection would pass that one and refuse every store anybody has."""
+        await contract_database.create_collection(f"{unique_collection_name}_plain")
+
+        assert await _indexes.default_collation(contract_database[f"{unique_collection_name}_plain"]) is None
+
+    async def test_an_explicit_simple_collation_is_not_stored_by_the_server(
+        self, contract_database: Any, unique_collection_name: str
+    ) -> None:
+        """AT-176 — measured on 8.0.32 and asserted rather than remembered, because it is the reason the
+        unit tier's ``simple`` case cannot be reached from a deployment."""
+        await contract_database.create_collection(f"{unique_collection_name}_simple", collation={"locale": "simple"})
+
+        assert await _indexes.default_collation(contract_database[f"{unique_collection_name}_simple"]) is None
+
+    async def test_a_store_over_it_refuses_before_writing_anything(
+        self, contract_uri: str, test_database_name: str, folded_collection: Any
+    ) -> None:
+        """AT-176 — the finding, end to end: a real store, a real collection, no write."""
+        config: MongoDBConfig = {"connection_string": contract_uri, "database": test_database_name}
+        storage = MongoDBStorage(config, collection=folded_collection.name)
+        try:
+            with pytest.raises(StorageError) as error:
+                await storage.write("k", b"v")
+            assert "collation" in str(error.value)
+            assert await folded_collection.count_documents({}) == 0, (
+                "the store refused and wrote anyway, which means the preflight ran after the write"
+            )
+        finally:
+            await storage.close()
+
+    async def test_the_equality_a_namespaced_read_issues_crosses_the_namespace(self, folded_collection: Any) -> None:
+        """AT-176 — what the refusal is refusing, first of three. This is the cross-tenant read."""
+        await folded_collection.insert_one({"_id": "Tenant-A/private", "data": b"secret"})
+
+        found = await folded_collection.find_one({"_id": "tenant-a/private"})
+
+        assert found is not None, (
+            "if this passes as None the deployment does not fold case and this whole class is checking "
+            "something the server no longer does"
+        )
+        assert found["_id"] == "Tenant-A/private"
+
+    async def test_two_keys_differing_only_in_case_collide_on_the_id_index(self, folded_collection: Any) -> None:
+        """AT-176 — second of three, and the one the review did not name. The ``_id`` index is unique and
+        its collation cannot be chosen, so the key space does not merely leak across namespaces: it
+        collapses, and a legitimate second key arrives as a duplicate."""
+        from pymongo.errors import DuplicateKeyError
+
+        await folded_collection.insert_one({"_id": "tenant-a/private", "data": b"one"})
+
+        with pytest.raises(DuplicateKeyError):
+            await folded_collection.insert_one({"_id": "Tenant-A/private", "data": b"two"})
+
+    async def test_the_range_bounds_a_prefix_delete_builds_cross_the_namespace(self, folded_collection: Any) -> None:
+        """AT-176 — third of three. The bounds are the ones ``_range_for`` produces for ``tenant-a``."""
+        await folded_collection.insert_one({"_id": "Tenant-A/private", "data": b"secret"})
+
+        matched = [
+            document["_id"]
+            async for document in folded_collection.find({"_id": {"$gte": "tenant-a/", "$lt": "tenant-a0"}})
+        ]
+
+        assert matched == ["Tenant-A/private"]
