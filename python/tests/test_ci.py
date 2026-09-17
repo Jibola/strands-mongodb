@@ -2047,6 +2047,90 @@ class TestSomethingInstallsTheFloorsThePackageShips:
         )
 
 
+def _typecheck_script() -> str:
+    """The name of the hatch script that runs mypy, read from the scripts table rather than assumed.
+
+    Found by what the script does, for the same reason ``_floor_job`` finds a job that way: the name
+    ``typecheck`` is a convention and renaming it should change this file not at all.
+
+    Returns:
+        The script's key.
+    """
+    scripts = _pyproject()["tool"]["hatch"]["envs"]["default"]["scripts"]
+    running = sorted(str(name) for name, body in scripts.items() if "mypy" in str(body))
+
+    assert running, f"no hatch script runs mypy, so nothing here can find the type checker: {sorted(scripts)}"
+    return running[0]
+
+
+def _typecheck_jobs(workflow: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Every job that runs that script, keyed by job name.
+
+    Args:
+        workflow: The parsed workflow.
+
+    Returns:
+        The jobs, which is more than one: linting type-checks the tree and the SDK-compatibility job
+        type-checks the Protocol assignment against an upgraded SDK.
+    """
+    script = _typecheck_script()
+    return {name: job for name, job in workflow["jobs"].items() if f"hatch run {script}" in _job_text(job)}
+
+
+class TestTheTypeCheckerAnalysesTheFloorAndRunsOnIt:
+    """``AT-189`` / ``REQ-E-184`` -- two declarations about the oldest interpreter, and neither was checked.
+
+    ``mypy`` analyses whatever ``[tool.mypy].python_version`` names, on whatever interpreter the job
+    installed, and those are two separate numbers that both mean "the floor" today. Nothing compared
+    either of them to ``requires-python``. Raising the floor and leaving one behind analyses a version the
+    package no longer claims; lowering it and leaving one ahead ships a floor nothing analyses. Both are
+    silent, and one of them is silent in a job whose whole purpose is a type-check.
+
+    The interpreter matters as well as the target because dependency stubs come from the interpreter that
+    installed them: the manifest's ``tomli`` entry is unmarked precisely so a checker analysing 3.10 finds
+    the parser it would import there, and that only holds while the job runs the version it analyses.
+    """
+
+    def test_the_manifest_declares_a_version_to_analyse(self) -> None:
+        """``AT-189`` -- the vacuity guard. With no target configured, mypy uses the running interpreter."""
+        assert "python_version" in _pyproject()["tool"]["mypy"], (
+            "pyproject.toml configures no `[tool.mypy].python_version`, so the analysis target is whichever "
+            "interpreter the job happened to install and the two tests below compare nothing"
+        )
+
+    def test_the_type_checker_analyses_the_declared_floor(self) -> None:
+        """``AT-189`` -- the floor is a support claim, and a checker aimed elsewhere never tests it."""
+        declared = str(_pyproject()["project"]["requires-python"])
+        oldest = declared.removeprefix(">=").strip()
+        target = str(_pyproject()["tool"]["mypy"]["python_version"])
+
+        assert target == oldest, (
+            f"mypy analyses {target} and pyproject.toml declares requires-python {declared!r}. A syntax or "
+            f"a typing feature the floor does not have passes the type check and fails on install"
+        )
+
+    def test_every_job_that_type_checks_runs_on_that_version(self, workflow: dict[str, Any]) -> None:
+        """``AT-189`` -- found by behaviour, so a third job that type-checks is covered the day it lands."""
+        target = str(_pyproject()["tool"]["mypy"]["python_version"])
+        jobs = _typecheck_jobs(workflow)
+        assert len(jobs) >= 2, (
+            f"found {sorted(jobs)} running the type checker, and there were two when this was written: "
+            f"linting and SDK compatibility. A matcher that resolves nothing reports a clean result"
+        )
+
+        for name, job in sorted(jobs.items()):
+            versions = [
+                str(step["with"]["python-version"])
+                for step in job.get("steps", [])
+                if isinstance(step.get("with"), dict) and "python-version" in step["with"]
+            ]
+            running = versions or ["whatever the runner defaults to"]
+            assert versions == [target], (
+                f"job {name!r} runs the type checker on Python {running} while mypy analyses {target}; the "
+                f"stubs a checker resolves are the interpreter's, not the target's"
+            )
+
+
 #: Which contexts GitHub makes available at each job-level key, transcribed from the "Context
 #: availability" table in the Actions documentation. Only the keys these two workflows actually put an
 #: expression under are listed, and a key that is missing fails this gate rather than passing it: the
