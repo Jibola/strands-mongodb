@@ -758,6 +758,104 @@ class TestOrdinaryIndexesAgainstAFake:
         return next(spec for spec in _indexes.memory_specs() if spec.options.get("unique"))
 
 
+class TestAMatchedIndexWhoseCollationFoldsCaseIsRefused:
+    """AT-193 / ``REQ-E-187`` — the gap ``AT-176``'s collection-level preflight leaves open.
+
+    The preflight reads the *collection's* default collation, and an index carries its own: a collection
+    with none at all, which passes the preflight, can hold a unique index created
+    ``{locale: "en", strength: 2}``. That index is what the dedup rule is enforced by, so the rule it
+    enforces is the folded one -- ``Remember X`` and ``remember x`` hash to different values, match the
+    same index entry, and the second write is a duplicate of a memory it is not a duplicate of.
+
+    Measured on ``mongod`` 7.0.12 rather than reasoned: the second ``add`` came back
+    ``ids=[], inserted=0, duplicates=1`` with tenant A's content left in place and tenant B's never
+    stored. It is not a reporting quirk, because ``_existing()`` re-queries with the binary selector and
+    a collated index cannot serve that query -- so the caller is told the memory was already there and
+    nothing can find it.
+
+    The rule is checked here rather than added to ``IndexSpec.options`` because the server does not store
+    a simple collation (``AT-176`` measured that, and so does the contract tier): an ``options`` entry of
+    ``{"collation": {"locale": "simple"}}`` would find ``collation`` absent on every correct index and
+    refuse every deployment that has one.
+    """
+
+    @staticmethod
+    def _dedup_spec() -> _indexes.IndexSpec:
+        """The unique partial index the dedup constraint rests on, which is what this finding is about."""
+        return next(spec for spec in _indexes.memory_specs() if spec.options.get("unique"))
+
+    def _matched(self, **collation: Any) -> Any:
+        """A collection holding an index that matches the dedup spec exactly but for its collation."""
+        dedup = self._dedup_spec()
+        return FakeAsyncCollection(indexes={"theirs": existing(*dedup.keys, **dedup.options, **collation)})
+
+    async def test_an_index_reporting_a_folding_collation_is_refused(self) -> None:
+        """The finding. Every option matches, so ``_check_options`` passes it, and it must still fail."""
+        from strands.types.exceptions import StorageError
+
+        collection = self._matched(collation={"locale": "en", "strength": 2})
+
+        with pytest.raises(StorageError) as caught:
+            await _indexes.ensure(collection, ordinary=[self._dedup_spec()], create=True)
+
+        assert "collation" in str(caught.value)
+
+    async def test_the_message_names_the_locale_and_the_index_and_the_remedy(self) -> None:
+        """The same standard ``_check_options`` is held to: whoever reads this has to decide whether the
+        index is theirs, and that decision needs the locale it was built with and the command to drop it."""
+        from strands.types.exceptions import StorageError
+
+        collection = self._matched(collation={"locale": "en", "strength": 2})
+
+        with pytest.raises(StorageError) as caught:
+            await _indexes.ensure(collection, ordinary=[self._dedup_spec()], create=True)
+
+        message = str(caught.value)
+        assert "'en'" in message
+        assert "theirs" in message
+        assert "dropIndex" in message
+
+    async def test_nothing_is_created_on_the_way_to_the_refusal(self) -> None:
+        """``create=True`` cannot resolve this one either: a second index over those keys is code 85, and
+        dropping somebody else's is not this package's decision (``REQ-E-063``'s standing rule)."""
+        from strands.types.exceptions import StorageError
+
+        collection = self._matched(collation={"locale": "en", "strength": 2})
+
+        with pytest.raises(StorageError):
+            await _indexes.ensure(collection, ordinary=[self._dedup_spec()], create=True)
+
+        assert collection.created_indexes == []
+
+    async def test_an_index_reporting_a_simple_collation_is_accepted(self) -> None:
+        """The first vacuity guard. A rule that refused every reported collation would pass all three
+        tests above and refuse the deployments that spell the safe answer out."""
+        collection = self._matched(collation={"locale": "simple"})
+
+        await _indexes.ensure(collection, ordinary=[self._dedup_spec()], create=True)
+
+        assert collection.created_indexes == []
+
+    async def test_an_index_reporting_no_collation_at_all_is_accepted(self) -> None:
+        """The second, and the one that matters most: this is what every correct index reports, because
+        the server does not store a simple collation. A rule reading absence as a mismatch would refuse
+        every deployment in existence."""
+        collection = self._matched()
+
+        await _indexes.ensure(collection, ordinary=[self._dedup_spec()], create=True)
+
+        assert collection.created_indexes == []
+
+    async def test_a_missing_index_is_still_created_rather_than_inspected(self) -> None:
+        """The third. The rule is about an index that is *there*; an absent one has no collation to read
+        and the creation path must stay reachable."""
+        collection: Any = FakeAsyncCollection()
+
+        await _indexes.ensure(collection, ordinary=[self._dedup_spec()], create=True)
+
+        assert len(collection.created_indexes) == 1
+
+
 def search_states(name: str, *statuses: str, definition: Mapping[str, Any] | None = None) -> Any:
     """Program a search index's successive ``list_search_indexes`` reads from a status sequence.
 
@@ -1804,6 +1902,98 @@ class TestTheFakesMatchTheDriver:
         from pymongo.asynchronous.database import AsyncDatabase
 
         return AsyncCollection if owner == "AsyncCollection" else AsyncDatabase
+
+
+@pytest.mark.contract
+class TestACollatedIndexAgainstARealDeployment:
+    """AT-193 / ``REQ-E-187`` — boundary **B-1**. The premise, and what the refusal is refusing.
+
+    Two things were assumptions when the finding arrived, and both are asserted here rather than
+    reasoned about: that ``index_information`` reports an index's own collation at all -- without which
+    the rule is unimplementable client-side and would need a round trip nobody has -- and that a folded
+    unique index does to the dedup rule what the refusal says it does.
+
+    Measured from 7.0.12 while writing it. The collision is the whole finding: the second insert of a
+    key differing only in case is an ``E11000`` against an index that *should* hold both, and the binary
+    query that would find the existing one cannot use a collated index, so the caller is told the record
+    is already there and no later read can produce it.
+    """
+
+    FOLDING: Final[dict[str, Any]] = {"locale": "en", "strength": 2}
+
+    async def test_the_server_reports_an_index_collation_where_the_check_reads_it(
+        self, contract_database: Any, unique_collection_name: str
+    ) -> None:
+        """The premise. If this fails the rule is reading a field the server does not send, and every
+        folded index would pass."""
+        from pymongo import IndexModel
+
+        collection = contract_database[unique_collection_name]
+        dedup = next(spec for spec in _indexes.memory_specs() if spec.options.get("unique"))
+        await collection.create_indexes(
+            [IndexModel(list(dedup.keys), name="theirs", **dedup.options, collation=self.FOLDING)]
+        )
+
+        found = (await collection.index_information())["theirs"]
+
+        assert found.get("collation", {}).get("locale") == "en"
+
+    async def test_an_uncollated_index_reports_no_collation_at_all(
+        self, contract_database: Any, unique_collection_name: str
+    ) -> None:
+        """The vacuity guard, and the reason the rule cannot be an ``IndexSpec.options`` entry: what a
+        correct index reports is nothing, so a wanted value of ``simple`` would mismatch all of them."""
+        collection = contract_database[unique_collection_name]
+        dedup = next(spec for spec in _indexes.memory_specs() if spec.options.get("unique"))
+        await collection.create_indexes([dedup.to_model()])
+
+        assert "collation" not in (await collection.index_information())[dedup.name]
+
+    async def test_ensure_refuses_the_folded_index_and_creates_nothing(
+        self, contract_database: Any, unique_collection_name: str
+    ) -> None:
+        """The finding end to end: a real index the server built, and a refusal before any write."""
+        from pymongo import IndexModel
+        from strands.types.exceptions import StorageError
+
+        collection = contract_database[unique_collection_name]
+        dedup = next(spec for spec in _indexes.memory_specs() if spec.options.get("unique"))
+        await collection.create_indexes(
+            [IndexModel(list(dedup.keys), name="theirs", **dedup.options, collation=self.FOLDING)]
+        )
+        before = await collection.index_information()
+
+        with pytest.raises(StorageError) as caught:
+            await _indexes.ensure(collection, ordinary=[dedup], create=True)
+
+        assert "collation" in str(caught.value)
+        assert await collection.index_information() == before
+
+    async def test_two_records_differing_only_in_case_collide_on_the_folded_index(
+        self, contract_database: Any, unique_collection_name: str
+    ) -> None:
+        """What the refusal is refusing, in the driver rather than in a paragraph.
+
+        The unique index is what stops a memory being stored twice. Built this way it also stops a
+        different memory being stored once, and the query that would have found the first one -- the
+        binary equality the package issues -- cannot use the index that rejected the second.
+        """
+        from pymongo import IndexModel
+        from pymongo.errors import DuplicateKeyError
+
+        collection = contract_database[unique_collection_name]
+        await collection.create_indexes(
+            [IndexModel([("content_hash", 1)], name="folded", unique=True, collation=self.FOLDING)]
+        )
+        await collection.insert_one({"content_hash": "Remember-X"})
+
+        with pytest.raises(DuplicateKeyError):
+            await collection.insert_one({"content_hash": "remember-x"})
+
+        assert await collection.find_one({"content_hash": "remember-x"}) is None, (
+            "if this is not None the deployment did not fold the index and this class is checking "
+            "something the server no longer does"
+        )
 
 
 @pytest.mark.contract

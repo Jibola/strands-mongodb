@@ -1608,6 +1608,95 @@ class TestAKeySpaceNeedsACollectionThatComparesBytes:
         await storage.close()
 
 
+class TestAnAbsentCollectionIsNotAVerifiedOne:
+    """``AT-192`` / ``REQ-E-186`` -- the cache in front of ``AT-176``'s check, and what it let through.
+
+    ``AT-176`` establishes that the check refuses a case-folding collection. This class is about the
+    other half: a namespace that entered ``_Connection.binary_keys`` without ever having been verified.
+    ``listCollections`` answers a collection with no collation and a collection that is not there the
+    same way -- with nothing -- and the preflight cached both as *binary*. The first is a verification.
+    The second is the absence of one, and a namespace in that set is never read again.
+
+    Reproduced against ``mongod`` 7.0.12 before the fix, and the consequence is the whole of what
+    ``REQ-E-170`` exists to prevent: a store that read an absent collection, another process that then
+    created it with ``{locale: "en", strength: 2}``, and a cross-namespace read, list and prefix delete
+    that all succeeded afterwards while a store with a cleared cache refused the same collection.
+    ``AT-192c`` is that reproduction; these three are its mechanism, with no deployment.
+    """
+
+    async def test_an_absent_collection_is_asked_about_again_on_the_next_operation(self) -> None:
+        """AT-192 -- the finding. Two reads, two ``listCollections``, because the first verified nothing.
+
+        The count is the assertion rather than an internal flag: what went wrong was a cached answer, and
+        a cache is observable exactly as a round trip that does not happen.
+        """
+        database = FakeStorageDatabase(absent=True)
+        storage = unit_storage(FakeStorageCollection(database=database))
+
+        await storage.read("k")
+        await storage.read("k")
+
+        assert database.list_collections_calls == 2, (
+            "an absent collection was cached as verified. Nothing was verified: listCollections reports "
+            "an uncollated collection and a missing one identically, and only the first is an answer"
+        )
+
+    async def test_a_collection_created_case_insensitively_after_an_absent_read_is_refused(self) -> None:
+        """AT-192 -- the consequence, in the order it happens. This is the ``mongod`` reproduction's shape.
+
+        The collection is created between the two operations by something that is not this store, which is
+        the only way the sequence can arise: this package creates collections implicitly and without a
+        collation, so the one that appears here is somebody else's.
+        """
+        database = FakeStorageDatabase(absent=True)
+        storage = unit_storage(FakeStorageCollection(database=database))
+        await storage.read("k")
+
+        database.absent = False
+        database.collation = dict(_CASE_INSENSITIVE)
+
+        with pytest.raises(StorageError) as error:
+            await storage.read("k")
+        assert "'en'" in str(error.value)
+
+    async def test_a_collection_that_exists_is_still_cached(self) -> None:
+        """AT-192 -- the vacuity guard, and the regression this fix could have caused.
+
+        Not caching *absence* must not stop caching *verification*. Without this, the cheapest way to pass
+        the two tests above is to cache nothing at all, which is a ``listCollections`` on every operation
+        of every store for the life of the process.
+        """
+        database = FakeStorageDatabase()
+        storage = unit_storage(FakeStorageCollection(database=database))
+
+        await storage.read("k")
+        await storage.read("k")
+
+        assert database.list_collections_calls == 1
+
+    async def test_the_first_write_closes_the_window_it_opened(self) -> None:
+        """AT-192 -- the bound on the re-reading, which is what makes it affordable.
+
+        A store over an absent collection asks again per operation, and its own first write creates the
+        collection implicitly. From the operation after that write there is something to verify, it is
+        verified, and the asking stops. The window is not open for the life of the store.
+        """
+        database = FakeStorageDatabase(absent=True)
+        storage = unit_storage(FakeStorageCollection(database=database))
+
+        await storage.read("k")
+        assert database.list_collections_calls == 1
+        # The implicit creation a write performs, which the fake does not model on its own.
+        await storage.write("k", b"v")
+        database.absent = False
+
+        await storage.read("k")
+        await storage.read("k")
+        assert database.list_collections_calls == 3, (
+            "one for the absent read, one for the write, one for the read that found it, and none after"
+        )
+
+
 class TestTheFakeMatchesTheDriver:
     """MP-001 — the parity contract for ``FakeStorageCollection`` and ``FakeCursor``.
 
@@ -2339,8 +2428,10 @@ class TestACaseFoldingCollectionAgainstARealDeployment:
 
     async def test_the_server_reports_the_collation_where_the_preflight_reads_it(self, folded_collection: Any) -> None:
         """AT-176 — the premise the whole check rests on, asserted against the server."""
-        collation = await _indexes.default_collation(folded_collection)
+        report = await _indexes.read_collation(folded_collection)
 
+        assert report.exists is True
+        collation = report.collation
         assert collation is not None, "listCollections did not report the collation the collection was made with"
         assert collation["locale"] == "en"
         assert collation["strength"] == 2
@@ -2352,7 +2443,10 @@ class TestACaseFoldingCollectionAgainstARealDeployment:
         collation for every collection would pass that one and refuse every store anybody has."""
         await contract_database.create_collection(f"{unique_collection_name}_plain")
 
-        assert await _indexes.default_collation(contract_database[f"{unique_collection_name}_plain"]) is None
+        report = await _indexes.read_collation(contract_database[f"{unique_collection_name}_plain"])
+
+        assert report.collation is None
+        assert report.exists is True, "an uncollated collection read as one that is not there (REQ-E-186)"
 
     async def test_an_explicit_simple_collation_is_not_stored_by_the_server(
         self, contract_database: Any, unique_collection_name: str
@@ -2361,7 +2455,10 @@ class TestACaseFoldingCollectionAgainstARealDeployment:
         unit tier's ``simple`` case cannot be reached from a deployment."""
         await contract_database.create_collection(f"{unique_collection_name}_simple", collation={"locale": "simple"})
 
-        assert await _indexes.default_collation(contract_database[f"{unique_collection_name}_simple"]) is None
+        report = await _indexes.read_collation(contract_database[f"{unique_collection_name}_simple"])
+
+        assert report.collation is None
+        assert report.exists is True
 
     async def test_a_store_over_it_refuses_before_writing_anything(
         self, contract_uri: str, test_database_name: str, folded_collection: Any
@@ -2412,3 +2509,74 @@ class TestACaseFoldingCollectionAgainstARealDeployment:
         ]
 
         assert matched == ["Tenant-A/private"]
+
+
+@pytest.mark.contract
+class TestAnAbsentCollectionAgainstARealDeployment:
+    """AT-192 / ``REQ-E-186`` — boundary **B-1**. The premise the whole distinction rests on, measured.
+
+    The unit tier asserts what the package does with the two answers. This asserts that the server really
+    gives two answers where it appears to give one: a collection that is not there and a collection with
+    no collation are both *no collation*, and only ``listCollections`` returning a document at all tells
+    them apart. If that stopped being true -- if the server began reporting an absent collection the way
+    it reports an uncollated one, or stopped reporting uncollated ones -- the caching rule in
+    ``_require_binary_keys`` would be caching the wrong one of the two, and these are the tests that
+    would say so rather than a store that silently skipped its preflight.
+
+    Measured from 7.0.12 while writing it, and re-measured by this class wherever the contract tier runs.
+    """
+
+    async def test_a_collection_that_was_never_created_reports_that_it_is_not_there(
+        self, contract_database: Any, unique_collection_name: str
+    ) -> None:
+        """The finding's premise: absence is visible, and it is not a collation of ``None``."""
+        report = await _indexes.read_collation(contract_database[f"{unique_collection_name}_never"])
+
+        assert report.exists is False
+        assert report.collation is None
+
+    async def test_the_preflight_declines_to_verify_it_and_verifies_the_one_beside_it(
+        self, contract_database: Any, unique_collection_name: str
+    ) -> None:
+        """The two answers as the caller reads them, in one test so neither can pass alone.
+
+        ``False`` for the collection that is not there is not a refusal -- nothing raises, because this
+        package creates collections implicitly and refusing would fail the first write to an empty
+        database. It is the answer that must not be cached. ``True`` beside it is the vacuity guard: a
+        preflight that answered ``False`` for everything would pass the first assertion and stop this
+        package from ever caching anything.
+        """
+        await contract_database.create_collection(f"{unique_collection_name}_present")
+
+        absent = await _indexes.require_binary_comparison(contract_database[f"{unique_collection_name}_absent"])
+        present = await _indexes.require_binary_comparison(contract_database[f"{unique_collection_name}_present"])
+
+        assert absent is False
+        assert present is True
+
+    async def test_a_store_over_an_empty_database_keeps_asking_until_its_own_write_creates_the_collection(
+        self, contract_uri: str, test_database_name: str, contract_database: Any, unique_collection_name: str
+    ) -> None:
+        """The finding end to end, on the connection's own cache.
+
+        Before the first write there is nothing to verify, so the namespace stays out of ``binary_keys``
+        and every operation asks again. The write creates the collection implicitly; the operation after
+        it has something to read, reads it, and the asking stops. What this rules out is the shape the
+        review found: a namespace recorded as verified while the collection it names does not exist, after
+        which no collation anybody gives that collection is ever looked at.
+        """
+        config: MongoDBConfig = {"connection_string": contract_uri, "database": test_database_name}
+        storage = MongoDBStorage(config, collection=f"{unique_collection_name}_empty")
+        target = (test_database_name, f"{unique_collection_name}_empty")
+        try:
+            assert await storage.read("absent") is None
+            assert target not in storage._connection.binary_keys, (
+                "a collection that does not exist was cached as verified (REQ-E-186)"
+            )
+
+            await storage.write("k", b"v")
+            assert await storage.read("k") == b"v"
+
+            assert target in storage._connection.binary_keys
+        finally:
+            await storage.close()

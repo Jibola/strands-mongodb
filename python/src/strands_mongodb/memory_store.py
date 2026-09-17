@@ -563,9 +563,11 @@ class MongoDBMemoryStore:
             # written under `Tenant-B` -- premortem **P-1**, a cross-scope read, arriving through the
             # collection's own comparison rules rather than through a caller-supplied filter.
             target = (self._database_name, self._collection_name)
-            if target not in connection.binary_keys:
-                await _indexes.require_binary_comparison(collection)
-                connection.binary_keys.add(target)
+            verified = target in connection.binary_keys
+            if not verified:
+                verified = await _indexes.require_binary_comparison(collection)
+                if verified:
+                    connection.binary_keys.add(target)
 
             capabilities = connection.capabilities
             if capabilities is None:
@@ -598,6 +600,18 @@ class MongoDBMemoryStore:
                 if capabilities.search
                 else ()
             )
+
+            # The second half of the preflight, and only when the first half had nothing to read
+            # (``REQ-E-186``). An absent collection cannot be verified and must not be cached as though
+            # it had been, but unlike `MongoDBStorage` this surface checks once and has no later
+            # operation to re-check from: `initialize()` returns early ever after. Ensuring the indexes
+            # above created the collection, so there is something to read now, and reading it here closes
+            # the window rather than leaving it open for the life of the store. A collation that appears
+            # in between is somebody else's and it fails this call, which is the right moment to fail:
+            # before `add` has written a single memory under it.
+            if not verified and await _indexes.require_binary_comparison(collection):
+                connection.binary_keys.add(target)
+
             self._initialized = True
 
     async def _ensure_search_tiers(
