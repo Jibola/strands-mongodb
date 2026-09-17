@@ -1,0 +1,13 @@
+# Who GitHub requests a review from, per path. One entry, because the repository has one maintainer:
+# every path is owned by the same person, and a narrower rule would only claim a structure that does
+# not exist yet. Add paths above the catch-all as teams take ownership of them -- the last matching
+# pattern wins, so a specific rule has to come after `*`, not before it.
+#
+# An email address rather than `@mohammaddaoudfarooqi`, which is the same account. GitHub resolves an
+# address to the account that has it, so the two are equivalent as long as the address stays on the
+# account and the account keeps write access here. Switch to the handle if a review request ever fails
+# to route: the handle depends on neither of those conditions.
+#
+# This file assigns reviewers. It does not require them -- that is branch protection, which lives in
+# repository settings rather than in the tree, and without it the assignment is a suggestion.
+* mohammaddaoud.farooqi@mongodb.com
