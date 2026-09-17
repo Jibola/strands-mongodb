@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 from conftest import (
@@ -30,7 +31,17 @@ from conftest import (
     skip_if_search_is_unreachable,
 )
 
+from strands_mongodb import _indexes
+
 pytest_plugins = ["pytester"]
+
+EXPECT_SEARCH_VARIABLE = "STRANDS_MONGODB_EXPECT_SEARCH"
+"""How a caller says "the deployment I gave you has a search process, so hold me to it" (``REQ-E-182``).
+
+Set by one leg of the contract tier's two and left empty by the other. One-directional on purpose: set
+means the search process must be there, and unset means nothing, because a developer running this tier
+against a cluster has not promised anything and should not be failed for exceeding the promise.
+"""
 
 # How a test says "this machine has no backend for that tier". Deleting the variable stopped being
 # enough once the real conftest learned to read `.env`: every nested session re-imports that
@@ -678,3 +689,39 @@ class TestAFailureReportNeverCarriesThePassword:
         result.assert_outcomes(failed=1)
         assert self._SECRET not in result.stdout.str(), "REQ-E-103: the password reached the report"
         result.stdout.fnmatch_lines(["*cluster0.example.mongodb.net*"])
+
+
+@pytest.mark.contract
+class TestALegPromisedASearchProcessGotOne:
+    """``AT-187`` / ``REQ-E-182`` -- the guard on the half of the contract tier that can pass vacuously.
+
+    The contract tier runs twice, over a deployment with a search process and one without, because the
+    rules about which search tier a store resolves are all true for a trivial reason where nothing can
+    search: the store resolves no tier at all and every branch about fusion takes its quiet side. The leg
+    with mongot is what reads the other side.
+
+    Which makes that leg's value entirely dependent on it really having mongot. If the image changed, or
+    the service came up before its search process did, or somebody copied the job and forgot the image,
+    the tests would take the same quiet branches and the job would still be green -- a check that reports
+    on nothing, which is the failure the whole two-leg arrangement exists to fix one level down.
+
+    So the promise is made explicit in the environment and read back here. This belongs with the other
+    tests of the harness rather than with the tests that use it: what it asserts is that the gate is
+    being fed what it was told it would be fed.
+    """
+
+    async def test_the_deployment_has_the_search_process_the_environment_promised(
+        self, contract_uri: str, test_database_name: str, unique_collection_name: str, contract_database: Any
+    ) -> None:
+        """``AT-187`` -- set the variable and the absence of mongot is a failure rather than a skip."""
+        if not os.environ.get(EXPECT_SEARCH_VARIABLE):
+            pytest.skip(f"{EXPECT_SEARCH_VARIABLE} is unset, so this deployment promised nothing")
+
+        support = await _indexes.search_support(contract_database[unique_collection_name])
+
+        assert support.available, (
+            f"{EXPECT_SEARCH_VARIABLE} is set, so MONGODB_URI was supposed to name a deployment with a "
+            f"search process, and the probe answered unavailable with server error code {support.code}. "
+            "Every test that branches on what this deployment can search has just taken the branch for a "
+            "deployment that cannot, and reported success"
+        )

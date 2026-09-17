@@ -518,6 +518,66 @@ class TestTheTriggerWatchesEverythingTheSuiteReads:
 
 _GATE_JOBS: Final = ("lint", "test", "floors", "contract", "coverage")
 
+_EXPECT_SEARCH: Final = "STRANDS_MONGODB_EXPECT_SEARCH"
+"""The promise one leg of the contract tier makes about its deployment (``AT-187``, ``REQ-E-182``)."""
+
+
+_MONGODB_IMAGES: Final = frozenset({"mongo", "mongodb/mongodb-atlas-local"})
+"""The container images that are a MongoDB deployment (``AT-187``).
+
+Two, because the contract tier needs a deployment with a search process and one without. ``mongo`` has no
+mongot at all; ``mongodb/mongodb-atlas-local`` is the image the Atlas CLI runs locally, mongot included.
+"""
+
+
+def _matrix_entries(job: dict[str, Any], dimension: str) -> list[Any]:
+    """The values of one dimension of a job's matrix, or an empty list where there is none."""
+    strategy = job.get("strategy") or {}
+    entries = (strategy.get("matrix") or {}).get(dimension) or []
+    return list(entries) if isinstance(entries, list) else []
+
+
+def _matrix_values(job: dict[str, Any], declared: str) -> list[str]:
+    """Every concrete value one declared string can take, with a matrix reference resolved.
+
+    Args:
+        job: The job the string was read from, which is where its matrix lives.
+        declared: The string as the workflow writes it.
+
+    Returns:
+        One value per matrix entry where the string names a matrix key, so a job running two deployments
+        reports two values. A string naming anything else is returned as itself, unchanged, which fails the
+        caller's assertion rather than being quietly dropped.
+    """
+    reference = re.search(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\s*\}\}", declared)
+    if reference is None:
+        return [declared]
+    dimension, key = reference.group(1), reference.group(2)
+    return [str(entry[key]) for entry in _matrix_entries(job, dimension) if isinstance(entry, dict) and key in entry]
+
+
+def _service_images(job: dict[str, Any]) -> list[str]:
+    """Every concrete image a job's service containers can run, with matrix references resolved."""
+    return [
+        image
+        for service in (job.get("services") or {}).values()
+        for image in _matrix_values(job, str(service.get("image", "")))
+    ]
+
+
+def _contract_deployments(workflow: dict[str, Any]) -> list[dict[str, Any]]:
+    """The contract job's matrix entries, one per deployment it runs against.
+
+    Args:
+        workflow: The parsed CI workflow.
+
+    Returns:
+        The list under the matrix's one dimension. Empty where the job has no matrix at all, which is the
+        state this arrangement replaced and is reported by the tests rather than by a ``KeyError``.
+    """
+    entries = _matrix_entries(workflow["jobs"]["contract"], "deployment")
+    return [entry for entry in entries if isinstance(entry, dict)]
+
 
 class TestEveryPullRequestReachesTheGatesWhateverItsBaseIs:
     """``AT-182`` / ``REQ-E-177`` -- the narrowing that let a pull request through with no gate job at all.
@@ -575,6 +635,127 @@ class TestEveryPullRequestReachesTheGatesWhateverItsBaseIs:
         missing = [job for job in _GATE_JOBS if job not in jobs]
 
         assert missing == [], f"{missing} are not jobs in this workflow; its jobs are {sorted(jobs)}"
+
+
+class TestTheContractTierRunsAgainstADeploymentThatCanSearch:
+    """``AT-187`` / ``REQ-E-182`` -- the leg that makes the tier-resolution assertions mean something.
+
+    Every rule about which search tier a store resolves is satisfied on a deployment with no search
+    process, because the store resolves no tier there and each branch takes its quiet side. Those rules
+    were graded on a change trigger by nothing before this, and on the cron by an Atlas cluster whose
+    verdict arrives after the merge. The fix is to run the same contract tier twice, over one deployment
+    without a search process and one with, so both sides of every branch are read on every change.
+
+    What is asserted here is the shape of that arrangement, since the runtime half cannot see it: two
+    deployments, different images, exactly one promising a search process, and the promise reaching the
+    tests as an environment variable they can fail on. The runtime half is in ``test_tier_gating.py``.
+    """
+
+    def test_the_contract_job_runs_over_more_than_one_deployment(self, workflow: dict[str, Any]) -> None:
+        """``AT-187`` -- a matrix, and two entries in it, because one is the arrangement this replaced."""
+        deployments = _contract_deployments(workflow)
+
+        assert len(deployments) >= 2, (
+            f"the contract tier runs against {len(deployments)} deployment(s), so half of what it "
+            "asserts about search tiers is true for the trivial reason that nothing can search"
+        )
+
+    def test_the_deployments_are_not_the_same_image_twice(self, workflow: dict[str, Any]) -> None:
+        """``AT-187`` -- the vacuity guard, and the likeliest way this decays: a copied matrix entry."""
+        images = [deployment.get("image") for deployment in _contract_deployments(workflow)]
+
+        assert all(images), f"a matrix entry names no image: {images}"
+        assert len(set(images)) == len(images), f"the same deployment twice is one deployment: {images}"
+
+    def test_the_service_and_the_promise_both_come_from_the_matrix(self, workflow: dict[str, Any]) -> None:
+        """``AT-187`` -- a matrix nothing reads is a list of strings.
+
+        Both halves. The service image has to vary with the matrix or every leg gets the same deployment,
+        and the promise has to vary with it or every leg makes the same claim about a deployment that
+        differs.
+        """
+        contract = workflow["jobs"]["contract"]
+        image = str(contract["services"]["mongodb"]["image"])
+        promise = str((contract.get("env") or {}).get(_EXPECT_SEARCH, ""))
+        uri = str((contract.get("env") or {}).get("MONGODB_URI", ""))
+
+        assert "matrix." in image, f"the service image does not vary with the matrix: {image!r}"
+        assert "matrix." in promise, (
+            f"{_EXPECT_SEARCH} does not vary with the matrix, so every leg makes the same promise about a "
+            f"different deployment: {promise!r}"
+        )
+        assert "matrix." in uri, (
+            f"MONGODB_URI does not vary with the matrix, so both legs are handed one connection string and "
+            f"only one of these deployments is a replica set: {uri!r}"
+        )
+
+    def test_the_leg_with_a_replica_set_is_told_not_to_discover_the_topology(self, workflow: dict[str, Any]) -> None:
+        """``AT-187`` -- measured, not anticipated: this leg times out for fifteen minutes without it.
+
+        ``mongodb/mongodb-atlas-local`` is a single-node replica set that initiates itself with the
+        container's hostname as its member's host. A driver that discovers the topology therefore learns
+        one member named something the runner cannot resolve, and every operation ends in server selection:
+        thirty seconds per test, no error a reader can act on, and a job cancelled at its timeout with every
+        test failed. ``directConnection=true`` -- which is the connection string MongoDB's own Docker
+        instructions give for this image -- says talk to the address you were handed.
+
+        Asserted because the failure it prevents does not look like a missing parameter. It looks like the
+        deployment being broken, and the natural response to it is to widen the timeout.
+        """
+        promising = [
+            deployment
+            for deployment in _contract_deployments(workflow)
+            if str(deployment.get("expect_search", "")).strip()
+        ]
+        assert promising, "no deployment promises a search process, which another test in this class owns"
+
+        uri = str(promising[0].get("uri", ""))
+
+        assert "directConnection=true" in uri, (
+            f"the leg running a replica set connects with {uri!r}, so the driver will discover a member "
+            "host only resolvable inside the container network and spend the job in server selection"
+        )
+
+    def test_exactly_one_deployment_promises_a_search_process(self, workflow: dict[str, Any]) -> None:
+        """``AT-187`` -- and it is a promise the tests can fail on, not a comment.
+
+        One, not "at least one". Two legs promising search would leave nothing reading the branches for a
+        deployment that cannot search, which is the deployment this package's own error paths are mostly
+        about; none would leave the search branches unread, which is where it started.
+        """
+        promising = [
+            deployment
+            for deployment in _contract_deployments(workflow)
+            if str(deployment.get("expect_search", "")).strip()
+        ]
+
+        assert len(promising) == 1, (
+            f"{len(promising)} of the contract tier's deployments promise a search process, and the "
+            "arrangement needs one of each: "
+            f"{[(d.get('image'), d.get('expect_search')) for d in _contract_deployments(workflow)]}"
+        )
+
+    def test_the_leg_with_a_search_process_keeps_that_images_own_health_check(self, workflow: dict[str, Any]) -> None:
+        """``AT-187`` -- a ping answers before mongot does, and the options replace rather than extend.
+
+        GitHub's ``--health-cmd`` overrides whatever HEALTHCHECK the image declares, so a service given a
+        ``mongod`` ping is reported healthy as soon as ``mongod`` answers. On the leg that exists for the
+        search process, that is the one thing worth waiting for: the tests would come up against a
+        deployment whose mongot was still starting, take every quiet branch, and pass.
+        """
+        promising = [
+            deployment
+            for deployment in _contract_deployments(workflow)
+            if str(deployment.get("expect_search", "")).strip()
+        ]
+        assert promising, "no deployment promises a search process, which another test in this class owns"
+
+        health = str(promising[0].get("health", ""))
+
+        assert "healthcheck" in health, (
+            "the leg that promises a search process is health-checked with "
+            f"{health!r}, which answers as soon as mongod does and not when the search process is ready"
+        )
 
 
 class TestTheManifestIsCheckedByAPullRequestAndNotOnlyByARelease:
@@ -1058,21 +1239,28 @@ class TestTheContractTierRunsOnEveryChange:
         A maintainer who wanted the tier run against a cluster would reach for a repository secret, which
         puts a live credential in a repository this package is moving out of. The container is the answer
         that needs no such decision, so the image is asserted rather than left as a comment.
+
+        Every image rather than any image, and the matrix is resolved before reading them. The contract
+        tier runs against two deployments and the second one arrives through ``matrix.deployment.image``,
+        so a walk that read the literal would see one expression and no MongoDB at all.
         """
         for name, job in self._jobs_setting(workflow, "MONGODB_URI").items():
-            services = job.get("services") or {}
-            images = [service.get("image", "") for service in services.values()]
-            assert any(image.split(":")[0] == "mongo" for image in images), (
-                f"the {name} job declares no MongoDB service container; its services are {services}"
+            images = _service_images(job)
+            assert images, f"the {name} job declares no service container; its services are {job.get('services')}"
+            foreign = [image for image in images if image.split(":")[0] not in _MONGODB_IMAGES]
+            assert foreign == [], (
+                f"the {name} job runs the contract tier against {foreign}, which is not one of the MongoDB "
+                f"images this tier is written for: {sorted(_MONGODB_IMAGES)}"
             )
 
-            uri = job["env"]["MONGODB_URI"]
-            assert "secrets." not in uri, (
-                f"the {name} job reaches for a credential rather than the container beside it: {uri!r}"
+            declared = str(job["env"]["MONGODB_URI"])
+            assert "secrets." not in declared, (
+                f"the {name} job reaches for a credential rather than the container beside it: {declared!r}"
             )
-            assert "localhost" in uri or "127.0.0.1" in uri, (
-                f"the {name} job's connection string is {uri!r}, which does not point at that container"
-            )
+            for uri in _matrix_values(job, declared):
+                assert "localhost" in uri or "127.0.0.1" in uri, (
+                    f"the {name} job's connection string is {uri!r}, which does not point at that container"
+                )
 
     def test_the_tier_gates_a_change_rather_than_only_the_cron(self, workflow: dict[str, Any]) -> None:
         """Pull requests are specified to gate on this tier, so weekly alone is the wrong cadence.
@@ -1878,6 +2066,16 @@ _JOB_LEVEL_CONTEXTS: dict[str, frozenset[str]] = {
     "timeout-minutes": frozenset({"github", "needs", "strategy", "matrix", "vars", "inputs"}),
     "concurrency": frozenset({"github", "needs", "strategy", "matrix", "vars", "inputs"}),
     "strategy": frozenset({"github", "needs", "vars", "inputs"}),
+    # No `secrets`, which is the one difference from `env` above and the reason this is its own row rather
+    # than a shared frozenset: a service image pulled from a secret is a plausible edit and GitHub refuses
+    # to start the run for it.
+    #
+    # Read against the bare `jobs.<job_id>.services` row. This gate attributes an expression to the
+    # top-level job key it was found under, and the table gives `services.<service_id>.env.<env_id>` a
+    # wider row of its own -- `job`, `runner`, `env` and `steps` are all admitted there. Nothing puts an
+    # expression under a service's `env` or `credentials` today; the first thing that does will fail here
+    # falsely, and the remedy is to make the walk read the path rather than to widen this row.
+    "services": frozenset({"github", "needs", "strategy", "matrix", "vars", "inputs"}),
 }
 
 #: Every context name GitHub defines. Used to filter the matcher below, because the same syntax that
