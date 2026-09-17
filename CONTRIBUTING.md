@@ -121,25 +121,21 @@ author ran locally, with `MONGODB_URI` and `MONGODB_ATLAS_URI` pointing at a dep
 
 ## Code of conduct
 
-<!-- TODO(code-of-conduct): adopt a code of conduct for this repository and link it here. The AWS template
-this package is modelled on points at the Amazon Open Source Code of Conduct, which is the wrong document
-to publish under a MongoDB repository's name. Blocks the first public release, not the code. -->
+This project follows the [MongoDB Code of Conduct](https://www.mongodb.com/community-code-of-conduct). The
+short version is the ordinary standard: be respectful, assume good faith, and keep discussion on the work.
 
-This project expects the ordinary standard: be respectful, assume good faith, and keep discussion on the
-work. The formal code of conduct is `TODO(code-of-conduct)` and will be linked here before the first
-release.
+Report a violation to community@mongodb.com, which is the address that document names. Not in an issue and
+not in a pull request review, because neither is private and neither reaches anybody who can act on it.
 
 ## Security
 
-Do not open a public issue for a security vulnerability.
+**Do not open a public issue for a security vulnerability.** A public report is a disclosure, and it reaches
+whoever is looking for one first.
 
-<!-- TODO(security-contact): confirm the reporting address for this repository. The template names the AWS
-vulnerability reporting page, which would route a report about this package to the wrong company. -->
-
-Report it privately instead. The reporting address is `TODO(security-contact)` until this repository's home
-is settled.
-Until then, contact the maintainers directly rather than filing publicly, and please do not create a public
-issue describing the vulnerability.
+Report it privately to mongodb-partners@mongodb.com instead. [SECURITY.md](SECURITY.md) is the same address
+with the detail beside it: what to put in the report, what to expect back, and what is out of scope here —
+including MongoDB Server, Atlas and the drivers, which go through MongoDB's own process rather than through
+this repository.
 
 ## Licensing
 

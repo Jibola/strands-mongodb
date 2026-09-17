@@ -57,7 +57,14 @@ dependencies = []
 # because a floor checked by reading is a floor checked against what the reader remembered.
 #
 # Upper bounds are deliberately omitted, matching strands-dynamodb-storage and the official
-# extension template.
+# extension template. Confirmed as a decision on 2026-09-17 rather than left as an inheritance,
+# because this repository has evidence about what the absence costs: `strands-agents` 1.56.0
+# changed a protocol and turned five CI jobs red on a change this package had no part in, 26
+# minutes after publication. A ceiling would have held the matrix steady and would also have hidden
+# from every user resolving fresh that a published conformance claim had stopped being true. A
+# package whose whole argument is that a published name should not lie about what it satisfies
+# cannot buy quiet at that price. The cost is accepted, and two detectors watch for it instead: the
+# weekly `sdk-compat` canary and the ordinary test matrix, both resolving latest.
 #
 # `pymongo` floors at 4.14.0, the release that added `AsyncMongoClient.append_metadata`, which
 # `_client.py` calls on an injected client. Below it that attribute resolves through

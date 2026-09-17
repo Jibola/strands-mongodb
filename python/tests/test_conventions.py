@@ -18,6 +18,10 @@ obeys them, because a convention nothing measures is a preference. Two of the ni
 say so. One is stated as a deviation from the SDK's own rule rather than as a copy of it, and the
 deviation is the decision recorded in ``REQ-E-112``, not an oversight this file should report.
 
+``AT-181`` came later, when the two sections that had shipped as placeholders got their answers. It asks a
+different kind of question from the rest of the file: not whether a name resolves against this repository,
+but whether an address reaches the company that can act on the report.
+
 What this file cannot tell you: whether the documents are *useful*. Every claim here is a resolvable
 reference, and a document can pass all of it while explaining nothing.
 """
@@ -53,6 +57,7 @@ _CONTRIBUTING = _ROOT / "CONTRIBUTING.md"
 _PYPROJECT = _PACKAGE / "pyproject.toml"
 _WORKFLOW = _ROOT / ".github" / "workflows" / "ci-python.yml"
 _GITIGNORE = _ROOT / ".gitignore"
+_SECURITY = _ROOT / "SECURITY.md"
 _SOURCE = _PACKAGE / "src" / "strands_mongodb"
 
 #: The two documents every test below reads. Named separately above because most tests want one of them.
@@ -74,6 +79,7 @@ _SWEPT_AT_LEAST: Final = (
     "AGENTS.md",
     "CONTRIBUTING.md",
     "README.md",
+    "SECURITY.md",
     "python/MIGRATION.md",
     "python/README.md",
     "python/examples/README.md",
@@ -94,10 +100,11 @@ _PATH_SUFFIXES: Final = frozenset({".md", ".py", ".toml", ".yml", ".yaml", ".cfg
 #: exemption is checked rather than trusted: ``AT-113`` asserts ``.gitignore`` is the reason.
 _ABSENT_FROM_A_CLONE: Final = (".env", "python/.venv")
 
-#: The placeholders this repository has declared open, each one a decision that belongs to whoever owns
-#: the repository rather than to the package. ``...`` is the shape ``AGENTS.md`` teaches when it explains
-#: the convention, not a placeholder anyone has to settle.
-_OPEN_PLACEHOLDERS: Final = frozenset({"code-of-conduct", "security-contact", "..."})
+#: The placeholders this repository has declared open. Empty of real ones today: the code of conduct and
+#: the security address were the two, and both are answered in ``CONTRIBUTING.md`` and ``SECURITY.md``.
+#: ``...`` is the shape ``AGENTS.md`` teaches when it explains the convention, not a placeholder anyone
+#: has to settle.
+_OPEN_PLACEHOLDERS: Final = frozenset({"..."})
 
 _HATCH_SCRIPT = re.compile(r"hatch run ([a-z][\w-]*)")
 _TIER_VARIABLE = re.compile(r"\b(MONGODB_[A-Z_]+|STRANDS_MONGODB_[A-Z_]+)\b")
@@ -107,6 +114,20 @@ _PYTHON_VERSION = re.compile(r"\b3\.\d+\b")
 _BACKTICKED = re.compile(r"`([^`\n]+)`")
 _HEADING = re.compile(r"^#{1,6}\s+(.*?)\s*#*$", re.MULTILINE)
 _TODO = re.compile(r"TODO\(([^)]*)\)")
+
+#: A mail address in a document. ``AT-181`` reads these to check which company a report would reach.
+_MAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+#: The one ``user@host`` in these documents that is not a mailbox: the SSH form of a git remote, which
+#: ``CONTRIBUTING.md`` names in its clone command. Excluded by shape -- the trailing colon a remote has and
+#: an address does not -- rather than by naming ``git@github.com``, so a real address at that host would
+#: still be reported by the check below.
+_SSH_REMOTE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}:")
+
+#: The address the owner supplied on 2026-09-17 for a private security report (``REQ-E-176``).
+#: Declared here rather than read out of whichever document is being checked, so that the two documents are
+#: compared against one string and changing it stays a deliberate edit rather than a typo that propagates.
+_SECURITY_ADDRESS: Final = "mongodb-partners@mongodb.com"
 _TABLE_ROW = re.compile(r"^\|\s*`([^`]+)`\s*\|", re.MULTILINE)
 
 
@@ -429,9 +450,9 @@ class TestEveryClaimResolvesAgainstThisRepository:
     def test_every_placeholder_names_a_tracked_item(self, document: Path) -> None:
         """AT-113 — ``REQ-E-111``: a ``TODO`` with nothing behind it is how an open decision ships as prose.
 
-        One decision is still open: which code of conduct this repository adopts and where a
-        security report goes. The template names AWS's, and publishing AWS's contact under a MongoDB
-        repository's name would route a vulnerability report to the wrong company.
+        The code of conduct this repository adopts and the address a security report goes to were the two
+        this check was written for, and both are filled in now. It stays for the next one, and ``AT-181`` now
+        holds the two sections to naming an address rather than to naming the item that will name one.
 
         The open set is declared in :data:`_OPEN_PLACEHOLDERS` rather than inferred, so that adding a
         placeholder is a deliberate act: a ``TODO`` nobody has claimed fails here, and so does a bare
@@ -707,3 +728,139 @@ class TestADeprecationIsAFailureRatherThanAScrollbackLine:
             f"on every async test -- which pyproject.toml's filterwarnings turns into an error. Install the "
             f"declared floor (>=1.0.0,<2.0.0); the rest of this run's failures are that, not your change"
         )
+
+
+def _section(document: Path, heading: str) -> str:
+    """The body of one ``##`` section of a Markdown document, matched on the heading text.
+
+    Sections rather than whole documents, because the questions ``AT-181`` asks are local: the address in
+    the security section is the one a finder uses, and an address anywhere else in the file is a different
+    claim. Two sections with the same heading would be concatenated, which no document here has.
+
+    Args:
+        document: The file to read.
+        heading: The heading text, without the ``##`` and matched case-insensitively.
+
+    Returns:
+        The lines between that heading and the next one at the same level, or ``""`` if it is absent --
+        which every caller below treats as a failure rather than as an empty section.
+    """
+    body: list[str] = []
+    collecting = False
+    for line in _text(document).splitlines():
+        if line.startswith("## "):
+            collecting = line[3:].strip().casefold() == heading.casefold()
+            continue
+        if collecting:
+            body.append(line)
+    return "\n".join(body)
+
+
+def _addresses(text: str) -> set[str]:
+    """Every mail address in a passage, with git's SSH remotes taken out first.
+
+    Args:
+        text: The passage to read.
+
+    Returns:
+        The addresses, deduplicated.
+    """
+    return set(_MAIL.findall(_SSH_REMOTE.sub("", text)))
+
+
+class TestTheCodeOfConductAndTheSecurityAddressResolve:
+    """``AT-181`` — ``REQ-E-176``: the two sections that shipped as placeholders for a long time.
+
+    Neither was a hard question; both were somebody else's. The template these documents were modelled on
+    answers both with Amazon's, and ``AT-113`` held the placeholders to naming a tracked item so that going
+    quiet could not resolve them. The owner supplied both on 2026-09-17, and the claim moves with them: from
+    "a placeholder names its item" to "an address resolves, and belongs to the company that can act on it".
+
+    The company check is the one worth having. A wrong address is a report nobody reads, and the specific way
+    this repository could have got there was inheriting a contact from the template -- which is a valid
+    address at a company that cannot fix a defect in a MongoDB package.
+    """
+
+    def test_the_security_policy_is_at_the_filename_github_reads(self) -> None:
+        """AT-181 — ``SECURITY.md`` at the root, which is what *Report a vulnerability* points a finder at.
+
+        ``CONTRIBUTING.md`` has the same address in it and is not where a finder looks: GitHub surfaces this
+        filename and only this filename.
+        """
+        assert _SECURITY.is_file(), f"REQ-E-176 asks for a security policy at {_SECURITY.name} and it is absent"
+
+    def test_the_code_of_conduct_section_links_a_document_rather_than_describing_one(self) -> None:
+        """AT-181 — a link, because "be respectful" is a sentiment and a code of conduct is a document."""
+        section = _section(_CONTRIBUTING, "Code of conduct")
+        assert section.strip(), "CONTRIBUTING.md has no 'Code of conduct' section for this test to read"
+        assert "https://" in section, f"the code of conduct section links no document: {section.strip()!r}"
+
+    def test_the_security_section_names_the_address_the_owner_supplied(self) -> None:
+        """AT-181 — the address itself, pinned, so that editing it is a deliberate act in this file too."""
+        section = _section(_CONTRIBUTING, "Security")
+        assert section.strip(), "CONTRIBUTING.md has no 'Security' section for this test to read"
+        assert _SECURITY_ADDRESS in section, f"the security section does not name {_SECURITY_ADDRESS}"
+
+    def test_the_two_documents_name_one_reporting_address_and_the_same_one(self) -> None:
+        """AT-181 — set equality against one string, because two copies of an address are two addresses.
+
+        A second address in either place is the failure this asserts against, not a redundancy: a finder
+        picks one, and the one they pick is the one nobody is reading.
+        """
+        found = _addresses(_text(_SECURITY)) | _addresses(_section(_CONTRIBUTING, "Security"))
+        assert found == {_SECURITY_ADDRESS}, f"the security route is not one address: {sorted(found)}"
+
+    def test_no_address_any_of_the_documents_names_belongs_to_another_company(self) -> None:
+        """AT-181 — the failure exactly: a valid address at a company that cannot act on the report.
+
+        Both addresses in this repository are at ``mongodb.com`` -- the reporting one the owner supplied,
+        and ``community@mongodb.com``, which is the address MongoDB's own code of conduct names. The count
+        guards the walk: an expression that matched nothing would pass the domain check silently.
+        """
+        found = {address for path in (_AGENTS, _CONTRIBUTING, _SECURITY) for address in _addresses(_text(path))}
+        assert len(found) >= 2, f"the mail expression found fewer addresses than this repository has: {sorted(found)}"
+        elsewhere = sorted(address for address in found if not address.endswith("@mongodb.com"))
+        assert elsewhere == [], f"these documents route mail to a company that does not own this package: {elsewhere}"
+
+    def test_the_one_address_shaped_string_that_is_not_an_address_is_a_git_remote(self) -> None:
+        """AT-181 — the exclusion :data:`_SSH_REMOTE` makes, checked rather than trusted.
+
+        An exclusion that quietly grew to cover a real mailbox would turn the company check above into a
+        test that reports green on the failure it exists to catch. So what it removes is asserted to be
+        non-empty and asserted to be written in the shape a remote has.
+        """
+        text = _text(_CONTRIBUTING)
+        removed = set(_MAIL.findall(text)) - _addresses(text)
+        assert removed, "CONTRIBUTING.md names no SSH remote any more, so the exclusion covers nothing"
+        written_as_a_remote = sorted(address for address in removed if f"{address}:" in text)
+        assert written_as_a_remote == sorted(removed), (
+            f"excluded as a git remote but written as a mail address: {sorted(removed)}"
+        )
+
+    def test_both_documents_tell_a_finder_not_to_open_a_public_issue(self) -> None:
+        """AT-181 — the outcome the section exists to prevent, stated in both places a finder arrives at.
+
+        A public issue describing an unfixed vulnerability is a disclosure, and it is the default a finder
+        falls back to when a repository says nothing.
+        """
+        silent = [
+            path.name
+            for path, text in ((_SECURITY, _text(_SECURITY)), (_CONTRIBUTING, _section(_CONTRIBUTING, "Security")))
+            if "public issue" not in text
+        ]
+        assert silent == [], f"these documents never tell a finder to keep a vulnerability off the tracker: {silent}"
+
+    def test_no_placeholder_stands_where_an_address_or_a_link_belongs(self) -> None:
+        """AT-181 — ``AT-113`` asserts a placeholder names a tracked item; this asserts there is none left.
+
+        The two are different claims and both are worth keeping. A tracked placeholder was the right answer
+        while the decision was open, and it is the wrong answer now that it is closed: the address exists, so
+        a ``TODO`` in either section would mean somebody replaced an answer with a promise.
+        """
+        sections = {
+            "CONTRIBUTING.md 'Code of conduct'": _section(_CONTRIBUTING, "Code of conduct"),
+            "CONTRIBUTING.md 'Security'": _section(_CONTRIBUTING, "Security"),
+            _SECURITY.name: _text(_SECURITY),
+        }
+        held = {name: _TODO.findall(text) for name, text in sections.items() if _TODO.search(text)}
+        assert held == {}, f"a placeholder stands where REQ-E-176 asks for an address or a link: {held}"

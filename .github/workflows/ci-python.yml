@@ -14,7 +14,14 @@ name: CI - Python
 
 on:
   pull_request:
-    branches: [ main ]
+    # No `branches:` filter, deliberately, and it is the one narrowing this trigger does not get. A pull
+    # request based on another topic branch -- one change stacked on an earlier one still under review --
+    # matched `branches: [ main ]` in neither trigger and ran no gate job at all: one check on the page, from
+    # an organisation-level scanner, in the same green as five passing gates. `AT-138` could not see it,
+    # because `paths` and `branches` narrow independently and every path that change touched was watched.
+    # Retargeting does not rescue it either: when the base merges, GitHub moves the base here on its own and
+    # emits `pull_request` with the `edited` activity type, which is not one of the three a workflow receives
+    # unless it asks. There is no run to re-run. `AT-182`.
     paths:
       # Every file the suite asserts something about, which is more than the package directory and is
       # checked rather than remembered: `AT-138` walks the test modules for the paths they name and fails
@@ -27,8 +34,12 @@ on:
       - 'AGENTS.md'
       - 'CONTRIBUTING.md'
       - 'README.md'
+      - 'SECURITY.md'
       - '.gitignore'
   push:
+    # This one keeps the filter. A push to a topic branch is already graded by that branch's pull request, and
+    # grading it here as well would run the whole matrix twice on one commit for one verdict -- the group
+    # below keys a push on the run id rather than the ref, so neither copy would supersede the other.
     branches: [ main ]
     paths:
       # Every file the suite asserts something about, which is more than the package directory and is
@@ -42,6 +53,7 @@ on:
       - 'AGENTS.md'
       - 'CONTRIBUTING.md'
       - 'README.md'
+      - 'SECURITY.md'
       - '.gitignore'
   schedule:
     # Weekly canary against the newest SDK release, and the only mitigation for an unpinned SDK floor. The floor
