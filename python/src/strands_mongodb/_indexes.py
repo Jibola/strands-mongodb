@@ -418,15 +418,23 @@ class IndexSpec:
     Attributes:
         name: Name used when this package creates the index. Never used to *find* one, since the server
             does not treat the name as an identity.
-        keys: The key list, in order. This is the match key.
+        keys: The key list, in order. This is the match key, and it can match more than one existing
+            index: the server's identity for an index is its keys *and* its collation, so a collection
+            may carry several over one key list (``REQ-E-190``). Every one of them is examined.
         options: Every option this package asks for, and therefore every option compared against an
             existing index. Options nobody here set are nobody here's business: a ``background`` or
             ``hidden`` flag another tool added is not a mismatch.
+        date_only: Whether every key of this index names a field this package writes BSON dates into and
+            nothing else. A collation decides how strings compare, so on such an index it decides nothing,
+            and the binary-comparison rule does not apply to it (``REQ-E-191``). Declared rather than
+            inferred from the field name, because which fields hold what is a fact about what this
+            package writes and not something to guess from a document nothing here has read.
     """
 
     name: str
     keys: tuple[tuple[str, int], ...]
     options: Mapping[str, Any] = field(default_factory=dict)
+    date_only: bool = False
 
     def to_model(self) -> IndexModel:
         """Build the driver object that creates this index.
@@ -541,6 +549,9 @@ def storage_specs() -> tuple[IndexSpec, ...]:
             name="strands_expires_at_ttl",
             keys=((EXPIRES_FIELD, 1),),
             options={"expireAfterSeconds": 0},
+            # `expires_at` holds a BSON date or nothing -- a TTL index requires it, and `_expiry_at` is
+            # the only writer. So no collation on this index can change what it compares (REQ-E-191).
+            date_only=True,
         ),
     )
 
@@ -584,6 +595,9 @@ def memory_specs() -> tuple[IndexSpec, ...]:
             name="strands_expires_at_ttl",
             keys=((EXPIRES_FIELD, 1),),
             options={"expireAfterSeconds": 0},
+            # `expires_at` holds a BSON date or nothing -- a TTL index requires it, and `_expiry_at` is
+            # the only writer. So no collation on this index can change what it compares (REQ-E-191).
+            date_only=True,
         ),
     )
 
@@ -885,19 +899,20 @@ async def _ensure_ordinary(collection: AsyncCollection[Any], specs: tuple[IndexS
     """Create or verify the ordinary indexes, matching on the key list (``REQ-E-063``)."""
     namespace = f"{collection.database.name}.{collection.name}"
     present = await _guard(collection.index_information(), what=f"reading indexes on {namespace}")
-    by_keys = {tuple(tuple(pair) for pair in found["key"]): (name, found) for name, found in present.items()}
+    # A list per key list, not one entry. The server's identity for an index is its keys and its
+    # collation, so a key list can have several indexes over it and a mapping that keeps one keeps
+    # whichever `index_information` happened to report last -- which is creation order (REQ-E-190).
+    by_keys: dict[tuple[tuple[str, int], ...], list[tuple[str, Mapping[str, Any]]]] = {}
+    for name, found in present.items():
+        by_keys.setdefault(tuple(tuple(pair) for pair in found["key"]), []).append((name, found))
 
     missing: list[IndexSpec] = []
     for spec in specs:
-        match = by_keys.get(spec.keys)
-        if match is None:
+        matches = by_keys.get(spec.keys)
+        if not matches:
             missing.append(spec)
             continue
-        # Before the options, deliberately. An index can differ in both, and of the two messages this is
-        # the one whose consequence is silent: a mismatched option is a refusal either way, while a
-        # folded collation that went unreported is a dedup rule enforced case-insensitively (REQ-E-187).
-        _check_collation(collection.name, namespace, spec, *match)
-        _check_options(collection.name, namespace, spec, *match)
+        _check_matches(collection.name, namespace, spec, matches)
 
     if not missing:
         return
@@ -916,6 +931,116 @@ async def _ensure_ordinary(collection: AsyncCollection[Any], specs: tuple[IndexS
     await _guard(
         collection.create_indexes([spec.to_model() for spec in missing]),
         what=f"creating indexes on {namespace}",
+    )
+
+
+def _folding_locale(found: Mapping[str, Any]) -> str | None:
+    """Return the locale of a reported collation that does not compare strings byte for byte.
+
+    Args:
+        found: The entry ``index_information`` reported for an index.
+
+    Returns:
+        The locale, or ``None`` when the index reports no collation at all or reports ``simple``. Absence
+        is the ordinary answer rather than a missing one: the server does not store a simple collation, so
+        an index created without one and an index created ``{locale: "simple"}`` both report nothing.
+    """
+    collation = found.get("collation")
+    if not isinstance(collation, Mapping):
+        return None
+    locale = collation.get("locale")
+    if locale == SIMPLE_LOCALE:
+        return None
+    return str(locale)
+
+
+def _check_matches(
+    collection_name: str,
+    namespace: str,
+    spec: IndexSpec,
+    matches: Sequence[tuple[str, Mapping[str, Any]]],
+) -> None:
+    """Hold every existing index over a declared index's keys to the rules, not just one (``REQ-E-190``).
+
+    Two questions, and they are different questions. The first is about the deployment: does anything over
+    these keys enforce a rule this package cannot see? A unique index under a folding collation does, it is
+    enforced by the server whether or not a correct index sits beside it, and ``REQ-E-187``'s cross-tenant
+    write loss follows from it regardless. That is refused wherever it appears in the list.
+
+    The second is about this package: is any of these indexes one this package can use? Exactly one needs
+    to be -- correct options and a collation this package's queries can match on -- and the rest are then
+    somebody else's business, which is ``REQ-E-063``'s standing position. A folding index that enforces
+    nothing is not a rule anyone is wrong about, so beside a usable index it is accepted; alone, it is the
+    only index over those keys, no binary query can use it, and ``REQ-E-187`` refuses it as before.
+
+    Args:
+        collection_name: The collection, for the commands in the message.
+        namespace: ``database.collection``, for the message.
+        spec: The declared index these indexes matched on keys.
+        matches: Every existing index over those keys, in the order the server reported them.
+
+    Raises:
+        StorageError: If any match enforces uniqueness under a folding collation, or if no match is one
+            this package can use. In the second case the first match's own failure is what is reported,
+            which for a single match is the message it has always produced.
+    """
+    if not spec.date_only:
+        for found_name, found in matches:
+            locale = _folding_locale(found)
+            if locale is not None and found.get("unique"):
+                raise StorageError(_folded_constraint_message(collection_name, namespace, spec, found_name, locale))
+
+    first: StorageError | None = None
+    for found_name, found in matches:
+        try:
+            _check_collation(collection_name, namespace, spec, found_name, found)
+            _check_options(collection_name, namespace, spec, found_name, found)
+        except StorageError as refusal:
+            first = first or refusal
+            continue
+        return
+    # Unreachable with an empty `matches`, which the caller filters out, and otherwise `first` is set:
+    # the loop returns on the first match that passes both checks, so arriving here means none did.
+    assert first is not None
+    raise first
+
+
+def _folded_constraint_message(
+    collection_name: str,
+    namespace: str,
+    spec: IndexSpec,
+    found_name: str,
+    locale: str,
+) -> str:
+    """Build the refusal for a unique index enforcing its rule under a folding collation (``REQ-E-190``).
+
+    Separate from ``_check_collation``'s message because the situation it describes is different, and the
+    difference is the part a reader will not guess: here the declared index may be present and perfectly
+    correct, so the obvious remedy -- create the right index -- has already been done and did not help.
+
+    Args:
+        collection_name: The collection, for the commands in the message.
+        namespace: ``database.collection``, for the message.
+        spec: The declared index whose keys this index covers.
+        found_name: What the existing index is called.
+        locale: The locale it folds under.
+
+    Returns:
+        The message, ending in the command that removes the index and the command that recreates the
+        declared one, for the case where it is not there either.
+    """
+    return (
+        f"strands_mongodb: the index {found_name!r} on {namespace} covers the keys {list(spec.keys)} "
+        f"that {spec.name!r} needs, it is unique, and it was created with the collation {locale!r}. The "
+        f"server enforces that uniqueness on the folded values, so two records differing only in the case "
+        f"of those keys collide as one -- and it goes on enforcing it whether or not a correctly collated "
+        f"index sits beside it, because an index's identity here is its keys and its collation together "
+        f"and the server keeps both indexes. This package queries and deduplicates with byte-for-byte "
+        f"comparison, so it cannot see that rule and cannot report it. Dropping this index is not this "
+        f"package's decision to make: it may be serving queries nothing here knows about. To resolve it, "
+        f"drop it, and create the declared index if it is not already there:\n"
+        f"{drop_index_command(collection_name, found_name)}\n"
+        f"{spec.creation_command(collection_name)}\n"
     )
 
 
@@ -956,21 +1081,21 @@ def _check_collation(
             index may be serving queries nothing here knows about, and dropping it is not this package's
             decision to make.
     """
-    collation = found.get("collation")
-    if not isinstance(collation, Mapping):
+    if spec.date_only:
         return
-    locale = collation.get("locale")
-    if locale == SIMPLE_LOCALE:
+    locale = _folding_locale(found)
+    if locale is None:
         return
     raise StorageError(
         f"strands_mongodb: the index {found_name!r} on {namespace} covers the keys {list(spec.keys)} "
         f"that {spec.name!r} needs, but it was created with the collation {locale!r} and this package "
         f"needs one that compares strings byte for byte. An index that folds case makes the rule it "
         f"enforces the folded rule, which for {spec.name!r} means two records differing only in case "
-        f"collide as one. Creating a second index over the same keys is rejected by the server whatever "
-        f"it is named, and dropping this one is not this package's decision to make: it may be serving "
-        f"queries nothing here knows about. To resolve it, drop the existing index and let the next call "
-        f"recreate it:\n"
+        f"collide as one, and a query that compares exactly cannot use it at all. The server would let a "
+        f"second index be created over these keys under a different collation, but that does not help: "
+        f"both would exist and both would be enforced. Dropping this one is not this package's decision "
+        f"to make -- it may be serving queries nothing here knows about. To resolve it, drop the existing "
+        f"index and let the next call recreate it:\n"
         f"{drop_index_command(collection_name, found_name)}\n"
         f"{spec.creation_command(collection_name)}\n"
     )
@@ -996,9 +1121,10 @@ def _check_options(
         raise StorageError(
             f"strands_mongodb: the index {found_name!r} on {namespace} covers the keys "
             f"{list(spec.keys)} that {spec.name!r} needs, but its {option} is {actual} and this "
-            f"package needs {wanted!r}. Creating a second index over the same keys is rejected by the "
-            f"server whatever it is named, and dropping this one is not this package's decision to "
-            f"make: it may be serving queries nothing here knows about. To resolve it, drop the "
+            f"package needs {wanted!r}. Creating a second index over the same keys under the same "
+            f"collation is rejected by the server whatever it is named, and dropping this one is not "
+            f"this package's decision to make: it may be serving queries nothing here knows about. To "
+            f"resolve it, drop the "
             f"existing index and let the next call recreate it:\n"
             f"{drop_index_command(collection_name, found_name)}\n"
             f"{spec.creation_command(collection_name)}\n"

@@ -816,8 +816,10 @@ class TestAMatchedIndexWhoseCollationFoldsCaseIsRefused:
         assert "dropIndex" in message
 
     async def test_nothing_is_created_on_the_way_to_the_refusal(self) -> None:
-        """``create=True`` cannot resolve this one either: a second index over those keys is code 85, and
-        dropping somebody else's is not this package's decision (``REQ-E-063``'s standing rule)."""
+        """``create=True`` cannot resolve this one either. Not because the server would refuse the
+        creation -- under a different collation it accepts it, which is ``REQ-E-190`` -- but because the
+        folded constraint would still be enforced beside it, and dropping somebody else's index is not
+        this package's decision (``REQ-E-063``'s standing rule)."""
         from strands.types.exceptions import StorageError
 
         collection = self._matched(collation={"locale": "en", "strength": 2})
@@ -854,6 +856,225 @@ class TestAMatchedIndexWhoseCollationFoldsCaseIsRefused:
         await _indexes.ensure(collection, ordinary=[self._dedup_spec()], create=True)
 
         assert len(collection.created_indexes) == 1
+
+
+class TestAFoldedConstraintBehindACorrectIndexIsStillRefused:
+    """AT-196 / ``REQ-E-190`` — the half of ``REQ-E-187`` that looked at one index where there are several.
+
+    An index's identity on the server is its keys **and** its collation. Measured on 7.0.12: a second
+    index over the same keys under the same collation is refused whatever it is named, and a second index
+    over the same keys under a *different* collation is created. So a collection can carry the declared
+    dedup index and a folding unique index over the same three keys at once, both enforced.
+
+    ``by_keys`` was built by a dict comprehension, so the last entry per key list won and the rest were
+    never examined. Which one that is, is creation order -- and measured through the real ``ensure()``,
+    the identical deployment is accepted when the folding index was created first and refused when it was
+    created second. What makes the accepted case a defect rather than a cosmetic inconsistency is that the
+    server enforces both constraints regardless of which one this package read.
+    """
+
+    FOLDING: Final[dict[str, Any]] = {"locale": "en", "strength": 2}
+
+    @staticmethod
+    def _dedup_spec() -> _indexes.IndexSpec:
+        """The unique partial index the dedup constraint rests on."""
+        return next(spec for spec in _indexes.memory_specs() if spec.options.get("unique"))
+
+    def _both(self, *, folding_first: bool) -> Any:
+        """A collection carrying the declared index and a folding unique one, in the given order.
+
+        Args:
+            folding_first: Whether the folding index is the one ``index_information`` reports first.
+                This is the whole variable: it is what decided the answer before ``REQ-E-190``.
+
+        Returns:
+            A :class:`FakeAsyncCollection` whose index mapping preserves that order.
+        """
+        dedup = self._dedup_spec()
+        ours = (dedup.name, existing(*dedup.keys, **dedup.options))
+        theirs = ("folding_unique", existing(*dedup.keys, **dedup.options, collation=self.FOLDING))
+        pair = [theirs, ours] if folding_first else [ours, theirs]
+        return FakeAsyncCollection(indexes=dict(pair))
+
+    async def test_a_folding_unique_index_behind_the_declared_one_is_refused(self) -> None:
+        """The finding. Every option of the declared index matches an index that is really there, and the
+        deployment must still be refused because the folded rule is enforced beside it."""
+        from strands.types.exceptions import StorageError
+
+        collection = self._both(folding_first=True)
+
+        with pytest.raises(StorageError) as caught:
+            await _indexes.ensure(collection, ordinary=[self._dedup_spec()], create=True)
+
+        assert "folding_unique" in str(caught.value)
+
+    async def test_the_answer_does_not_depend_on_which_index_was_created_first(self) -> None:
+        """The defect stated as the property it violates. Two orderings, one deployment, one answer."""
+        from strands.types.exceptions import StorageError
+
+        for folding_first in (True, False):
+            with pytest.raises(StorageError):
+                await _indexes.ensure(
+                    self._both(folding_first=folding_first), ordinary=[self._dedup_spec()], create=True
+                )
+
+    async def test_the_message_names_the_index_that_is_actually_the_problem(self) -> None:
+        """Not the declared index, which is correct and is not what anyone needs to act on. Whoever reads
+        this has to find one index among several over the same keys, so it needs the name and the locale."""
+        from strands.types.exceptions import StorageError
+
+        collection = self._both(folding_first=True)
+
+        with pytest.raises(StorageError) as caught:
+            await _indexes.ensure(collection, ordinary=[self._dedup_spec()], create=True)
+
+        message = str(caught.value)
+        assert "'en'" in message
+        assert "dropIndex" in message
+
+    async def test_nothing_is_created_on_the_way_to_the_refusal(self) -> None:
+        """``create=True`` has nothing to do here: the declared index is present and correct."""
+        from strands.types.exceptions import StorageError
+
+        collection = self._both(folding_first=True)
+
+        with pytest.raises(StorageError):
+            await _indexes.ensure(collection, ordinary=[self._dedup_spec()], create=True)
+
+        assert collection.created_indexes == []
+
+    async def test_a_second_binary_index_over_the_same_keys_is_accepted(self) -> None:
+        """The first vacuity guard. A fix that refused whenever it found more than one index over a key
+        list would pass every test above, and refuse a deployment with nothing wrong with it."""
+        dedup = self._dedup_spec()
+        collection: Any = FakeAsyncCollection(
+            indexes={
+                dedup.name: existing(*dedup.keys, **dedup.options),
+                "theirs": existing(*dedup.keys, **dedup.options),
+            }
+        )
+
+        await _indexes.ensure(collection, ordinary=[dedup], create=True)
+
+        assert collection.created_indexes == []
+
+    async def test_a_folding_index_enforcing_nothing_beside_a_correct_one_is_accepted(self) -> None:
+        """The second, and the narrower one. What is refused is a folded *constraint*, not a folded index:
+        a non-unique collated index over the same keys enforces no rule, so there is no rule to be wrong
+        about. A fix that refused every folding sibling would be ``REQ-E-191``'s mistake in reverse."""
+        dedup = self._dedup_spec()
+        collection: Any = FakeAsyncCollection(
+            indexes={
+                dedup.name: existing(*dedup.keys, **dedup.options),
+                "theirs": existing(*dedup.keys, collation=self.FOLDING),
+            }
+        )
+
+        await _indexes.ensure(collection, ordinary=[dedup], create=True)
+
+        assert collection.created_indexes == []
+
+    async def test_a_folding_index_enforcing_nothing_and_alone_is_still_refused(self) -> None:
+        """The third, guarding the guard above. Relaxing the folding-sibling rule must not relax
+        ``REQ-E-187``: alone, that index is the only one over those keys, this package's binary queries
+        cannot use it, and it is refused for that reason rather than for a constraint it does not hold."""
+        from strands.types.exceptions import StorageError
+
+        dedup = self._dedup_spec()
+        collection: Any = FakeAsyncCollection(indexes={"theirs": existing(*dedup.keys, collation=self.FOLDING)})
+
+        with pytest.raises(StorageError):
+            await _indexes.ensure(collection, ordinary=[dedup], create=True)
+
+
+class TestADateOnlyIndexIsNotHeldToAStringRule:
+    """AT-197 / ``REQ-E-191`` — the other half, and a regression ``REQ-E-187`` introduced.
+
+    ``_check_collation`` ran for every ordinary spec. One of them is ``strands_expires_at_ttl``: keyed on
+    ``expires_at`` alone, non-unique, and holding a BSON date or nothing at all. A collation changes what
+    an index compares for strings, and that index will never hold one -- so the rule refused a working
+    deployment and told the operator to drop an index that does its job.
+
+    That it does its job was measured, not argued. Over a TTL index built ``{locale: "en", strength: 2}``
+    on 7.0.12, a document stamped an hour in the past was gone inside ten seconds and a document with
+    ``expires_at: null`` was left alone: the same two outcomes the binary TTL index produces.
+    """
+
+    FOLDING: Final[dict[str, Any]] = {"locale": "en", "strength": 2}
+
+    @staticmethod
+    def _ttl_spec() -> _indexes.IndexSpec:
+        """The TTL spec, taken from ``storage_specs`` so both surfaces are covered by one declaration."""
+        return _indexes.storage_specs()[0]
+
+    async def test_a_collated_ttl_index_is_accepted(self) -> None:
+        """The regression. Nothing about this deployment is wrong and the previous revision refused it."""
+        spec = self._ttl_spec()
+        collection: Any = FakeAsyncCollection(
+            indexes={spec.name: existing(*spec.keys, **spec.options, collation=self.FOLDING)}
+        )
+
+        await _indexes.ensure(collection, ordinary=[spec], create=True)
+
+        assert collection.created_indexes == []
+
+    async def test_the_whole_memory_index_set_is_accepted_over_a_collated_ttl_index(self) -> None:
+        """The regression as it actually arrived: not one spec in isolation, but the call
+        ``MongoDBMemoryStore.initialize()`` makes, which refused outright and left the store unusable."""
+        specs = _indexes.memory_specs()
+        indexes: dict[str, Any] = {}
+        for spec in specs:
+            folding = self.FOLDING if spec.name.endswith("_ttl") else {}
+            indexes[spec.name] = existing(*spec.keys, **spec.options, **({"collation": folding} if folding else {}))
+        collection: Any = FakeAsyncCollection(indexes=indexes)
+
+        await _indexes.ensure(collection, ordinary=specs, create=True)
+
+        assert collection.created_indexes == []
+
+    async def test_the_exemption_is_declared_on_the_spec_rather_than_guessed(self) -> None:
+        """Which specs are exempt is a fact about what this package writes into those fields, so it is
+        recorded where the other facts about a declared index live. Asserted because the alternative --
+        matching on a field name or an index name -- would be guessing about documents nothing has read."""
+        by_name = {spec.name: spec for spec in _indexes.memory_specs()}
+
+        assert by_name["strands_expires_at_ttl"].date_only is True
+
+    async def test_the_recency_index_is_not_exempt(self) -> None:
+        """The vacuity guard, and the one that keeps the exemption from swallowing the rule.
+        ``strands_scope_store_created_at`` keys ``scope`` and ``store_name`` as well, both strings this
+        package compares exactly, so a folding collation on it is still refused."""
+        from strands.types.exceptions import StorageError
+
+        spec = next(s for s in _indexes.memory_specs() if s.name.endswith("_created_at"))
+        collection: Any = FakeAsyncCollection(
+            indexes={spec.name: existing(*spec.keys, **spec.options, collation=self.FOLDING)}
+        )
+
+        assert spec.date_only is False
+        with pytest.raises(StorageError):
+            await _indexes.ensure(collection, ordinary=[spec], create=True)
+
+    async def test_the_dedup_index_is_not_exempt(self) -> None:
+        """The second vacuity guard. ``REQ-E-187``'s own case has to keep failing, or this change has
+        quietly removed the rule it is narrowing."""
+        from strands.types.exceptions import StorageError
+
+        spec = next(s for s in _indexes.memory_specs() if s.options.get("unique"))
+        collection: Any = FakeAsyncCollection(
+            indexes={spec.name: existing(*spec.keys, **spec.options, collation=self.FOLDING)}
+        )
+
+        assert spec.date_only is False
+        with pytest.raises(StorageError):
+            await _indexes.ensure(collection, ordinary=[spec], create=True)
+
+    async def test_a_date_only_index_this_package_creates_carries_no_collation(self) -> None:
+        """The exemption is about reading somebody else's index, not about building one. Nothing here
+        ever creates a collated index, and if that changed the exemption would be hiding it."""
+        spec = self._ttl_spec()
+
+        assert "collation" not in spec.creation_command("memory")
 
 
 def search_states(name: str, *statuses: str, definition: Mapping[str, Any] | None = None) -> Any:
@@ -2485,3 +2706,180 @@ class TestEveryCallSitePassesTheConfiguredBudget:
             f"these _indexes.ensure call sites pass no timeout=, so index_ready_timeout does not "
             f"reach them and they wait out the module default instead (REQ-E-122): {missing}"
         )
+
+
+@pytest.mark.contract
+class TestCompetingIndexesAgainstARealDeployment:
+    """AT-196 / ``REQ-E-190`` — boundary **B-1**. The premise the fake cannot assert.
+
+    Everything in the unit class above rests on one claim about the server: that a second index over the
+    same keys under a *different* collation is created rather than refused. If that is wrong, a collection
+    cannot carry two competing indexes and the finding does not exist. The fake is built from that claim,
+    so it cannot test it; this class builds the indexes and asks.
+
+    The remaining tests then show that the constraint the check now looks for is really enforced -- that
+    the folded rule refuses a write the binary index would have accepted, on a deployment where both
+    indexes are present and the declared one is entirely correct.
+    """
+
+    FOLDING: Final[dict[str, Any]] = {"locale": "en", "strength": 2}
+
+    @staticmethod
+    def _dedup_spec() -> _indexes.IndexSpec:
+        """The unique partial index the dedup constraint rests on."""
+        return next(spec for spec in _indexes.memory_specs() if spec.options.get("unique"))
+
+    async def _both(self, collection: Any) -> _indexes.IndexSpec:
+        """Build the declared dedup index and a folding unique index over the same keys.
+
+        Args:
+            collection: The contract collection to build them on.
+
+        Returns:
+            The declared spec, for the assertions.
+        """
+        from pymongo import IndexModel
+
+        dedup = self._dedup_spec()
+        await collection.create_indexes([dedup.to_model()])
+        await collection.create_indexes(
+            [IndexModel(list(dedup.keys), name="folding_unique", **dedup.options, collation=self.FOLDING)]
+        )
+        return dedup
+
+    async def test_the_server_keeps_both_indexes_over_one_key_list(
+        self, contract_database: Any, unique_collection_name: str
+    ) -> None:
+        """The premise. An index's identity is its keys and its collation, and if it were the keys alone
+        the second creation here would be a conflict rather than an index."""
+        collection = contract_database[unique_collection_name]
+        dedup = await self._both(collection)
+
+        found = await collection.index_information()
+
+        over_those_keys = [
+            name for name, entry in found.items() if [tuple(p) for p in entry["key"]] == list(dedup.keys)
+        ]
+        assert sorted(over_those_keys) == sorted([dedup.name, "folding_unique"])
+
+    async def test_ensure_refuses_the_deployment_the_declared_index_is_correct_on(
+        self, contract_database: Any, unique_collection_name: str
+    ) -> None:
+        """The finding. The declared index is present, correct, and matches every option -- and the
+        deployment is still refused, which is the whole difference from ``REQ-E-187``."""
+        from strands.types.exceptions import StorageError
+
+        collection = contract_database[unique_collection_name]
+        dedup = await self._both(collection)
+        before = await collection.index_information()
+
+        with pytest.raises(StorageError) as caught:
+            await _indexes.ensure(collection, ordinary=[dedup], create=True)
+
+        assert "folding_unique" in str(caught.value)
+        assert await collection.index_information() == before
+
+    async def test_the_folded_constraint_refuses_a_write_the_declared_index_allows(
+        self, contract_database: Any, unique_collection_name: str
+    ) -> None:
+        """What the refusal is refusing. Two records differing only in the case of ``scope`` are distinct
+        under the declared index and one record under the folding one, and the server enforces both."""
+        from pymongo.errors import DuplicateKeyError
+
+        collection = contract_database[unique_collection_name]
+        await self._both(collection)
+        await collection.insert_one({"scope": "Tenant-A", "store_name": "s", "content_hash": "h"})
+
+        with pytest.raises(DuplicateKeyError) as caught:
+            await collection.insert_one({"scope": "tenant-a", "store_name": "s", "content_hash": "h"})
+
+        assert "folding_unique" in str(caught.value)
+
+    async def test_the_declared_index_alone_accepts_that_same_write(
+        self, contract_database: Any, unique_collection_name: str
+    ) -> None:
+        """The vacuity guard, and the one that makes the test above mean anything. Without it, that
+        ``DuplicateKeyError`` could be the declared index doing its job on a genuinely duplicate record."""
+        collection = contract_database[unique_collection_name]
+        await collection.create_indexes([self._dedup_spec().to_model()])
+        await collection.insert_one({"scope": "Tenant-A", "store_name": "s", "content_hash": "h"})
+
+        await collection.insert_one({"scope": "tenant-a", "store_name": "s", "content_hash": "h"})
+
+        assert await collection.count_documents({}) == 2
+
+
+@pytest.mark.contract
+class TestACollatedTtlIndexAgainstARealDeployment:
+    """AT-197 / ``REQ-E-191`` — boundary **B-1**. That the refused index worked, measured.
+
+    The exemption rests on a claim about the server: that a non-simple collation on a date-only TTL index
+    changes nothing about expiry. Reasoning gets you there -- a collation orders strings and a BSON date is
+    not one -- but the previous revision's refusal was also reasoned, so this asks instead.
+
+    ``expireAfterSeconds`` is swept by a background task on its own schedule, roughly once a minute, which
+    is longer than a test should wait. What is asserted here is what can be asserted promptly: the server
+    accepts the index, reports the collation the check reads, and agrees the index is a TTL index. The
+    deletion itself was measured separately against ``mongod`` 7.0.12 -- a document stamped an hour in the
+    past was gone inside ten seconds of the sweep and an ``expires_at: null`` document was left in place.
+    """
+
+    FOLDING: Final[dict[str, Any]] = {"locale": "en", "strength": 2}
+
+    async def _collated_ttl(self, collection: Any) -> _indexes.IndexSpec:
+        """Build the TTL index with a folding collation, as an operator's own tooling might have.
+
+        Args:
+            collection: The contract collection to build it on.
+
+        Returns:
+            The declared TTL spec.
+        """
+        from pymongo import IndexModel
+
+        spec = _indexes.storage_specs()[0]
+        await collection.create_indexes(
+            [IndexModel(list(spec.keys), name=spec.name, **spec.options, collation=self.FOLDING)]
+        )
+        return spec
+
+    async def test_the_server_builds_a_collated_ttl_index_at_all(
+        self, contract_database: Any, unique_collection_name: str
+    ) -> None:
+        """The premise. If the server refused this combination the regression could not arise, and the
+        exemption would be code for a deployment that cannot exist."""
+        collection = contract_database[unique_collection_name]
+        spec = await self._collated_ttl(collection)
+
+        found = (await collection.index_information())[spec.name]
+
+        assert found.get("collation", {}).get("locale") == "en"
+        assert found.get("expireAfterSeconds") == 0
+
+    async def test_ensure_accepts_it(self, contract_database: Any, unique_collection_name: str) -> None:
+        """The regression, against the server rather than the fake: this call raised in the previous
+        revision, which is ``ensure_indexes()`` failing on a deployment that expires documents correctly."""
+        collection = contract_database[unique_collection_name]
+        spec = await self._collated_ttl(collection)
+        before = await collection.index_information()
+
+        await _indexes.ensure(collection, ordinary=[spec], create=True)
+
+        assert await collection.index_information() == before
+
+    async def test_a_collated_index_on_the_dedup_keys_is_still_refused(
+        self, contract_database: Any, unique_collection_name: str
+    ) -> None:
+        """The vacuity guard. The exemption is for the date-only index and nothing else, and an exemption
+        that leaked to the specs keying strings would undo ``REQ-E-187`` on a real deployment."""
+        from pymongo import IndexModel
+        from strands.types.exceptions import StorageError
+
+        collection = contract_database[unique_collection_name]
+        dedup = next(spec for spec in _indexes.memory_specs() if spec.options.get("unique"))
+        await collection.create_indexes(
+            [IndexModel(list(dedup.keys), name="theirs", **dedup.options, collation=self.FOLDING)]
+        )
+
+        with pytest.raises(StorageError):
+            await _indexes.ensure(collection, ordinary=[dedup], create=True)
