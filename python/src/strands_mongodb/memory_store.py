@@ -535,9 +535,10 @@ class MongoDBMemoryStore:
         Writes work on it, so failing construction or setup would take away the half that functions.
 
         Raises:
-            StorageError: If a driver call fails, or if ``search_type`` names a tier the deployment
-                cannot prepare. Under ``auto`` a tier that cannot be prepared is skipped instead, and
-                only an empty result raises.
+            StorageError: If a driver call fails, if the collection was created with a collation that
+                does not compare strings byte by byte (``REQ-E-170``), or if ``search_type`` names a tier
+                the deployment cannot prepare. Under ``auto`` a tier that cannot be prepared is skipped
+                instead, and only an empty result raises.
         """
         if self._initialized:
             return
@@ -552,6 +553,20 @@ class MongoDBMemoryStore:
                 return
 
             collection = self._collection()
+
+            # Before any index is created, because provisioning a collection that cannot hold this
+            # store's scopes apart is pointless (``REQ-E-170``). `MongoDBStorage` reaches the same check
+            # through a helper; here it is inline and unguarded by any extra lock, because this block
+            # already holds the connection's. What is at stake on this surface is not `_id` but `scope`:
+            # `_filter.compose` pins `{"scope": self.scope, "store_name": self.name}` on every read,
+            # update and delete, so a collation that folds case makes `scope="tenant-b"` match documents
+            # written under `Tenant-B` -- premortem **P-1**, a cross-scope read, arriving through the
+            # collection's own comparison rules rather than through a caller-supplied filter.
+            target = (self._database_name, self._collection_name)
+            if target not in connection.binary_keys:
+                await _indexes.require_binary_comparison(collection)
+                connection.binary_keys.add(target)
+
             capabilities = connection.capabilities
             if capabilities is None:
                 # Through the module rather than through a direct import, so this stays one observable

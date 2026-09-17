@@ -15,9 +15,10 @@ import asyncio
 import hashlib
 import json
 import logging
+import threading
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from strands_mongodb._extras import missing_extra
 
@@ -110,13 +111,30 @@ class _Connection:
             ``loop``; read it through :meth:`get_lock`.
         loop: The event loop ``lock`` is usable on, or ``None`` before its first use.
         capabilities: Result of the server capability probe, or ``None`` until it has run.
+        binary_keys: ``(database, collection)`` pairs whose default collation has been read and found
+            binary (``REQ-E-170``). Cached here rather than on the store for the reason ``capabilities``
+            is: N stores over one collection share the answer, and a namespaced store is a second store
+            over the same collection (``REQ-E-039``), so a per-instance cache would be a round trip per
+            namespace. A collation cannot be altered in place, so the only way this cache goes stale is
+            somebody dropping the collection and recreating it under the same name while the process
+            runs, which is not a case worth a round trip per operation to catch.
     """
 
-    client: AsyncMongoClient[Any]
+    # `repr=False`, and this is the field that needs it (``REQ-E-171``). A dataclass renders every field,
+    # and `AsyncMongoClient.__repr__` renders every non-default option it was built with. pymongo redacts
+    # the password in the URI it prints, which is what makes this look safe and is not the whole story:
+    # `authMechanismProperties` carries `AWS_SESSION_TOKEN` and `tlsCertificateKeyFilePassword` is a
+    # password by name, and neither is redacted. Both reached `repr(connection)` and, through the values
+    # of the registry dict, `repr(_REGISTRY)` -- so a debugger frame, a logged local, or an exception
+    # rendering its arguments published them. Reported by a production-readiness review; `AT-177` is the
+    # gate. The client is reachable as an attribute, which is what the rest of this module uses; what it
+    # is not any more is part of anything that renders itself by default.
+    client: AsyncMongoClient[Any] = field(repr=False)
     owned: bool
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     loop: asyncio.AbstractEventLoop | None = None
     capabilities: Capabilities | None = None
+    binary_keys: set[tuple[str, str]] = field(default_factory=set)
 
     def get_lock(self) -> asyncio.Lock:
         """Return a lock usable on the running event loop, replacing it if the loop changed.
@@ -158,6 +176,30 @@ _RegistryKey = tuple[str, asyncio.AbstractEventLoop | None]
 # every store built from one config shares one pool per event loop.
 _REGISTRY: dict[_RegistryKey, _Connection] = {}
 
+_REGISTRY_LOCK: Final = threading.RLock()
+"""Guards every read, every mutation and every iteration of :data:`_REGISTRY` (``REQ-E-172``).
+
+A **thread** lock rather than an ``asyncio`` one, because the hazard is not concurrency on one loop.
+``resolve`` is synchronous and process-global state is per process, so two threads each running their own
+loop -- which is what a synchronous ``Agent`` does, and what a thread pool of them does more of -- reach
+this dict at the same time with no loop in common to serialise them. An ``asyncio.Lock`` would serialise
+neither, and a coroutine cannot be required here anyway: ``resolve`` is called from
+``MongoDBStorage.__init__``, which is not one.
+
+Reentrant, because ``resolve`` holds it across a call to :func:`_register`, which needs it too. A plain
+``Lock`` would deadlock that single thread against itself, and splitting the two functions to avoid the
+nesting would put the check and the act on either side of a release, which is the defect this exists to
+close.
+
+**Never held across an ``await``.** :func:`close` takes it for the snapshot and again for each removal,
+and releases it before waiting on ``client.close()``. Holding it across the suspension would block the
+thread the loop runs on, so the coroutine that must release it could not be resumed by the loop that is
+waiting for it -- a deadlock rather than a slow path, and in a teardown.
+
+Reported by a production-readiness review, which reproduced the ``KeyError`` with overlapping event-loop
+resolutions across threads. ``AT-178`` is the gate.
+"""
+
 
 def _running_loop() -> asyncio.AbstractEventLoop | None:
     """Return the running event loop, or ``None`` when there is none.
@@ -185,9 +227,18 @@ def _reap_closed_loops() -> None:
 
     The client itself is dropped rather than closed, deliberately. It holds sockets that only its dead
     loop's selector can reach, so the file descriptors are released when the object is collected.
+
+    Under :data:`_REGISTRY_LOCK`, and removing with ``pop(key, None)`` rather than ``del`` (``REQ-E-172``).
+    Two things went wrong without it, and they need different halves of the fix. The snapshot iterated a
+    dict another thread could be writing, which is a ``RuntimeError`` from CPython and needs the lock; and
+    the removal named a key another thread's reap could already have taken, which is a ``KeyError`` and
+    needs the default. Both surfaced in ``resolve``, on the caller's first use of a connection, having
+    nothing to do with what that caller asked for. ``close()`` reached the second conclusion first, for
+    ``REQ-E-017c``, from one loop rather than from two threads.
     """
-    for key in [key for key, _ in _REGISTRY.items() if key[1] is not None and key[1].is_closed()]:
-        del _REGISTRY[key]
+    with _REGISTRY_LOCK:
+        for key in [key for key, _ in _REGISTRY.items() if key[1] is not None and key[1].is_closed()]:
+            _REGISTRY.pop(key, None)
 
 
 def _package_version() -> str:
@@ -314,43 +365,49 @@ def resolve(config: MongoDBConfig) -> _Connection:
     """
     identity = _identity(config)
 
-    injected = config.get("client")
-    if injected is not None:
-        # REQ-E-017a's carve-out: one slot, keyed on no loop at all. We did not build this client, so
-        # there is no second copy to build, and REQ-E-010 forbids closing the one we have. A caller
-        # who drives an injected client from two loops gets pymongo's own RuntimeError, which names
-        # the object they own.
-        return _register(identity, None, injected, owned=False, attribute=True)
+    # One lock over the whole body, because every branch below is a check followed by an act on
+    # process-global state and the two must not be separable by another thread (``REQ-E-172``). Nothing
+    # in here does I/O: `AsyncMongoClient()` builds a pool lazily and connects on first use, and
+    # `_identity` -- the one call that can raise -- is deliberately above the lock, so a config with no
+    # way to reach a database is rejected without touching the registry at all (``REQ-E-015``).
+    with _REGISTRY_LOCK:
+        injected = config.get("client")
+        if injected is not None:
+            # REQ-E-017a's carve-out: one slot, keyed on no loop at all. We did not build this client, so
+            # there is no second copy to build, and REQ-E-010 forbids closing the one we have. A caller
+            # who drives an injected client from two loops gets pymongo's own RuntimeError, which names
+            # the object they own.
+            return _register(identity, None, injected, owned=False, attribute=True)
 
-    running = _running_loop()
-    existing = _REGISTRY.get((identity, running))
-    if existing is not None:
-        # Returning here is what keeps REQ-E-016's warning to one line per connection rather than one
-        # per store, and a Storage is resolved once per SDK subsystem that consumes it. Reapplying the
-        # attribution would in fact be harmless, since `_update_metadata` dedupes by driver name, but
-        # re-warning would not be.
-        return existing
+        running = _running_loop()
+        existing = _REGISTRY.get((identity, running))
+        if existing is not None:
+            # Returning here is what keeps REQ-E-016's warning to one line per connection rather than one
+            # per store, and a Storage is resolved once per SDK subsystem that consumes it. Reapplying the
+            # attribution would in fact be harmless, since `_update_metadata` dedupes by driver name, but
+            # re-warning would not be.
+            return existing
 
-    if running is not None:
-        # Adoption (REQ-E-017a). A client built with no loop running has not bound itself to anything,
-        # so the first loop that asks for it takes it over. Building a second here instead would leave
-        # the first open, unused, and never closed, in the ordinary case of constructing a store at
-        # import time and using it on one loop.
-        adopted = _REGISTRY.pop((identity, None), None)
-        if adopted is not None:
-            _REGISTRY[(identity, running)] = adopted
-            return adopted
+        if running is not None:
+            # Adoption (REQ-E-017a). A client built with no loop running has not bound itself to anything,
+            # so the first loop that asks for it takes it over. Building a second here instead would leave
+            # the first open, unused, and never closed, in the ordinary case of constructing a store at
+            # import time and using it on one loop.
+            adopted = _REGISTRY.pop((identity, None), None)
+            if adopted is not None:
+                _REGISTRY[(identity, running)] = adopted
+                return adopted
 
-    _reap_closed_loops()
+        _reap_closed_loops()
 
-    # `driver=` reaches pymongo through `**kwargs` rather than a named parameter, so nothing type
-    # checks it. AT-013a asserts the resulting pool metadata instead of the call.
-    client: AsyncMongoClient[Any] = AsyncMongoClient(
-        config["connection_string"],
-        driver=_driver_info(),
-        **(config.get("client_args") or {}),
-    )
-    return _register(identity, running, client, owned=True, attribute=False)
+        # `driver=` reaches pymongo through `**kwargs` rather than a named parameter, so nothing type
+        # checks it. AT-013a asserts the resulting pool metadata instead of the call.
+        client: AsyncMongoClient[Any] = AsyncMongoClient(
+            config["connection_string"],
+            driver=_driver_info(),
+            **(config.get("client_args") or {}),
+        )
+        return _register(identity, running, client, owned=True, attribute=False)
 
 
 def _register(
@@ -373,14 +430,19 @@ def _register(
     Returns:
         The registered connection, existing or new.
     """
-    existing = _REGISTRY.get((identity, loop))
-    if existing is not None:
-        return existing
-    if attribute:
-        _attribute_injected_client(client)
-    _warn_if_retries_disabled(client)
-    _REGISTRY[(identity, loop)] = _Connection(client=client, owned=owned)
-    return _REGISTRY[(identity, loop)]
+    # Its own acquisition rather than a documented precondition, because this is also the function that
+    # decides whether the warning happens: the check and the insert have to be one step for the "at most
+    # once" in this docstring to hold across threads (``REQ-E-172``). :data:`_REGISTRY_LOCK` is reentrant,
+    # so the nesting under ``resolve``, which is the only caller, costs nothing.
+    with _REGISTRY_LOCK:
+        existing = _REGISTRY.get((identity, loop))
+        if existing is not None:
+            return existing
+        if attribute:
+            _attribute_injected_client(client)
+        _warn_if_retries_disabled(client)
+        _REGISTRY[(identity, loop)] = _Connection(client=client, owned=owned)
+        return _REGISTRY[(identity, loop)]
 
 
 async def close(config: MongoDBConfig) -> None:
@@ -409,13 +471,21 @@ async def close(config: MongoDBConfig) -> None:
         return
 
     running = asyncio.get_running_loop()
-    for key in [key for key in _REGISTRY if key[0] == identity]:
+    with _REGISTRY_LOCK:
+        # The snapshot is taken under the lock and the iteration below runs outside it, which is the only
+        # arrangement available here (``REQ-E-172``): there is an `await` in the loop body, and holding a
+        # thread lock across it would block the thread this loop runs on, so whoever has to release the
+        # lock could never be resumed. A teardown path must not be able to deadlock.
+        keys = [key for key in _REGISTRY if key[0] == identity]
+
+    for key in keys:
         # Popped with a default because the snapshot above can go stale before this line reaches the end
         # of it (`REQ-E-017c`). There is an `await` inside this loop, so anything that removes a slot
         # gets a turn: a second concurrent `close()` for the same config, which is what three stores
         # closing under one `gather` do, or the reap in `resolve()`. Either way the slot is gone because
         # somebody released it, which is the outcome this call wanted.
-        connection = _REGISTRY.pop(key, None)
+        with _REGISTRY_LOCK:
+            connection = _REGISTRY.pop(key, None)
         if connection is None or not connection.owned:
             continue
         loop = key[1]

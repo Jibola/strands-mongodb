@@ -14,11 +14,37 @@ assert the shape we emit rather than re-probing the server on every run.
 
 from __future__ import annotations
 
+import re
+from collections import ChainMap, UserDict
+from collections.abc import Iterator, Mapping
+from types import MappingProxyType
 from typing import Any
 
 import pytest
 
 from strands_mongodb import _filter
+
+
+class _MinimalMapping(Mapping[str, Any]):
+    """A mapping that is not a ``dict`` and does not inherit from one.
+
+    ``UserDict`` wraps a ``dict``, ``MappingProxyType`` proxies one and ``ChainMap`` composes them, so all
+    three could be dismissed as library types with a ``dict`` inside. This one is what a caller writes: a
+    class registered as a mapping and nothing more. bson encodes it, ``AT-179`` walks it.
+    """
+
+    def __init__(self, contents: dict[str, Any]) -> None:
+        self._contents = contents
+
+    def __getitem__(self, key: str) -> Any:
+        return self._contents[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._contents)
+
+    def __len__(self) -> int:
+        return len(self._contents)
+
 
 # The paths the index definition always declares, before any caller-supplied `filter_fields`.
 BAKED_IN = ("scope", "store_name")
@@ -141,6 +167,161 @@ class TestOperatorKeysAreRejectedAtAnyDepth:
         """
         with pytest.raises(ValueError, match=r"\$gt"):
             _filter.validate({"age": {"$gt": 5}}, declared_fields=("age",))
+
+
+class TestTheGuardsCoverEveryMappingAndRefuseEveryRegex:
+    """AT-179 / ``REQ-E-173``, ``REQ-E-174`` — two ways past the exact-match policy, both measured.
+
+    ``TestOperatorKeysAreRejectedAtAnyDepth`` above says the guard rejects keys and not values, and cites
+    the reference implementation for it. Both halves of that sentence had a hole in them, and a
+    production-readiness review found each:
+
+    * the recursion tested ``isinstance(value, dict)``, while bson encodes **any** mapping as a
+      subdocument. A ``UserDict`` value carrying ``$ne`` was never walked, so its operator key was never
+      seen, and it reached the server as an operator anyway;
+    * a value is not always data. A regex value is dispatched on by ``$match`` exactly as a key is: it
+      pattern-matches where the policy promises comparison.
+
+    Measured on MongoDB 8.0.32 against two documents whose ``tier`` is ``"gold"`` and ``"silver"``, all
+    four through the real ``validate`` and ``compose``:
+
+    * ``{"tier": UserDict({"$ne": "gold"})}`` validated, composed to
+      ``{"$and": [{"scope": ...}, {"store_name": ...}, {"tier": {"$ne": "gold"}}]}`` and matched the
+      silver document -- the exact inverse of the filter's stated meaning;
+    * ``{"tier": {"inner": UserDict({"$ne": None})}}`` validated for the same reason;
+    * ``{"tier": re.compile("^gol")}`` validated and matched the gold document, where an exact match on
+      the four characters ``^gol`` matches nothing;
+    * ``{"tier": bson.Regex("^gol")}`` did the same.
+
+    The scope conjunction held in every case, which is what makes this a filter-policy bypass and not a
+    cross-scope read: ``compose`` pins ``scope`` and ``store_name`` itself and a caller term can only
+    narrow. That is the difference between this and premortem **P-1**, and it is the reason the finding is
+    a P2. The policy is still the thing being defended -- an exact-value filter whose values are not exact
+    is a promise this package makes and does not keep.
+    """
+
+    DECLARED = ("tier", "scope", "store_name")
+
+    @staticmethod
+    def _mappings(payload: dict[str, Any]) -> dict[str, Any]:
+        """Return the payload wrapped in each mapping type that is not a ``dict``.
+
+        Args:
+            payload: The contents to wrap.
+
+        Returns:
+            One entry per mapping flavour, keyed by a name a parametrized test id can carry.
+        """
+        return {
+            "UserDict": UserDict(payload),
+            "MappingProxyType": MappingProxyType(payload),
+            "ChainMap": ChainMap(payload),
+            "custom Mapping": _MinimalMapping(payload),
+        }
+
+    def test_bson_encodes_a_non_dict_mapping_exactly_as_a_dict(self) -> None:
+        """The premise, asserted rather than assumed: this is why ``dict`` was the wrong test.
+
+        If bson refused a ``UserDict``, the old guard would have been fine and the failure would have been
+        a loud one from inside the driver. It does not refuse it -- the two encodings are byte-identical --
+        so the operator arrived at the server having been declared inert by a guard that never looked at it.
+        """
+        import bson
+
+        assert bson.encode({"tier": UserDict({"$ne": "gold"})}) == bson.encode({"tier": {"$ne": "gold"}})
+
+    @pytest.mark.parametrize("flavour", ["UserDict", "MappingProxyType", "ChainMap", "custom Mapping"])
+    def test_an_operator_inside_a_mapping_value_is_rejected(self, flavour: str) -> None:
+        """``REQ-E-173`` — every mapping, not every ``dict``. The four here are what the stdlib and bson
+        hand a caller without asking them to subclass anything."""
+        value = self._mappings({"$ne": "gold"})[flavour]
+
+        with pytest.raises(ValueError, match=r"\$ne"):
+            _filter.validate({"tier": value}, declared_fields=self.DECLARED)
+
+    def test_an_operator_inside_a_mapping_nested_one_level_down_is_rejected(self) -> None:
+        """The recursion has to carry the widened test with it, or the fix is a one-level fix."""
+        with pytest.raises(ValueError, match=r"\$ne"):
+            _filter.validate({"tier": {"inner": UserDict({"$ne": None})}}, declared_fields=self.DECLARED)
+
+    def test_an_operator_inside_a_mapping_inside_a_list_is_rejected(self) -> None:
+        """Both extensions at once: the list walk this package added, over the mapping test it now uses."""
+        with pytest.raises(ValueError, match=r"\$where"):
+            _filter.validate({"tier": [UserDict({"$where": "sleep(1000)"})]}, declared_fields=self.DECLARED)
+
+    def test_a_non_dict_mapping_is_accepted_as_the_filter_itself(self) -> None:
+        """The top level, which is the one place a mapping was always walked -- by ``validate``'s caller
+        contract rather than by the guard. Asserted so the widened recursion cannot break it."""
+        _filter.validate(UserDict({"tier": "gold"}), declared_fields=self.DECLARED)
+
+    def test_a_clean_mapping_value_is_still_allowed(self) -> None:
+        """The vacuity guard for all of the above. A mapping value with no operator key in it is exact
+        subdocument equality, which is a documented filter shape, and a guard that rejected every mapping
+        would pass every test above while breaking callers."""
+        _filter.validate({"tier": UserDict({"inner": "gold"})}, declared_fields=self.DECLARED)
+        _filter.validate({"tier": MappingProxyType({"inner": "gold"})}, declared_fields=self.DECLARED)
+
+    def test_a_native_regex_value_is_rejected_and_the_message_names_the_field(self) -> None:
+        """``REQ-E-174`` — ``re.compile`` is the flavour a Python caller reaches for by reflex."""
+        with pytest.raises(ValueError) as caught:
+            _filter.validate({"tier": re.compile("^gol")}, declared_fields=self.DECLARED)
+
+        assert "'tier'" in str(caught.value)
+        assert "regular expression" in str(caught.value)
+
+    def test_a_bson_regex_value_is_rejected(self) -> None:
+        """The other flavour, and the one that exists for no purpose except carrying a pattern.
+
+        Refused by class name rather than by ``isinstance``, because ``_filter`` imports no part of
+        pymongo. This is the test that fails if that name ever changes, which is the trade the name check
+        makes and the reason it is written down.
+        """
+        import bson
+
+        with pytest.raises(ValueError, match="regular expression"):
+            _filter.validate({"tier": bson.Regex("^gol")}, declared_fields=self.DECLARED)
+
+    def test_a_subclass_of_the_bson_regex_is_rejected_too(self) -> None:
+        """Why the MRO is walked instead of ``type(value)`` being compared: one subclass would be enough."""
+        import bson
+
+        class Sneaky(bson.Regex):  # type: ignore[type-arg,misc]
+            """A pattern wearing a different name."""
+
+        with pytest.raises(ValueError, match="regular expression"):
+            _filter.validate({"tier": Sneaky("^gol")}, declared_fields=self.DECLARED)
+
+    def test_a_regex_nested_in_a_mapping_or_a_list_is_rejected(self) -> None:
+        """At any depth, on the same terms as the operator guard, and through a non-dict mapping."""
+        with pytest.raises(ValueError, match="regular expression"):
+            _filter.validate({"tier": {"inner": re.compile("x")}}, declared_fields=self.DECLARED)
+        with pytest.raises(ValueError, match="regular expression"):
+            _filter.validate({"tier": [re.compile("x")]}, declared_fields=self.DECLARED)
+        with pytest.raises(ValueError, match="regular expression"):
+            _filter.validate({"tier": UserDict({"inner": re.compile("x")})}, declared_fields=self.DECLARED)
+
+    def test_a_string_that_looks_like_a_pattern_is_still_a_string(self) -> None:
+        """The negative half, and the one a value-shaped guard is most likely to get wrong.
+
+        ``"^gol"`` as a value is five characters to compare. A guard that rejected it would refuse a
+        legitimate filter over a field whose contents happen to contain regex punctuation, which is most
+        fields that hold a path, a version range or a formula.
+        """
+        _filter.validate({"tier": "^gol.*$"}, declared_fields=self.DECLARED)
+        _filter.validate({"tier": ["^gol", "silver"]}, declared_fields=self.DECLARED)
+
+    def test_an_operator_key_is_the_message_when_a_filter_has_both_faults(self) -> None:
+        """The guard order in ``validate``, which decides which of three messages a caller reads first.
+
+        An operator key is the more serious fault and the one whose remedy is not "use a different value",
+        so it is named first. The order is asserted rather than left to the reading, because the three
+        guards are independent functions and reordering them is a one-line edit with no other symptom.
+        """
+        with pytest.raises(ValueError) as caught:
+            _filter.validate({"tier": {"$ne": re.compile("x")}}, declared_fields=self.DECLARED)
+
+        assert "$ne" in str(caught.value)
+        assert "regular expression" not in str(caught.value)
 
 
 class TestUndeclaredFieldsAreRejectedBeforeQuerying:

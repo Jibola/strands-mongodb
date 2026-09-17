@@ -16,8 +16,12 @@ import asyncio
 import contextlib
 import inspect
 import logging
-from typing import TYPE_CHECKING, Any
+import sys
+import threading
+import traceback
+from typing import TYPE_CHECKING, Any, Final
 
+import pymongo
 import pytest
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
@@ -687,6 +691,201 @@ class TestThePasswordNeverLeavesTheConfig:
         self.assert_no_leak(*(value for value in vars(_client).values() if not callable(value)))
 
 
+class TestTheCredentialsTheUriRedactionDoesNotCover:
+    """AT-177 / ``REQ-E-171`` — premortem **P-3** again, on the half ``AT-014`` could not see.
+
+    ``AT-014`` above asserts that the password does not render, and it passed for four reasons, only
+    three of which were ours. The fourth was pymongo: ``AsyncMongoClient.__repr__`` prints every
+    non-default option it was built with, and the *password in the URI* is the one it has always
+    redacted. A credential passed as any other option is not covered by that.
+
+    Two options carry a secret past that redaction, and each was rendered on every pymongo release from
+    this package's ``>=4.14.0`` floor to 4.18.1 with the exact call :meth:`_resolve` makes:
+
+    * ``tlsCertificateKeyFilePassword='PEMPASSPHRASE'`` — a password by name, printed verbatim by every
+      one of them;
+    * ``authmechanismproperties={'AWS_SESSION_TOKEN': 'SESSIONTOKENSECRET'}`` — a live STS token, printed
+      verbatim through 4.17.0 and rendered ``'<redacted>'`` from 4.18.0 on.
+
+    Both halves of that second line are asserted, because CI installs both: the ``Dependency floors`` job
+    resolves the floor, where the token leaks, and the matrix jobs resolve the newest, where it does not.
+    A package that supports its own floor cannot treat the newest driver's redaction as the behaviour.
+
+    ``_Connection`` is a dataclass, so its generated ``__repr__`` rendered the client, and the registry's
+    values are ``_Connection`` objects, so ``repr(_REGISTRY)`` rendered every one of them. A debug line
+    interpolating the connection, a crash reporter walking module globals, or an exception rendering its
+    arguments therefore published whichever of these the user configured. ``client`` now carries
+    ``field(repr=False)``, which is the smallest fix that keeps the attribute and removes the rendering.
+
+    Reported by a production-readiness review. The class is separate from ``AT-014``'s rather than folded
+    into it because the hazard is a different one: not our interpolation of a config we hold, but a
+    dependency's ``__repr__`` reached through a dataclass we generate.
+    """
+
+    TOKEN: Final[str] = "SESSIONTOKENSECRET"
+    PEM: Final[str] = "PEMPASSPHRASE"
+    # Port 1 is reserved and never listening. Nothing here makes a call, so this only has to be a URI a
+    # client can be built from; `LEAKY_UNREACHABLE` below carries a password, which is the other class's
+    # subject and would make a failure here ambiguous about which secret escaped.
+    UNREACHABLE: Final[str] = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=50"
+    #: The release that began redacting ``AWS_SESSION_TOKEN``, bisected across 4.14.0, 4.15.0, 4.16.0,
+    #: 4.17.0, 4.18.0 and 4.18.1 rather than read from a changelog.
+    TOKEN_REDACTED_FROM: Final[tuple[int, int]] = (4, 18)
+
+    @classmethod
+    def assert_no_secret(cls, *subjects: object) -> None:
+        """Assert neither measured secret appears in any of the given renderings.
+
+        Args:
+            *subjects: Objects whose ``repr`` must not carry a secret, plus any strings to check as
+                themselves. Same contract as ``AT-014``'s :meth:`~TestThePasswordNeverLeavesTheConfig.assert_no_leak`,
+                over both measured values, whether or not the installed driver redacts either.
+
+        Raises:
+            AssertionError: Naming the leaking subject and which secret leaked, without reproducing the
+                value, because this message is read in CI output.
+        """
+        for index, subject in enumerate(subjects):
+            text = subject if isinstance(subject, str) else repr(subject)
+            for label, secret in (("session token", cls.TOKEN), ("certificate key password", cls.PEM)):
+                assert secret not in text, f"subject {index} ({type(subject).__name__}) leaked the {label}"
+
+    @staticmethod
+    def _resolve(**client_args: Any) -> _client._Connection:
+        """Resolve a connection whose client was built with the given driver options.
+
+        Args:
+            **client_args: Forwarded to ``AsyncMongoClient`` through ``client_args``, unvalidated, which
+                is the documented route a user reaches these options by.
+
+        Returns:
+            The connection the registry now holds.
+        """
+        config: Any = {
+            "database": "appdb",
+            "connection_string": TestTheCredentialsTheUriRedactionDoesNotCover.UNREACHABLE,
+            "client_args": client_args,
+        }
+        return _client.resolve(config)
+
+    def test_the_driver_prints_the_certificate_key_password_which_is_why_this_class_exists(self) -> None:
+        """The hazard, asserted rather than remembered, on the object we hand the driver options to.
+
+        This is also the vacuity guard for every test below: if pymongo ever starts redacting this one,
+        those tests keep passing while asserting nothing, and this one fails and says why. The
+        certificate key password is what the guard rests on rather than the session token, because it is
+        the option no release in the supported range redacts;
+        :meth:`test_the_session_tokens_redaction_is_the_drivers_and_moves_between_releases` carries the
+        one that does.
+        """
+        connection = self._resolve(
+            tlsCertificateKeyFilePassword=self.PEM,
+            authMechanism="MONGODB-AWS",
+            authMechanismProperties=f"AWS_SESSION_TOKEN:{self.TOKEN}",
+        )
+
+        rendered = repr(connection.client)
+
+        assert self.PEM in rendered
+
+    def test_the_session_tokens_redaction_is_the_drivers_and_moves_between_releases(self) -> None:
+        """The second credential, whose exposure is a fact about the installed driver rather than about us.
+
+        Written as a bisection result rather than as a single measurement because the suite runs against
+        both ends of the supported range in the same workflow, and a premise asserted on one end is a
+        test that fails on the other for a reason that is nobody's defect. Whichever way this goes, the
+        tests below are unaffected: ``REQ-E-171``'s fix removes our rendering of the client, so the
+        driver's choice about this option never reaches a caller through us.
+        """
+        connection = self._resolve(
+            tlsCertificateKeyFilePassword=self.PEM,
+            authMechanism="MONGODB-AWS",
+            authMechanismProperties=f"AWS_SESSION_TOKEN:{self.TOKEN}",
+        )
+
+        rendered = repr(connection.client)
+
+        if pymongo.version_tuple[:2] >= self.TOKEN_REDACTED_FROM:
+            assert self.TOKEN not in rendered, "pymongo stopped redacting the session token again"
+            assert "<redacted>" in rendered
+        else:
+            assert self.TOKEN in rendered, "pymongo began redacting the session token below 4.18.0"
+
+    def test_neither_reaches_the_connection_or_the_registry(self) -> None:
+        """The outcome ``REQ-E-171`` states, on both renderings the review named.
+
+        The registry is included because it is the worse of the two: it is a module global, so it is what
+        a crash reporter walking ``vars(_client)`` renders, and it holds every connection in the process
+        rather than the one a frame happens to be looking at.
+        """
+        connection = self._resolve(
+            tlsCertificateKeyFilePassword=self.PEM,
+            authMechanism="MONGODB-AWS",
+            authMechanismProperties=f"AWS_SESSION_TOKEN:{self.TOKEN}",
+        )
+
+        self.assert_no_secret(connection, _client._REGISTRY, *_client._REGISTRY.values())
+
+    def test_a_debug_line_interpolating_the_connection_is_clean(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The route a leak actually takes, written the way it gets written.
+
+        Nothing in the package logs a connection today. The point is that the next line that does cannot
+        publish a credential by doing so, because ``%s`` and ``%r`` of a dataclass are its ``__repr__``.
+        """
+        connection = self._resolve(tlsCertificateKeyFilePassword=self.PEM)
+
+        with caplog.at_level(logging.DEBUG, logger="strands_mongodb"):
+            logging.getLogger("strands_mongodb").debug("connection=%r", connection)
+
+        assert "connection=" in caplog.text
+        self.assert_no_secret(caplog.text)
+
+    def test_an_error_that_names_the_connection_carries_no_secret_into_its_traceback(self) -> None:
+        """The review's third route: an exception rendering the object it was given.
+
+        The standard renderer prints no locals, so what this asserts is the interpolation rather than the
+        frame: a message built from the connection, formatted the way a crash reporter and a log handler
+        both format it. That is the shape every error in this package already uses -- ``_target`` and a
+        namespace go into the message -- so the next one that reaches for the connection instead is one
+        edit away, and this is what makes that edit safe.
+        """
+        connection = self._resolve(
+            authMechanism="MONGODB-AWS", authMechanismProperties=f"AWS_SESSION_TOKEN:{self.TOKEN}"
+        )
+
+        try:
+            raise StorageError(f"strands_mongodb: pretending something failed while holding {connection!r}")
+        except StorageError as error:
+            rendered = "".join(traceback.format_exception(error))
+
+        assert "_Connection(" in rendered, "the message did not render the connection, so nothing was checked"
+        self.assert_no_secret(rendered)
+
+    def test_the_fields_that_are_not_secrets_still_render(self) -> None:
+        """``repr=False`` on the one field, not a hand-written ``__repr__`` that hides the object.
+
+        A dataclass whose ``repr`` says nothing is a debugging regression traded for a security fix, and
+        the fields listed here are the ones worth having in a frame: which client owns closing it, which
+        loop it belongs to, what the deployment can do, and which collections have been vetted.
+        """
+        connection = self._resolve()
+
+        rendered = repr(connection)
+
+        assert rendered.startswith("_Connection(")
+        assert "client=" not in rendered
+        for field_name in ("owned=", "lock=", "loop=", "capabilities=", "binary_keys="):
+            assert field_name in rendered, f"{field_name} stopped rendering"
+
+    def test_the_client_is_still_reachable_as_an_attribute(self) -> None:
+        """The property ``repr=False`` must not have cost, and the whole module reads it this way."""
+        connection = self._resolve()
+
+        assert connection.client is not None
+        assert isinstance(_client._Connection.__dataclass_fields__["client"].repr, bool)
+        assert _client._Connection.__dataclass_fields__["client"].repr is False
+
+
 # Port 1 is reserved and never listening, and 50 ms is what makes "cannot connect" fast enough to run in
 # the unit tier instead of waiting out pymongo's 30-second default. The shape is ``test_storage.py``'s
 # ``UNREACHABLE`` carrying ``LEAKY_URI``'s password, because ``AT-117`` needs both properties at once: a
@@ -1188,6 +1387,270 @@ class TestTheClientFollowsTheEventLoop:
 
         asyncio.run(resolve_then_close())
 
+        assert _client._REGISTRY == {}
+
+
+class _RecordingLock:
+    """A stand-in for ``_REGISTRY_LOCK`` that says whether it is held and how deeply.
+
+    Wraps a real ``RLock`` rather than faking one, so the mutual exclusion under test is the real thing
+    and only the observation is added. Depth is counted here rather than read off the lock because
+    ``RLock.locked()`` arrived in Python 3.14 and this package's floor is 3.10, and ``_is_owned()`` is
+    private; a wrapper needs neither and works on every version in the matrix.
+
+    Attributes:
+        depth: How many times it is currently held by the thread inside it.
+        peak: The deepest nesting seen, which is what makes the reentrancy claim testable.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.depth = 0
+        self.peak = 0
+
+    def __enter__(self) -> _RecordingLock:
+        self._lock.acquire()
+        self.depth += 1
+        self.peak = max(self.peak, self.depth)
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.depth -= 1
+        self._lock.release()
+
+    @property
+    def held(self) -> bool:
+        """Whether it is held right now."""
+        return self.depth > 0
+
+
+class _WatchfulRegistry(dict[Any, Any]):
+    """A registry that records whether the lock was held each time it was iterated.
+
+    ``__iter__`` and ``items`` are the two entry points the module uses to walk it, and walking a dict
+    another thread is writing is the ``RuntimeError`` half of ``AT-178``. Recording rather than raising,
+    because what is being asserted is that every walk happened under the lock, not that any one did.
+
+    Attributes:
+        walks: One entry per iteration, ``True`` if the lock was held for it.
+    """
+
+    def __init__(self, lock: _RecordingLock) -> None:
+        super().__init__()
+        self._lock = lock
+        self.walks: list[bool] = []
+
+    def __iter__(self) -> Any:
+        self.walks.append(self._lock.held)
+        return super().__iter__()
+
+    def items(self) -> Any:
+        self.walks.append(self._lock.held)
+        return super().items()
+
+
+class _RacingRegistry(dict[Any, Any]):
+    """A registry that loses every entry between the snapshot and the removal.
+
+    Stands in for the other thread in the reviewer's reproduction, without needing two threads to line up:
+    ``items()`` hands back a list of what was there and then empties the dict, so the caller's snapshot
+    names keys that are already gone. A ``del`` over that list is a ``KeyError``; ``pop(key, None)`` is a
+    no-op, which is the outcome ``REQ-E-172`` asks for.
+    """
+
+    def items(self) -> Any:
+        snapshot = list(super().items())
+        for key, _ in snapshot:
+            super().pop(key, None)
+        return snapshot
+
+
+class _ClosedByHand:
+    """The smallest thing ``close()`` will await, recording what the lock was doing while it waited.
+
+    Attributes:
+        held_while_closing: Whether ``_REGISTRY_LOCK`` was held at the moment this was awaited.
+    """
+
+    def __init__(self, lock: _RecordingLock) -> None:
+        self._lock = lock
+        self.held_while_closing: bool | None = None
+
+    async def close(self) -> None:
+        """Record and suspend, which is what ``endSessions`` does."""
+        self.held_while_closing = self._lock.held
+        await asyncio.sleep(0)
+
+
+class TestTheRegistryIsThreadSafeAndForgetsTolerantly:
+    """AT-178 / ``REQ-E-172`` — two threads, one process-global dict, and a crash in the wrong place.
+
+    ``REQ-E-017a`` keys the registry per event loop, and the loops a synchronous ``Agent`` creates are the
+    reason it has to. What that requirement did not say is which *thread* the loop belongs to. Each loop
+    runs on one thread, so nothing on a loop can race another coroutine here — but two threads each
+    driving their own loop are not serialised by anything, and the dict they both reach is a module global.
+
+    Two failures followed, and the review reproduced the first with overlapping event-loop resolutions:
+
+    * ``_reap_closed_loops`` snapshotted the entries to drop and then removed them by ``del``. Two threads
+      that snapshot the same dead loop leave the second one deleting a key that is gone: ``KeyError``.
+    * The snapshot itself walked a dict another thread could be inserting into, which CPython answers with
+      ``RuntimeError: dictionary changed size during iteration``.
+
+    Both surfaced inside ``resolve``, on a caller's first use of a connection, about an entry belonging to
+    a loop that caller never had. ``close()`` had already reached the ``pop(key, None)`` half of the fix
+    for ``REQ-E-017c``, from one loop rather than from two threads; this is the same conclusion drawn
+    across threads, plus the lock, which nothing on one loop needs.
+
+    The lock is a ``threading.RLock``, and both of those words are load-bearing. A thread lock, because an
+    ``asyncio`` one serialises coroutines on one loop and these callers are on different loops -- and
+    because ``resolve`` is synchronous, called from ``MongoDBStorage.__init__``, where a coroutine is not
+    available. Reentrant, because ``resolve`` holds it across ``_register``, which takes it too.
+
+    What it must never do is span an ``await``. A thread lock held across a suspension blocks the thread
+    the loop runs on, so the coroutine that would release it cannot be resumed by the loop waiting on it:
+    a deadlock, in ``close()``, on a teardown path. The last test here is what keeps that closed.
+    """
+
+    CONFIG: MongoDBConfig = {"database": "appdb", "connection_string": "mongodb://127.0.0.1:1/"}
+
+    @staticmethod
+    def _dead_loop_key() -> tuple[Any, Any]:
+        """Leave one entry behind whose loop has closed, and return its key.
+
+        Built by hand rather than by resolving and returning, so a reap cannot race the test into passing.
+        Same idiom as ``AT-091d``'s helper below.
+
+        Returns:
+            The key of the entry that was added.
+        """
+        dead = asyncio.new_event_loop()
+        dead.close()
+        client: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/")
+        identity = _client._identity(TestTheRegistryIsThreadSafeAndForgetsTolerantly.CONFIG)
+        key = (identity, dead)
+        _client._REGISTRY[key] = _client._Connection(client=client, owned=True)
+        return key
+
+    def test_every_walk_of_the_registry_happens_under_the_lock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The ``RuntimeError`` half, asserted as the invariant that prevents it rather than as a race.
+
+        A test that runs threads and hopes to catch a dict mid-write is a test that passes on a broken
+        build most of the time. What can be asserted deterministically is that no walk happens outside the
+        lock, which is the property that makes the interleaving impossible.
+        """
+        lock = _RecordingLock()
+        registry = _WatchfulRegistry(lock)
+        monkeypatch.setattr(_client, "_REGISTRY_LOCK", lock)
+        monkeypatch.setattr(_client, "_REGISTRY", registry)
+        self._dead_loop_key()
+
+        _client.resolve(self.CONFIG)
+
+        assert registry.walks, "the registry was never walked, so this asserted nothing"
+        assert all(registry.walks), f"{registry.walks.count(False)} of {len(registry.walks)} walks were unlocked"
+        assert lock.depth == 0, "the lock was still held after resolve returned"
+
+    def test_the_lock_is_reentrant_because_resolve_holds_it_across_register(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Why an ``RLock`` and not a ``Lock``: a plain one would deadlock this thread against itself.
+
+        The nesting is the thing being asserted. Splitting the two functions so it does not happen would
+        put ``_register``'s check and its insert on either side of a release, which is the defect.
+        """
+        lock = _RecordingLock()
+        monkeypatch.setattr(_client, "_REGISTRY_LOCK", lock)
+
+        _client.resolve(self.CONFIG)
+
+        assert lock.peak >= 2, "resolve no longer nests, so the reentrancy this lock pays for is unused"
+
+    def test_a_key_another_thread_already_reaped_is_not_a_key_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The ``KeyError`` half, made deterministic: the snapshot is stale by construction.
+
+        The reviewer reproduced this with two worker threads. A registry that empties itself during the
+        walk is the same stale snapshot with none of the timing, and it fails against ``del`` every time.
+        """
+        lock = _RecordingLock()
+        monkeypatch.setattr(_client, "_REGISTRY_LOCK", lock)
+        monkeypatch.setattr(_client, "_REGISTRY", _RacingRegistry())
+        self._dead_loop_key()
+
+        _client._reap_closed_loops()
+
+        assert _client._REGISTRY == {}
+
+    def test_eight_threads_reaping_at_once_raise_nothing(self) -> None:
+        """The reviewer's reproduction, and it does reproduce -- reliably, which took one adjustment.
+
+        Written the obvious way it passed on the broken build every time: a reap over a handful of entries
+        finishes inside one GIL slice, so the threads never actually interleave and the test asserts that
+        two things did not happen at once rather than that they are safe when they do. Two changes fix
+        that, and both describe a machine under load rather than a machine in a test:
+
+        * 300 dead entries, so a single reap is long enough to be interrupted part-way;
+        * ``sys.setswitchinterval(1e-6)``, so the interpreter preempts inside it.
+
+        Measured on the unfixed build with both in place: six of the eight threads raised, every run, and
+        the first exception was ``RuntimeError: dictionary changed size during iteration`` rather than the
+        ``KeyError`` the review named. Both are the same defect seen from either side -- one thread walking
+        while another writes, one thread deleting what another already deleted -- and the iteration is what
+        fails first, because it fails before the removals begin.
+
+        The switch interval is process-global, so it is restored in a ``finally``: leaving it at a
+        microsecond makes every threaded test after this one crawl.
+        """
+        errors: list[BaseException] = []
+        start = threading.Barrier(8)
+        for _ in range(300):
+            self._dead_loop_key()
+
+        def worker() -> None:
+            try:
+                start.wait(timeout=10)
+                for _ in range(30):
+                    _client._reap_closed_loops()
+            except BaseException as error:  # noqa: BLE001 - the claim is that nothing at all escapes
+                errors.append(error)
+
+        original = sys.getswitchinterval()
+        sys.setswitchinterval(1e-6)
+        try:
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=30)
+        finally:
+            sys.setswitchinterval(original)
+
+        assert errors == [], f"{len(errors)} of 8 threads raised, first: {errors[0]!r}"
+        assert not any(thread.is_alive() for thread in threads), "a worker did not finish, which reads as a deadlock"
+        assert _client._REGISTRY == {}, "the reap left a dead loop's entry behind"
+
+    def test_close_releases_the_lock_before_it_waits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The deadlock the fix could have introduced, and the reason ``close()`` takes the lock twice.
+
+        ``close()`` snapshots under the lock and pops under the lock, and does neither while awaiting
+        ``client.close()``. Holding it across that suspension would block the thread the loop runs on, so
+        a second coroutine needing the lock could not be resumed by the loop that is waiting for it. The
+        symptom would be a process that never exits, from a ``finally`` and an ``atexit``.
+        """
+        lock = _RecordingLock()
+        monkeypatch.setattr(_client, "_REGISTRY_LOCK", lock)
+        client = _ClosedByHand(lock)
+
+        async def body() -> None:
+            identity = _client._identity(self.CONFIG)
+            loop = asyncio.get_running_loop()
+            _client._REGISTRY[(identity, loop)] = _client._Connection(client=client, owned=True)  # type: ignore[arg-type]
+
+            await _client.close(self.CONFIG)
+
+        asyncio.run(body())
+
+        assert client.held_while_closing is False, "the lock was held across an await inside close()"
         assert _client._REGISTRY == {}
 
 
