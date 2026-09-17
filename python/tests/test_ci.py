@@ -577,6 +577,25 @@ class TestEveryPullRequestReachesTheGatesWhateverItsBaseIs:
         assert missing == [], f"{missing} are not jobs in this workflow; its jobs are {sorted(jobs)}"
 
 
+class TestTheManifestIsCheckedByAPullRequestAndNotOnlyByARelease:
+    """``AT-183`` / ``REQ-E-178`` -- the half of the manifest check that shifts left.
+
+    ``test_release_ci.py`` holds the rest of ``AT-183``: the release gate validates the manifest and checks
+    the built artifacts before the upload. This asks the cheaper question. A manifest defect found by the
+    release is found after a tag exists; found by a pull request it is a comment on a diff, and the check
+    costs a `pip install` and a subsecond run in a job that already exists.
+    """
+
+    def test_a_change_is_validated_against_the_packaging_schemas(self, workflow: dict[str, Any]) -> None:
+        """``validate-pyproject``, which asks what packaging tools ask and what `hatch build` does not."""
+        runs = "\n".join(_run_blocks(workflow))
+
+        assert "validate-pyproject" in runs, (
+            "no step validates pyproject.toml, so a manifest the packaging schemas refuse reaches the "
+            "release gate as the first thing that notices"
+        )
+
+
 class TestEveryJobCanBeStartedOnDemand:
     """``AT-139`` / ``REQ-E-139`` -- the mirror of the class above, asked about jobs instead of files.
 
