@@ -606,6 +606,15 @@ class MongoDBStorage:
         intended shape: the collection may be fixed while the process runs, and a store that had cached
         the refusal would keep reporting a problem that no longer exists.
 
+        **An absent collection caches nothing either, and for the same reason** (``REQ-E-186``). It is
+        not a refusal and it is not a verification: ``listCollections`` reports a collection with no
+        collation and a collection that is not there identically, and caching the second as though it
+        were the first is how a namespace entered ``binary_keys`` having never been checked. Whoever
+        creates that collection next may give it any collation, and the cache would mean nobody ever
+        looked. So the asking continues, one ``listCollections`` per operation, until this store's own
+        first write creates the collection implicitly -- after which there is something to verify, it is
+        verified, and the asking stops.
+
         Raises:
             StorageError: If the collection's default collation is not binary, or if reading it fails.
         """
@@ -613,8 +622,8 @@ class MongoDBStorage:
         connection = self._connection
         if target in connection.binary_keys:
             return
-        await _indexes.require_binary_comparison(self._collection())
-        connection.binary_keys.add(target)
+        if await _indexes.require_binary_comparison(self._collection()):
+            connection.binary_keys.add(target)
 
     @property
     def _target(self) -> str:

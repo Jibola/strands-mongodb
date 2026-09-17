@@ -1291,6 +1291,9 @@ class _SetupRecorder:
             *this* call happens, and a count folded into ``probes`` could not tell the two apart.
         refuse_collation: Whether the preflight should refuse, standing in for a collection created with
             a case-folding collation.
+        absent_until_provisioned: Whether the first collation read should report a collection that is not
+            there yet (``REQ-E-186``), as an empty database does. Later reads report one that is, because
+            between them ``initialize()`` ensures the indexes and that creates it.
     """
 
     def __init__(
@@ -1300,9 +1303,11 @@ class _SetupRecorder:
         failing: frozenset[str] = frozenset(),
         rank_fusion: bool = False,
         refuse_collation: bool = False,
+        absent_until_provisioned: bool = False,
     ) -> None:
         self.rank_fusion = rank_fusion
         self.refuse_collation = refuse_collation
+        self.absent_until_provisioned = absent_until_provisioned
         self.collations: list[str] = []
         self.fusion_probes: list[str] = []
         self.probes: list[str] = []
@@ -1312,7 +1317,7 @@ class _SetupRecorder:
         self.failing = failing
         self.available = available
 
-    async def require_binary_comparison(self, collection: Any) -> None:
+    async def require_binary_comparison(self, collection: Any) -> bool:
         """Stand in for ``_indexes.require_binary_comparison``, the preflight ``AT-176`` added.
 
         Suspends for the reason :meth:`probe` does. It is also the first thing ``initialize()`` calls, so a
@@ -1322,6 +1327,12 @@ class _SetupRecorder:
         Args:
             collection: The collection being checked. Its name is what is recorded: the requirement is
                 one preflight per collection, not per store.
+
+        Returns:
+            Whether a collection was there to verify (``REQ-E-186``). ``True`` unless
+            :attr:`absent_until_provisioned` says the collection does not exist yet, in which case the
+            first call answers ``False`` and every later one answers ``True`` -- which is what a
+            deployment does, because the ``ensure`` between them creates it.
 
         Raises:
             StorageError: If :attr:`refuse_collation`, in the shape the real function raises it -- the
@@ -1335,6 +1346,9 @@ class _SetupRecorder:
                 f"'en', and this package cannot store keys in a collection whose string comparison is "
                 f"not binary."
             )
+        if self.absent_until_provisioned and len(self.collations) == 1:
+            return False
+        return True
 
     async def probe(self, collection: Any) -> _indexes.SearchSupport:
         """Stand in for ``_indexes.search_support``.
@@ -1404,6 +1418,7 @@ def _patch_setup(
     failing: frozenset[str] = frozenset(),
     rank_fusion: bool = False,
     refuse_collation: bool = False,
+    absent_until_provisioned: bool = False,
 ) -> _SetupRecorder:
     """Replace every call ``initialize()`` makes, so it runs to completion with no deployment.
 
@@ -1418,6 +1433,9 @@ def _patch_setup(
         refuse_collation: Whether the collation preflight refuses (``AT-176``). Defaults to ``False``,
             which is what a collection created without a collation reports and therefore what every test
             written before ``AT-176`` assumed without saying so.
+        absent_until_provisioned: Whether the first collation read reports a collection that is not there
+            yet (``REQ-E-186``). Defaults to ``False``, which is the established deployment every test
+            written before ``AT-192`` assumed.
         rank_fusion: What the ``$rankFusion`` probe answers. Defaults to ``False``, which is the one
             place in this file a fake's default deliberately does not match the common deployment:
             Atlas hands out 8.0.23 and would answer ``True``. It is ``False`` here because that is
@@ -1430,7 +1448,11 @@ def _patch_setup(
         The recorder, holding what was asked for once the test has run.
     """
     recorder = _SetupRecorder(
-        available=available, failing=failing, rank_fusion=rank_fusion, refuse_collation=refuse_collation
+        available=available,
+        failing=failing,
+        rank_fusion=rank_fusion,
+        refuse_collation=refuse_collation,
+        absent_until_provisioned=absent_until_provisioned,
     )
     monkeypatch.setattr(_indexes, "require_binary_comparison", recorder.require_binary_comparison)
     monkeypatch.setattr(_indexes, "search_support", recorder.probe)
@@ -1819,6 +1841,76 @@ class TestTheMemoryStoreRefusesACollationThatFoldsCase:
 
         assert recorder.collations == ["memory"]
         assert len(recorder.probes) == 1
+
+
+class TestAnAbsentCollectionIsNotAVerifiedOne:
+    """AT-192 / ``REQ-E-186`` — this surface's half of the finding ``test_storage.py`` carries.
+
+    ``listCollections`` reports a collection with no collation and a collection that is not there at all
+    identically: nothing. ``AT-176``'s preflight read that nothing as a verification and the connection
+    cached it, so a namespace could enter ``binary_keys`` having never been checked -- and whoever created
+    the collection a moment later could give it any collation, with the cache guaranteeing nobody ever
+    looked again.
+
+    What makes this surface different from ``MongoDBStorage`` is that it has no later operation to
+    re-check from. ``initialize()`` returns early ever after, so declining to cache an absent collection
+    would leave the window open for the life of the store rather than closing it on the next write. The
+    close is the second read: ``ensure`` has created the collection by then, so there is something to
+    verify, and verifying it is both the answer and the thing worth caching. A collation that appeared in
+    between is somebody else's, and it fails this call -- before ``add`` has written one memory under it.
+    """
+
+    async def test_an_absent_collection_is_read_again_once_the_indexes_have_created_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two reads for the empty database, where ``AT-176`` did one and cached what it could not read."""
+        recorder = _patch_setup(monkeypatch, absent_until_provisioned=True)
+        store = _store()
+
+        await store.initialize()
+
+        assert recorder.collations == ["memory", "memory"]
+        assert store._initialized is True
+
+    async def test_the_read_that_found_something_is_the_one_that_caches(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The bound on the re-reading: it stops, rather than repeating per store for the connection's life.
+
+        The second store shares the connection and therefore the ``binary_keys`` set, and it adds no third
+        read -- which is only true because the first store's *second* read is what went into the cache.
+        """
+        recorder = _patch_setup(monkeypatch, absent_until_provisioned=True)
+
+        await _store().initialize()
+        await _store(name="others").initialize()
+
+        assert recorder.collations == ["memory", "memory"]
+
+    async def test_a_collation_that_appears_during_provisioning_fails_initialize(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The window the second read closes, exercised by creating the collection inside it.
+
+        Somebody else creates ``appdb.memory`` with a case-folding collation while this store is
+        provisioning: the first read found nothing to object to and the second one finds it. The refusal
+        is the point, and so is *when* it arrives -- ``_initialized`` is still ``False``, so no caller ever
+        held a store over a collection that cannot keep the scopes apart.
+        """
+        recorder = _patch_setup(monkeypatch, absent_until_provisioned=True)
+        provision = recorder.ensure
+
+        async def a_collation_appears(*args: Any, **kwargs: Any) -> None:
+            recorder.refuse_collation = True
+            await provision(*args, **kwargs)
+
+        monkeypatch.setattr(_indexes, "ensure", a_collation_appears)
+        store = _store()
+
+        with pytest.raises(StorageError) as caught:
+            await store.initialize()
+
+        assert "collation" in str(caught.value)
+        assert store._initialized is False
+        assert recorder.collations == ["memory", "memory"]
 
 
 class TestTheHybridTierIsAStatementAboutTwoOthers:

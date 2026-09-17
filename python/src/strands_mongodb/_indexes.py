@@ -672,8 +672,26 @@ async def search_support(collection: AsyncCollection[Any]) -> SearchSupport:
     return SearchSupport(available=True)
 
 
-async def default_collation(collection: AsyncCollection[Any]) -> dict[str, Any] | None:
-    """Report the collection's default collation, or ``None`` when it has none.
+class CollationReport(NamedTuple):
+    """What ``listCollections`` says about one collection's string comparison.
+
+    Two fields rather than one optional collation, because the two answers this call can give are not
+    the same answer and reading them as one is ``REQ-E-186``. A collection with no collation and a
+    collection that does not exist are both reported by the server as nothing, and only the first of them
+    is a *verification* that string comparison here is binary.
+
+    Attributes:
+        exists: Whether the server reported the collection at all.
+        collation: The collation document it reported, or ``None`` for a collection with none -- which,
+            when ``exists`` is ``False``, means only that there was no document to read one from.
+    """
+
+    exists: bool
+    collation: dict[str, Any] | None
+
+
+async def read_collation(collection: AsyncCollection[Any]) -> CollationReport:
+    """Report whether the collection exists and what default collation it carries.
 
     ``listCollections`` filtered to one name, which is the only way to ask: a collation is fixed at
     creation and lives in the collection's options, and nothing on ``AsyncCollection`` carries it. The
@@ -685,9 +703,10 @@ async def default_collation(collection: AsyncCollection[Any]) -> dict[str, Any] 
         collection: The collection to ask about. Need not exist.
 
     Returns:
-        The collation document the server reports, or ``None`` if the collection has no collation or does
-        not exist yet. The two are the same answer here on purpose: a collection this package creates
-        implicitly is created without one.
+        A :class:`CollationReport`. An absent collection is ``(False, None)`` and an uncollated one is
+        ``(True, None)``: the same *collation*, deliberately distinguished, because a caller that refuses
+        on the collation wants them merged and a caller that caches the answer must not merge them
+        (``REQ-E-186``).
 
         Measured on 8.0.32, because the shape is the whole contract of this function and it is not
         derivable from the documentation: a collection created with ``{locale: "en", strength: 2}`` is
@@ -707,16 +726,16 @@ async def default_collation(collection: AsyncCollection[Any]) -> dict[str, Any] 
         async for document in cursor:
             options = document.get("options") or {}
             collation = options.get("collation")
-            return dict(collation) if collation is not None else None
+            return CollationReport(exists=True, collation=dict(collation) if collation is not None else None)
     except PyMongoError as error:
         raise StorageError(
             f"strands_mongodb: reading the collation of {collection.database.name}.{collection.name} failed: {error}"
         ) from error
-    return None
+    return CollationReport(exists=False, collation=None)
 
 
-async def require_binary_comparison(collection: AsyncCollection[Any]) -> None:
-    """Refuse a collection whose default collation is not binary (``REQ-E-170``).
+async def require_binary_comparison(collection: AsyncCollection[Any]) -> bool:
+    """Refuse a collection whose default collation is not binary, and say whether it verified one.
 
     A collation is a property of the collection, and every query against that collection inherits it
     unless it names another. This package's key space is one document per key with the key in ``_id``, so
@@ -733,16 +752,28 @@ async def require_binary_comparison(collection: AsyncCollection[Any]) -> None:
     this key space, and saying so once is more use than working incorrectly in a way that reads as
     working.
 
+    **A collection that is not there is not a collection that passed** (``REQ-E-186``). Nothing here can
+    refuse it -- there is no collation to object to, and this package creates collections implicitly and
+    without one, so refusing would make the first write to an empty database fail. What it must not do is
+    let a caller record the answer: the collection somebody else creates a moment later may carry any
+    collation at all, and a namespace cached as verified is never read again. The return value is that
+    distinction and it is the whole reason this function has one.
+
     Args:
         collection: The collection about to be operated on.
+
+    Returns:
+        ``True`` if the collection exists and compares strings byte by byte, which is an answer worth
+        caching. ``False`` if it does not exist yet, which is not an answer at all.
 
     Raises:
         StorageError: If the collection has a collation whose locale is not
             :data:`SIMPLE_LOCALE`, naming the locale found and the remedy.
     """
-    collation = await default_collation(collection)
+    report = await read_collation(collection)
+    collation = report.collation
     if collation is None or collation.get("locale") == SIMPLE_LOCALE:
-        return
+        return report.exists
     namespace = f"{collection.database.name}.{collection.name}"
     raise StorageError(
         f"strands_mongodb: the collection {namespace} was created with the collation "
@@ -862,6 +893,10 @@ async def _ensure_ordinary(collection: AsyncCollection[Any], specs: tuple[IndexS
         if match is None:
             missing.append(spec)
             continue
+        # Before the options, deliberately. An index can differ in both, and of the two messages this is
+        # the one whose consequence is silent: a mismatched option is a refusal either way, while a
+        # folded collation that went unreported is a dedup rule enforced case-insensitively (REQ-E-187).
+        _check_collation(collection.name, namespace, spec, *match)
         _check_options(collection.name, namespace, spec, *match)
 
     if not missing:
@@ -881,6 +916,63 @@ async def _ensure_ordinary(collection: AsyncCollection[Any], specs: tuple[IndexS
     await _guard(
         collection.create_indexes([spec.to_model() for spec in missing]),
         what=f"creating indexes on {namespace}",
+    )
+
+
+def _check_collation(
+    collection_name: str,
+    namespace: str,
+    spec: IndexSpec,
+    found_name: str,
+    found: Mapping[str, Any],
+) -> None:
+    """Refuse a matched index whose collation does not compare strings byte for byte (``REQ-E-187``).
+
+    ``require_binary_comparison`` asks the same question of the *collection*, and an index carries its
+    own answer: a collection with no default collation passes that preflight while holding a unique index
+    created ``{locale: "en", strength: 2}``. That index is what the dedup rule is enforced by, so on such
+    a collection the rule is the folded one -- two memories whose text differs only in case hash to
+    different values, match the same index entry, and the second write comes back
+    ``ids=[], inserted=0, duplicates=1`` for a memory that was never stored. The caller is told it was
+    already there, and ``_existing()`` re-queries with the binary selector, which a collated index cannot
+    serve, so nothing can find it.
+
+    Not an entry in :attr:`IndexSpec.options`, which is where a rule about an index option would
+    otherwise live. The server does not store a simple collation -- an index created without one and an
+    index created ``{locale: "simple"}`` both report no ``collation`` at all -- so a wanted value of
+    ``{"locale": "simple"}`` would find it absent on every correct index and refuse every deployment.
+    What is checkable is the opposite: a collation that *is* reported and is not ``simple``.
+
+    Args:
+        collection_name: The collection, for the commands in the message.
+        namespace: ``database.collection``, for the message.
+        spec: The declared index the existing one matched on keys.
+        found_name: What the existing index is called, which is whatever its creator chose.
+        found: The entry ``index_information`` reported for it.
+
+    Raises:
+        StorageError: If the index reports a collation whose locale is not ``simple``. Reported with the
+            drop and recreate commands rather than acted on, for ``REQ-E-063``'s standing reason: the
+            index may be serving queries nothing here knows about, and dropping it is not this package's
+            decision to make.
+    """
+    collation = found.get("collation")
+    if not isinstance(collation, Mapping):
+        return
+    locale = collation.get("locale")
+    if locale == SIMPLE_LOCALE:
+        return
+    raise StorageError(
+        f"strands_mongodb: the index {found_name!r} on {namespace} covers the keys {list(spec.keys)} "
+        f"that {spec.name!r} needs, but it was created with the collation {locale!r} and this package "
+        f"needs one that compares strings byte for byte. An index that folds case makes the rule it "
+        f"enforces the folded rule, which for {spec.name!r} means two records differing only in case "
+        f"collide as one. Creating a second index over the same keys is rejected by the server whatever "
+        f"it is named, and dropping this one is not this package's decision to make: it may be serving "
+        f"queries nothing here knows about. To resolve it, drop the existing index and let the next call "
+        f"recreate it:\n"
+        f"{drop_index_command(collection_name, found_name)}\n"
+        f"{spec.creation_command(collection_name)}\n"
     )
 
 

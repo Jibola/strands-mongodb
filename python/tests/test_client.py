@@ -591,6 +591,128 @@ class TestAttributionHappensAtMostOncePerClient:
         assert injected.options.pool_options.metadata["driver"]["name"].endswith("StrandsToolkit|Strands")
 
 
+class TestAttributionThatSrvResolutionDiscardsIsReapplied:
+    """AT-195 / ``REQ-E-189`` — the one path where ``REQ-E-185``'s guard keeps a loss instead of a chain.
+
+    ``append_metadata`` writes into the client's ``ClientOptions``. Resolving a ``mongodb+srv://`` URI
+    assigns a **new** ``ClientOptions`` and rebuilds the topology settings from it, and that happens on the
+    client's first connection rather than at construction -- so for an injected SRV client the append lands
+    before the resolution and is discarded by it. ``_already_attributed`` then reads a chain with no
+    ``Strands`` in it, which is true, so it is not the cause of the loss; what it is, without this, is the
+    reason the loss is permanent.
+
+    Telemetry rather than correctness, and it is a ``P3`` for that reason: no database operation behaves
+    differently either way. What it costs is MongoDB's own usage counting for exactly the deployments that
+    matter most, since ``mongodb+srv://`` is what Atlas hands out.
+
+    The re-check is bounded in both directions. It runs only for injected clients, only on the
+    registry-hit path, and it is a string split over metadata already in memory. And it stops: an append
+    that does not become visible clears the flag, so a future driver that ignores ``append_metadata``
+    costs one extra append rather than the per-operation chain growth ``REQ-E-185`` exists to prevent.
+    """
+
+    @staticmethod
+    def _lose_the_attribution(client: AsyncMongoClient[Any]) -> None:
+        """Strip ``Strands`` from the chain in place, which is what the new ``ClientOptions`` amounts to.
+
+        Written on the metadata rather than by re-running SRV resolution, so this half of the class stays
+        a test of the branch. The test below runs the real resolution and asserts the loss is real.
+        """
+        driver = client.options.pool_options.metadata["driver"]
+        driver["name"] = "|".join(entry for entry in driver["name"].split("|") if entry.casefold() != "strands")
+
+    def test_an_attribution_that_was_discarded_is_applied_again_on_the_next_resolve(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The finding. The second resolve is a registry hit, which before this returned without looking."""
+        injected: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/")
+        config: MongoDBConfig = {"database": "appdb", "client": injected}
+        _client.resolve(config)
+        self._lose_the_attribution(injected)
+        appended = TestAttributionHappensAtMostOncePerClient._record_appends(monkeypatch)
+
+        _client.resolve(config)
+
+        assert appended == ["Strands"], f"the hit path did not re-apply a lost attribution: {appended}"
+        assert _client._already_attributed(injected) is True
+
+    def test_a_client_that_kept_it_is_not_appended_to_again(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``REQ-E-185`` still holds, and this is the test that says the re-check did not repeal it.
+
+        Ten hits on a client that kept its attribution, which on the 4.14.0 floor would be ten entries in
+        the handshake document if the re-check appended unconditionally instead of reading first.
+        """
+        injected: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/")
+        config: MongoDBConfig = {"database": "appdb", "client": injected}
+        _client.resolve(config)
+        appended = TestAttributionHappensAtMostOncePerClient._record_appends(monkeypatch)
+
+        for _ in range(10):
+            _client.resolve(config)
+
+        assert appended == [], f"a client that already named Strands was appended to: {appended}"
+
+    def test_an_append_that_does_not_become_visible_stops_the_re_checking(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The bound, and the one that makes this safe to add rather than merely correct.
+
+        A driver whose ``append_metadata`` does nothing observable is not a driver to keep calling: the
+        chain it is not growing here is the chain it *is* growing on 4.14.0, once per resolve, and
+        ``REQ-E-185`` measured where that ends. Five resolves, two appends, and the second one is what
+        proves the first was not simply skipped.
+        """
+        appended: list[str] = []
+
+        def refuse(self: AsyncMongoClient[Any], driver_info: DriverInfo) -> None:
+            appended.append(driver_info.name)
+
+        monkeypatch.setattr(AsyncMongoClient, "append_metadata", refuse)
+        injected: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/")
+        config: MongoDBConfig = {"database": "appdb", "client": injected}
+
+        for _ in range(5):
+            _client.resolve(config)
+
+        assert appended == ["Strands", "Strands"], f"the re-check did not stop: {appended}"
+
+    async def test_srv_resolution_really_does_discard_it_and_the_next_resolve_recovers_it(self) -> None:
+        """The premise, against pymongo's own SRV path with only the DNS lookup replaced.
+
+        Everything above is a test of the branch, and every one of them would pass against a package
+        whose attribution was never lost -- the loss is the assumption the requirement rests on, and it
+        belongs to the driver rather than to this package. So this runs the real ``_resolve_srv`` on a
+        real client, with ``_parse_srv`` returning what a lookup would have returned, and asserts both
+        halves: that the append is gone afterwards, and that resolving the client again brings it back.
+
+        Measured on pymongo 4.17.0 while writing it: ``PyMongo|c|async|Strands`` before, and
+        ``PyMongo|c|async`` after.
+        """
+        from unittest import mock
+
+        injected: AsyncMongoClient[Any] = AsyncMongoClient("mongodb+srv://cluster0.example.mongodb.net/", connect=False)
+        config: MongoDBConfig = {"database": "appdb", "client": injected}
+        _client.resolve(config)
+        assert _client._already_attributed(injected) is True, "the append did not take, so nothing below means anything"
+
+        resolved = {
+            "nodelist": [("host1.example.mongodb.net", 27017)],
+            "options": {"replicaSet": "rs0", "tls": True},
+        }
+        with mock.patch("pymongo.asynchronous.uri_parser._parse_srv", new=mock.AsyncMock(return_value=resolved)):
+            await injected._resolve_srv()
+
+        assert _client._already_attributed(injected) is False, (
+            "SRV resolution kept the attribution, so either the driver changed or this requirement is "
+            "describing something that no longer happens"
+        )
+
+        _client.resolve(config)
+
+        assert _client._already_attributed(injected) is True
+        assert injected.options.pool_options.metadata["driver"]["name"].endswith("Strands")
+
+
 class TestRetryWritesDisabledIsWorthSaying:
     """AT-016 / REQ-E-016 — a warning rather than a refusal.
 
@@ -1831,4 +1953,147 @@ class TestConcurrentClosesOnOneIdentity:
 
         asyncio.run(body())
 
+        assert _client._REGISTRY == {}
+
+
+class _ALoopThatClosesBetweenTheCheckAndTheSchedule:
+    """A foreign loop that answers ``is_closed()`` with ``False`` and then refuses the schedule.
+
+    Which is what a live loop does when it closes in between -- the window is two statements wide and
+    nothing here holds that loop still. Faked rather than raced, because a test that reproduces it by
+    timing would reproduce it rarely and would not fail when the fix was removed.
+
+    ``asyncio.run_coroutine_threadsafe`` reaches the loop through exactly one call, so this is the whole
+    surface it needs: the ``RuntimeError`` it raises is the one a closed loop raises, and it is not a
+    ``PyMongoError``, so nothing in the driver catches it on the way out.
+    """
+
+    def __init__(self) -> None:
+        self.schedules = 0
+
+    def is_closed(self) -> bool:
+        return False
+
+    def call_soon_threadsafe(self, *args: Any, **kwargs: Any) -> None:
+        self.schedules += 1
+        raise RuntimeError("Event loop is closed")
+
+
+class _CountsItsCloses:
+    """A stand-in client whose ``close()`` is a coroutine, so an un-awaited one is visible."""
+
+    def __init__(self) -> None:
+        self.closes = 0
+
+    async def close(self) -> None:
+        self.closes += 1
+
+
+class TestALoopClosingMidTeardownDoesNotStrandTheOtherSlots:
+    """AT-194 / ``REQ-E-188`` — the one statement in ``close()`` that could raise past the loop it is in.
+
+    ``close()`` releases every slot for an identity (``REQ-E-017a``), and a slot on another live loop is
+    closed by scheduling onto that loop. Between the ``is_closed()`` that decides it is worth scheduling
+    and the schedule itself, that loop may close. The ``RuntimeError`` is not a ``PyMongoError``, so it
+    escapes the driver's handling and this function's: it leaves ``close()`` from inside the loop over
+    the remaining keys, and every slot after the failing one stays in the registry for the life of the
+    process -- from a path that runs in a ``finally`` and in an ``atexit``, where there is no later call
+    to reach them.
+
+    The un-awaited coroutine is the second half. ``client.close()`` has already been called by then, and
+    a coroutine nobody awaits raises ``RuntimeWarning`` at collection -- which this suite configures as
+    an error, so the failure would surface in whatever test happened to trigger the collection.
+
+    Nothing here claims the client gets closed. It cannot be: closing needs the loop that owns its
+    sockets and that loop is gone. This is the closed loop's case arriving one statement earlier, and what
+    the fix is about is the slots that are still releasable.
+    """
+
+    CONFIG: MongoDBConfig = {"database": "appdb", "connection_string": "mongodb://127.0.0.1:1/"}
+
+    def test_the_running_loops_slot_is_released_after_the_foreign_schedule_fails(self) -> None:
+        """The finding. The dead loop's slot is first in the registry, so it is first in the snapshot."""
+        hostile = _ALoopThatClosesBetweenTheCheckAndTheSchedule()
+        stranded = _CountsItsCloses()
+
+        async def body() -> None:
+            identity = _client._identity(self.CONFIG)
+            _client._REGISTRY[(identity, hostile)] = _client._Connection(  # type: ignore[index]
+                client=_CountsItsCloses(),  # type: ignore[arg-type]
+                owned=True,
+            )
+            _client._REGISTRY[(identity, asyncio.get_running_loop())] = _client._Connection(
+                client=stranded,  # type: ignore[arg-type]
+                owned=True,
+            )
+
+            await _client.close(self.CONFIG)
+
+        asyncio.run(body())
+
+        assert hostile.schedules == 1, "the schedule was not attempted, so this test proves nothing"
+        assert stranded.closes == 1, "a slot after the failing one was never reached"
+        assert _client._REGISTRY == {}
+
+    def test_the_coroutine_nobody_can_await_is_closed_rather_than_dropped(self) -> None:
+        """The second half, asserted on the warning rather than on a flag.
+
+        Collected explicitly instead of waiting for the garbage collector to do it at some later test's
+        expense, which is exactly the shape that made this worth fixing rather than tolerating.
+        """
+        import gc
+        import warnings
+
+        hostile = _ALoopThatClosesBetweenTheCheckAndTheSchedule()
+
+        async def body() -> None:
+            identity = _client._identity(self.CONFIG)
+            _client._REGISTRY[(identity, hostile)] = _client._Connection(  # type: ignore[index]
+                client=_CountsItsCloses(),  # type: ignore[arg-type]
+                owned=True,
+            )
+
+            await _client.close(self.CONFIG)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            asyncio.run(body())
+            gc.collect()
+
+        never_awaited = [warning for warning in caught if "never awaited" in str(warning.message)]
+        assert never_awaited == [], f"{never_awaited[0].message}" if never_awaited else ""
+
+    def test_a_foreign_loop_that_is_still_open_is_still_scheduled_onto(self) -> None:
+        """The vacuity guard. A fix that stopped scheduling altogether would pass both tests above and
+        would leak a pool on every loop but the running one, which is what ``REQ-E-017a`` exists for."""
+        other = asyncio.new_event_loop()
+        thread = threading.Thread(target=other.run_forever, daemon=True)
+        thread.start()
+        closed = threading.Event()
+
+        class _SignalsWhenClosed(_CountsItsCloses):
+            async def close(self) -> None:
+                await super().close()
+                closed.set()
+
+        client = _SignalsWhenClosed()
+
+        async def body() -> None:
+            identity = _client._identity(self.CONFIG)
+            _client._REGISTRY[(identity, other)] = _client._Connection(
+                client=client,  # type: ignore[arg-type]
+                owned=True,
+            )
+
+            await _client.close(self.CONFIG)
+
+        try:
+            asyncio.run(body())
+            assert closed.wait(timeout=5), "the client was never closed on the loop that owns it"
+        finally:
+            other.call_soon_threadsafe(other.stop)
+            thread.join(timeout=5)
+            other.close()
+
+        assert client.closes == 1
         assert _client._REGISTRY == {}

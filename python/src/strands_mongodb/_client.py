@@ -112,12 +112,19 @@ class _Connection:
         loop: The event loop ``lock`` is usable on, or ``None`` before its first use.
         capabilities: Result of the server capability probe, or ``None`` until it has run.
         binary_keys: ``(database, collection)`` pairs whose default collation has been read and found
-            binary (``REQ-E-170``). Cached here rather than on the store for the reason ``capabilities``
+            binary (``REQ-E-170``). A namespace goes in only when there was a collection there to read
+            it from: ``listCollections`` reports an absent collection and an uncollated one identically,
+            and recording the first as verified is how a namespace entered this set having never been
+            checked (``REQ-E-186``). Cached here rather than on the store for the reason ``capabilities``
             is: N stores over one collection share the answer, and a namespaced store is a second store
             over the same collection (``REQ-E-039``), so a per-instance cache would be a round trip per
             namespace. A collation cannot be altered in place, so the only way this cache goes stale is
             somebody dropping the collection and recreating it under the same name while the process
             runs, which is not a case worth a round trip per operation to catch.
+        recheck_attribution: Whether a later ``resolve`` of an injected client should read its driver
+            metadata again and re-apply the attribution if it has gone (``REQ-E-189``). Only injected
+            clients are attributed at all, so this is read only for them. Cleared permanently when an
+            append does not become visible, which bounds the re-applying on a driver that ignores it.
     """
 
     # `repr=False`, and this is the field that needs it (``REQ-E-171``). A dataclass renders every field,
@@ -135,6 +142,7 @@ class _Connection:
     loop: asyncio.AbstractEventLoop | None = None
     capabilities: Capabilities | None = None
     binary_keys: set[tuple[str, str]] = field(default_factory=set)
+    recheck_attribution: bool = True
 
     def get_lock(self) -> asyncio.Lock:
         """Return a lock usable on the running event loop, replacing it if the loop changed.
@@ -375,6 +383,46 @@ def _attribute_injected_client(client: AsyncMongoClient[Any]) -> None:
     client.append_metadata(_driver_info())
 
 
+def _reattribute_if_it_was_discarded(connection: _Connection) -> None:
+    """Re-apply an injected client's attribution if something threw it away (``REQ-E-189``).
+
+    ``append_metadata`` writes into the client's ``ClientOptions``, and resolving a ``mongodb+srv://``
+    URI assigns a new one: it happens on the client's first connection rather than at construction, so
+    for an injected SRV client the append lands before the resolution and is discarded by it. Measured on
+    pymongo 4.17.0 with the DNS lookup replaced and nothing else -- ``PyMongo|c|async|Strands`` before,
+    ``PyMongo|c|async`` after. ``REQ-E-185``'s guard is not what loses it (the attribution really is gone,
+    so the guard is answering correctly); without this, it is what makes the loss permanent.
+
+    Nothing is claimed about handshakes already sent. What this restores is every pool built afterwards,
+    which for the client whose first connection resolved the record is all of them.
+
+    Args:
+        connection: The registered connection for an injected client, whose ``recheck_attribution`` says
+            whether there is any point looking.
+    """
+    if not connection.recheck_attribution:
+        return
+    client = connection.client
+    if _already_attributed(client):
+        # Still there, and the flag stays set: this runs again on the next resolve, because the loss it
+        # is watching for happens on the first *connection* and that can be after any number of these.
+        return
+
+    client.append_metadata(_driver_info())
+    if _already_attributed(client):
+        return
+
+    # The append did not become visible, so calling it again would be calling it forever. On pymongo
+    # 4.14.0 -- the declared floor, which appends unconditionally -- that would be one more entry in the
+    # handshake document per resolve, which is the growth `REQ-E-185` measured to death at 22 cycles.
+    # One append and one debug line is the whole cost of a driver that ignores this call.
+    connection.recheck_attribution = False
+    logger.debug(
+        "strands_mongodb: append_metadata did not become visible on the injected client, so the Strands "
+        "attribution is left as it is"
+    )
+
+
 def resolve(config: MongoDBConfig) -> _Connection:
     """Return the shared connection for a config and the running loop, creating it on first use.
 
@@ -470,6 +518,8 @@ def _register(
     with _REGISTRY_LOCK:
         existing = _REGISTRY.get((identity, loop))
         if existing is not None:
+            if attribute:
+                _reattribute_if_it_was_discarded(existing)
             return existing
         if attribute:
             _attribute_injected_client(client)
@@ -528,7 +578,25 @@ async def close(config: MongoDBConfig) -> None:
             # Another live loop's client. Its `close()` sends `endSessions` over sockets that belong to
             # that loop, so it has to run there. Scheduled and not waited on: this loop may be the one
             # that loop is waiting for, and a teardown path must not be able to deadlock.
-            asyncio.run_coroutine_threadsafe(connection.client.close(), loop)
+            pending = connection.client.close()
+            try:
+                asyncio.run_coroutine_threadsafe(pending, loop)
+            except RuntimeError:
+                # That loop closed between the line above and this one, and the window is exactly two
+                # statements wide (`REQ-E-188`). `RuntimeError` is not a `PyMongoError`, so without this
+                # it leaves `close()` from inside the loop over the remaining keys and every slot after
+                # this one stays registered for the life of the process -- out of a path that runs in a
+                # `finally` and in an `atexit`, where nothing comes along later to reach them. The
+                # coroutine is closed rather than dropped because an un-awaited one raises
+                # `RuntimeWarning` whenever it is eventually collected, which is somewhere else. This is
+                # The closed loop's case arriving one statement earlier, and it has that case's outcome:
+                # the client is not closed, because closing it needs the loop its sockets belong to and
+                # that loop is gone. What is still releasable is released.
+                pending.close()
+                logger.debug(
+                    "strands_mongodb: an event loop closed while its client was being scheduled for "
+                    "close; the slot is released and the client is dropped unclosed"
+                )
         # A closed loop's client is dropped and not closed. Nothing can close it: `close()` needs the
         # loop the sockets belong to, and the `RuntimeError` pymongo raises instead is not a
         # `PyMongoError`, so it escapes the driver's own handling.
