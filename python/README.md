@@ -55,6 +55,47 @@ A bare `pip install strands-mongodb` installs no runtime dependencies and gives 
 backend. It is metadata only. The extra you choose is what selects the dependency set, so
 `[storage]` never drags in vector-search machinery you are not using.
 
+### Before the package reaches PyPI
+
+Nothing is published yet, so the commands above resolve to nothing. Until they do, install from this
+repository. The obvious URL fails twice over, and neither failure explains the other.
+
+The repository is private and MongoDB enforces SAML single sign-on, so an unauthenticated `https://`
+clone stops before pip ever sees a package:
+
+```text
+remote: The 'mongodb' organization has enabled or enforced SAML SSO.
+fatal: unable to access 'https://github.com/mongodb/strands-mongodb.git/': The requested URL returned error: 403
+```
+
+And this is a monorepo. The distribution lives in `python/`, a sibling of a future `typescript/`, so
+there is no `pyproject.toml` at the repository root for pip to build even once the clone succeeds.
+
+One URL addresses both: SSH for the first, a `subdirectory` fragment for the second.
+
+<!-- skip: it clones a private repository over SSH, which no test tier holds a key for -->
+```bash
+pip install 'strands-mongodb[all] @ git+ssh://git@github.com/mongodb/strands-mongodb.git#subdirectory=python'
+uv add 'strands-mongodb[all] @ git+ssh://git@github.com/mongodb/strands-mongodb.git#subdirectory=python'
+```
+
+`[all]` is the same choice as above: `[storage]` and `[memory]` work here too, and the extra is still
+what selects the dependency set.
+
+This needs a GitHub account in the `mongodb` organization holding an SSH key authorized for single
+sign-on. A CI runner needs a deploy key for the same reason. There is no anonymous path to this
+package until it is published.
+
+What you get is not a release. No release tag exists yet, so the version is derived from the distance
+since the first commit and moves every time `main` does -- an install from `main` reported
+`0.0.1.dev69+g20b0ea579` when this was written. Pin a commit for anything that has to resolve the same
+way twice, after the `.git` and before the fragment:
+
+<!-- skip: the same private clone as above, against a commit this document does not pin for you -->
+```bash
+pip install 'strands-mongodb[all] @ git+ssh://git@github.com/mongodb/strands-mongodb.git@<commit-sha>#subdirectory=python'
+```
+
 ## Quickstart
 
 Both snippets below are run by the test suite from this file, so they are the versions that work rather

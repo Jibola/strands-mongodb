@@ -444,16 +444,34 @@ class TestTheTwoReadmesAgree:
     files agreeing on a stale number is the failure this is meant to catch.
     """
 
-    def test_the_install_block_is_identical_in_both(self) -> None:
-        """AT-093 -- the install lines are the one snippet both files carry, so they are compared verbatim."""
-        installs = {
-            path: [block.body for block in blocks if "pip install" in block.body]
-            for path, blocks in ((_PACKAGE_README, _PACKAGE_BLOCKS), (_ROOT_README, _ROOT_BLOCKS))
-        }
-        for path, bodies in installs.items():
-            assert bodies, f"{path.name} has no install block"
-        assert installs[_PACKAGE_README][0] == installs[_ROOT_README][0], (
-            "the two READMEs give different install commands"
+    def test_the_install_section_is_identical_in_both(self) -> None:
+        """AT-093 -- the whole ``## Install`` section, compared verbatim rather than one block out of it.
+
+        This compared ``[0]`` of the blocks containing ``pip install``, which was the entire shared
+        surface while the PyPI commands were the only install block. Two things make that too narrow now.
+        The section gained a second block -- how to install before the package is published -- and the
+        first element of a list is exactly what keeps matching while the part somebody edited drifts. And
+        a block comparison never saw the prose between the blocks, where the reason for each command is
+        written; the caveat about quoting brackets could disagree between the two files indefinitely.
+
+        The section rather than the file, because these are not the same document: the split makes the root
+        file a landing page and ``python/README.md`` the reference, and the reference carries a
+        ``pip install -e`` line for contributors that the landing page has no reason to repeat. What the
+        two are required to agree on is what they tell a reader to install, and that is this section.
+        """
+        sections = {}
+        for path in (_PACKAGE_README, _ROOT_README):
+            text = path.read_text()
+            start = text.find("\n## Install\n")
+            assert start != -1, f"{path.name} has no '## Install' section, so nothing here is comparing it"
+            end = text.find("\n## ", start + 1)
+            sections[path] = text[start:end] if end != -1 else text[start:]
+
+        assert sections[_PACKAGE_README] == sections[_ROOT_README], (
+            "the two READMEs' Install sections differ. They are the one passage both files carry in full, "
+            "so a reader who arrives at either is told the same thing:\n"
+            f"--- python/README.md ---\n{sections[_PACKAGE_README]}\n"
+            f"--- README.md ---\n{sections[_ROOT_README]}"
         )
 
     @pytest.mark.parametrize(
