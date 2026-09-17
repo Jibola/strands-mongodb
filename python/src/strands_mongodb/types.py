@@ -188,6 +188,11 @@ class MongoDBMemoryStoreConfig(MemoryStoreConfig, total=False):
             score instead, because the tier was the caller's own choice (``REQ-E-146``).
         max_score: Ceiling a result must not exceed. Mutually exclusive with ``min_score``. The same
             scale note applies, and bites harder: a ceiling meant for cosine scores admits everything.
+            A ``dotProduct`` index inverts the danger instead of blunting it. That metric's score is
+            ``(1 + dot) / 2`` with nothing normalising the vectors first, so a corpus vector longer than
+            the query scores above 1 -- 2.0, measured, for one five times its length -- and a ceiling of
+            1.0 there drops the strongest matches rather than the weakest, with no error to read
+            (``REQ-E-183``).
         ttl_seconds: How long a memory lives, as an offset from its own ``created_at``. Absent means no
             expiry and stamps no field; ``0`` means "expire at the next sweep" and is a legitimate
             value, not a disabled one (``REQ-E-148``). Set on insert only, so re-extracting a fact this

@@ -42,6 +42,7 @@ import datetime
 import hashlib
 import inspect
 import logging
+import math
 import re
 import time
 import traceback
@@ -3531,6 +3532,276 @@ class TestTenStoresShareOneSetup:
                 )
         finally:
             await stores[0].close()
+
+
+# --- AT-188: what the three vector metrics return, which is measurable on a container ---------------
+#
+# The manual-vector path takes the caller's own vectors, so an index on any of the three metrics needs
+# nothing from the deployment's embedding-model registry and a plain Atlas container can build all three.
+# That is the same discovery the tier-resolution tests rest on, applied to scores, and it is why these
+# tests are `contract` rather than `integration`.
+#
+# `MANUAL_VECTOR`, `_seed_vectors` and `_answered` are defined further down this module with the
+# integration corpus they were written for; module-level names resolve when the test runs.
+
+_METRIC_QUERY: Final[list[float]] = [1.0, 0.0, 0.0, 0.0]
+"""The query for every metric test: the first axis, unit length, so a score is readable off a vector."""
+
+_METRIC_CORPUS: Final[dict[str, list[float]]] = {
+    "on the axis, a tenth of the way out": [0.1, 0.0, 0.0, 0.0],
+    "half a unit, off the axis": [0.3, 0.4, 0.0, 0.0],
+    "the same direction as the last one, ten times as long": [3.0, 4.0, 0.0, 0.0],
+    "unit length, spread over every dimension": [0.5, 0.5, 0.5, 0.5],
+    "square to the query, in a dimension of its own": [0.0, 0.0, 1.0, 0.0],
+    "off to one side and behind": [-0.6, 0.8, 0.0, 0.0],
+}
+"""Six vectors chosen so that the three metrics disagree, which is the point of them.
+
+Lengths differ deliberately. ``cosine`` normalises, so the second and third are *tied* under it; the
+third is first under ``dotProduct``, which does not normalise; and it is **last** under ``euclidean``,
+because a vector ten times too long is ten times too far away. One corpus, one query, three orders.
+
+Each metric has a unique nearest and a unique furthest document here, checked by ``AT-188``'s first test
+computing both rather than naming them, so a tie can never make that assertion vacuous.
+"""
+
+
+def _metric_similarity(metric: str, vector: list[float]) -> float:
+    """Return this metric's own notion of nearness, higher being nearer.
+
+    Not the score. The score is what the server computes *from* this, and keeping the two apart is what
+    lets one test assert the direction without also asserting the formula.
+
+    Args:
+        metric: ``"cosine"``, ``"dotProduct"`` or ``"euclidean"``.
+        vector: The stored vector, against :data:`_METRIC_QUERY`.
+
+    Returns:
+        Cosine similarity, dot product, or the negated squared distance -- negated so that higher is
+        nearer on all three and one comparison reads the same way for each.
+    """
+    dot = sum(left * right for left, right in zip(vector, _METRIC_QUERY, strict=True))
+    if metric == "cosine":
+        lengths = math.sqrt(sum(value * value for value in vector)) * math.sqrt(
+            sum(value * value for value in _METRIC_QUERY)
+        )
+        return dot / lengths
+    if metric == "dotProduct":
+        return dot
+    return -sum((left - right) ** 2 for left, right in zip(vector, _METRIC_QUERY, strict=True))
+
+
+def _metric_score(metric: str, vector: list[float]) -> float:
+    """Return the score this deployment was measured to compute for one vector on one metric.
+
+    Measured on ``mongodb/mongodb-atlas-local:8``, mongod 8.3.11, on 2026-09-17: ``(1 + cosine) / 2``,
+    ``(1 + dot) / 2``, and ``1 / (1 + squared distance)``. Written as arithmetic rather than as a table
+    of expected numbers so that the corpus above can change without a transcription step.
+
+    All three are similarities, and the third is the interesting one: ``euclidean`` is a distance metric
+    and the server has already inverted it. This package has no distance to invert and must not invert
+    the similarity it does get.
+
+    Args:
+        metric: ``"cosine"``, ``"dotProduct"`` or ``"euclidean"``.
+        vector: The stored vector, against :data:`_METRIC_QUERY`.
+
+    Returns:
+        The expected ``vectorSearchScore``.
+    """
+    similarity = _metric_similarity(metric, vector)
+    if metric == "euclidean":
+        return 1 / (1 - similarity)
+    return (1 + similarity) / 2
+
+
+async def _seeded_metric_store(metric: str, uri: str, database: str, collection: str) -> MongoDBMemoryStore:
+    """Build a manual-vector store on one metric, seed :data:`_METRIC_CORPUS`, and hand it back open.
+
+    Skips where the deployment has no search process, which is one of the two legs this tier runs on:
+    there is no vector index there and so no score to read, and ``AT-185`` is the test that asserts the
+    consequence for tier resolution.
+
+    Args:
+        metric: The ``similarity`` to build the index on.
+        uri: Connection string for the deployment.
+        database: This session's throwaway database.
+        collection: This test's own collection.
+
+    Returns:
+        The initialized store, with the corpus written. **The caller closes it.**
+    """
+    store = _real_store(
+        uri,
+        database,
+        collection,
+        scope="tenant-a",
+        connection={**MANUAL_VECTOR, "similarity": metric, "search_type": "vector"},
+    )
+    try:
+        await store.initialize()
+        capabilities = store._connection.capabilities
+        assert capabilities is not None
+        if not capabilities.search:
+            pytest.skip("this deployment has no search process, so no vector index and no score to read")
+        await _seed_vectors(store._collection(), scope="tenant-a", store_name="facts", facts=_METRIC_CORPUS)
+    except BaseException:
+        # `pytest.skip` raises, and a store left open on a skip leaks a client into the next test.
+        await store.close()
+        raise
+    return store
+
+
+async def _metric_scores(store: MongoDBMemoryStore) -> list[tuple[str, float]]:
+    """Query the vector tier and return content with its score, in the order the server returned them.
+
+    Args:
+        store: A store from :func:`_seeded_metric_store`.
+
+    Returns:
+        One pair per document in :data:`_METRIC_CORPUS`, server order preserved.
+    """
+    results = await _answered(store, {"vector": _METRIC_QUERY, "limit": 10}, expected=len(_METRIC_CORPUS))
+    return [(entry.content, float(_metadata(entry)["_relevance_score"])) for entry in results]
+
+
+@pytest.mark.contract
+class TestEveryMetricReturnsASimilarityAndNeverADistance:
+    """``AT-188`` / ``REQ-E-183`` -- what a score is, measured rather than argued from documentation.
+
+    This package's release criteria ask for "similarity-ordered results with ``score`` populated and
+    monotonically decreasing; distance inverted", and the last clause was the unmeasured one: nothing in
+    this suite had ever observed a score from a ``dotProduct`` or a ``euclidean`` index. The documented
+    answer -- that Atlas returns a similarity for all three, so there is nothing left here to invert -- is
+    the right one, and was, until this class, a citation rather than a measurement.
+
+    The direction is the claim a caller depends on and it is asserted per metric, because a score that
+    *was* a distance would order results the other way and ``min_score`` -- a floor on the reported number
+    (``REQ-E-059``) -- would then keep the worst matches and drop the best, with no error on either side.
+    """
+
+    @pytest.mark.parametrize("metric", ["cosine", "dotProduct", "euclidean"])
+    async def test_the_nearest_vector_scores_highest_and_the_furthest_lowest(
+        self, metric: str, contract_uri: str, test_database_name: str, unique_collection_name: str
+    ) -> None:
+        """``AT-188`` -- the direction, from the corpus rather than from a written-down order.
+
+        Three assertions and they are not the same one: that the server's order is descending by score,
+        that reading the *metric's* own nearness along that order never rises, and that the ends are the
+        documents the corpus computes as nearest and furthest. A raw distance in the score field passes
+        none of the three, and an accidental ``sorted()`` in this package passes only the first.
+        """
+        store = await _seeded_metric_store(metric, contract_uri, test_database_name, unique_collection_name)
+        try:
+            measured = await _metric_scores(store)
+
+            assert len(measured) == len(_METRIC_CORPUS), f"the corpus did not all arrive: {measured}"
+            scores = [score for _, score in measured]
+            assert scores == sorted(scores, reverse=True), f"{metric} results are not ordered by score: {measured}"
+            assert all(score > 0.0 for score in scores), (
+                f"a score of zero on {metric} is what an unprojected `$meta` reads as, so it cannot be "
+                f"told from a document that scored nothing: {measured}"
+            )
+
+            nearness = [_metric_similarity(metric, _METRIC_CORPUS[content]) for content, _ in measured]
+            assert nearness == sorted(nearness, reverse=True), (
+                f"the score falls down this list while {metric} nearness does not, which is what a "
+                f"distance in the score field looks like: {list(zip(measured, nearness, strict=True))}"
+            )
+            nearest = max(_METRIC_CORPUS, key=lambda content: _metric_similarity(metric, _METRIC_CORPUS[content]))
+            furthest = min(_METRIC_CORPUS, key=lambda content: _metric_similarity(metric, _METRIC_CORPUS[content]))
+            assert measured[0][0] == nearest, f"{metric}'s nearest vector is not first: {measured}"
+            assert measured[-1][0] == furthest, f"{metric}'s furthest vector is not last: {measured}"
+        finally:
+            await store.close()
+
+    @pytest.mark.parametrize("metric", ["cosine", "dotProduct", "euclidean"])
+    async def test_the_score_is_the_number_this_deployments_formula_predicts(
+        self, metric: str, contract_uri: str, test_database_name: str, unique_collection_name: str
+    ) -> None:
+        """``AT-188`` -- the formula, recomputed from the vectors rather than read off a table.
+
+        The tolerance is relative and loose enough for ``float32``, which is the precision a vector field
+        has: the worst disagreement measured over eighteen scores was ``2.4e-08``. A formula that changes
+        in a future mongot fails here, which is the arrangement ``MAX_NUM_CANDIDATES`` and ``AT-072b``
+        already have for a bound this repository writes down after reading it off a server.
+        """
+        store = await _seeded_metric_store(metric, contract_uri, test_database_name, unique_collection_name)
+        try:
+            measured = await _metric_scores(store)
+
+            for content, score in measured:
+                expected = _metric_score(metric, _METRIC_CORPUS[content])
+                assert math.isclose(score, expected, rel_tol=1e-6), (
+                    f"{metric} scored {content!r} at {score!r}, and the formula measured on this image "
+                    f"predicts {expected!r}"
+                )
+        finally:
+            await store.close()
+
+    async def test_the_reported_score_is_the_one_the_server_projected(
+        self, contract_uri: str, test_database_name: str, unique_collection_name: str
+    ) -> None:
+        """``AT-188`` -- the passthrough, against a pipeline this package did not build.
+
+        ``euclidean`` on purpose: it is the metric whose name invites a normalisation, and a package that
+        rescaled anything would rescale this one. The comparison pipeline is written out here rather than
+        taken from ``_pipeline``, because a passthrough claim checked against the same builder the package
+        uses would agree with itself.
+        """
+        store = await _seeded_metric_store("euclidean", contract_uri, test_database_name, unique_collection_name)
+        try:
+            reported = dict(await _metric_scores(store))
+            cursor = await store._collection().aggregate(
+                [
+                    {
+                        "$vectorSearch": {
+                            "index": store._index_names["vector"],
+                            "path": _indexes.VECTOR_FIELD,
+                            "queryVector": _METRIC_QUERY,
+                            "numCandidates": 100,
+                            "limit": len(_METRIC_CORPUS),
+                        }
+                    },
+                    {"$set": {"projected": {"$meta": _pipeline.VECTOR_SCORE_META}}},
+                    {"$project": {_indexes.CONTENT_FIELD: 1, "projected": 1, "_id": 0}},
+                ]
+            )
+            projected = {
+                str(document[_indexes.CONTENT_FIELD]): float(document["projected"]) async for document in cursor
+            }
+
+            assert projected, "the comparison pipeline returned nothing, so it is asserting nothing"
+            assert reported == projected, (
+                "the score this package reports is not the score the server projected, so something "
+                f"between the two is rescaling it: reported {reported}, projected {projected}"
+            )
+        finally:
+            await store.close()
+
+    async def test_a_dot_product_score_is_not_bounded_above_by_one(
+        self, contract_uri: str, test_database_name: str, unique_collection_name: str
+    ) -> None:
+        """``AT-188`` -- the range this package's prose does not describe, measured rather than warned about.
+
+        Four places in this repository say a cosine score lands in roughly 0 to 1, and all four are about
+        cosine. ``dotProduct`` is ``(1 + dot) / 2`` with no normalisation of its own, so a stored vector
+        longer than the query's scores above one -- ``2.0`` for the corpus vector five times too long.
+        A ``max_score`` ceiling carried over from the cosine range is therefore a filter that removes the
+        strongest matches on such a store, silently, which is worth one test rather than one sentence.
+        """
+        store = await _seeded_metric_store("dotProduct", contract_uri, test_database_name, unique_collection_name)
+        try:
+            measured = await _metric_scores(store)
+
+            above_one = [(content, score) for content, score in measured if score > 1.0]
+            assert above_one, (
+                "no dotProduct score in this corpus exceeded 1.0, so either the corpus lost its "
+                f"over-long vector or the server now normalises: {measured}"
+            )
+            assert measured[0][1] == max(score for _, score in measured), "the ordering test's premise broke here"
+        finally:
+            await store.close()
 
 
 # --- integration tier: mongot, because no v0.1.0 search tier runs without it -----------------------
