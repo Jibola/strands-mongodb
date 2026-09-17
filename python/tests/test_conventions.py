@@ -29,9 +29,13 @@ reference, and a document can pass all of it while explaining nothing.
 from __future__ import annotations
 
 import ast
+import asyncio
+import gc
+import inspect
 import re
 import sys
 import warnings
+import weakref
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Final
@@ -39,6 +43,7 @@ from typing import Any, Final
 import pytest
 import yaml
 from conftest import TIER_VARIABLES
+from pymongo.periodic_executor import AsyncPeriodicExecutor
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -727,6 +732,97 @@ class TestADeprecationIsAFailureRatherThanAScrollbackLine:
             f"pytest-asyncio {installed} is installed, and below 1.0 it calls asyncio.get_event_loop_policy() "
             f"on every async test -- which pyproject.toml's filterwarnings turns into an error. Install the "
             f"declared floor (>=1.0.0,<2.0.0); the rest of this run's failures are that, not your change"
+        )
+
+
+class TestTheWarningTheFilterLeavesCountedIsNotOursToFix:
+    """``AT-191`` / ``REQ-E-156`` -- the reason the filter names one category instead of erroring on all.
+
+    ``filterwarnings = ["error::DeprecationWarning"]`` is deliberately narrower than ``["error"]``, and the
+    comment in ``pyproject.toml`` gives two reasons. One of them was read off the tail of a 1,922-second
+    contract run and never reproduced: nine ``PytestUnraisableExceptionWarning``s, diagnosed as
+    pymongo's periodic executor cancelling its task from a weakref callback after the loop it belongs to
+    has closed. The test named in that report was whichever one happened to be running, so the diagnosis
+    was an inference from a stack trace, and a justification nobody can reproduce is a justification that
+    gets argued away the next time somebody wants the strict setting.
+
+    Reproduced here in five lines, deterministically and with no deployment: exactly the shape
+    ``monitor.py`` builds, exactly one ``RuntimeError: Event loop is closed``, arriving where no ``except``
+    can see it.
+
+    **Not fixed upstream, and not by anything this project can pin.** ``AsyncPeriodicExecutor.close`` is
+    byte-identical in 4.14.0 and in 4.18.1, the newest release at the time of writing: it calls
+    ``self._task.cancel()`` with nothing asking whether the loop is still alive. So the filter stays narrow,
+    and if that ever changes these tests fail -- which is the good direction, and the signal that
+    ``["error"]`` has become affordable.
+
+    **Not claimed: that the nine warnings in that run were each this.** One executor produces one, and the
+    count matched the number of clients that outlived their loops; that is consistent rather than proven.
+    """
+
+    def test_the_executors_close_raises_when_its_loop_is_gone(self) -> None:
+        """AT-191 -- the mechanism, reproduced rather than inferred from a stack trace.
+
+        The executor is pymongo's own class with a trivial target, so what is under test is the driver's
+        cancellation path and not a re-implementation of it. ``sys.unraisablehook`` is swapped for the
+        duration because the exception is raised inside a garbage-collection callback, where the only way
+        to observe it is the hook pytest's own plugin installs for the same reason.
+
+        The closed loop is the cause rather than the coincidence: the same five lines with the loop left
+        open collect the stand-in and raise nothing.
+        """
+
+        async def target() -> bool:
+            return True
+
+        async def start(executor: AsyncPeriodicExecutor) -> None:
+            executor.open()
+            await asyncio.sleep(0)  # Let the task start, for determinism; measured, it fires either way.
+
+        executor = AsyncPeriodicExecutor(interval=60, min_interval=0.1, target=target, name="AT-191")
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(start(executor))
+        # The pending task is collected after the loop it ran on, and asyncio reports that through the
+        # loop's exception handler rather than through a warning. Silenced because it is not what is being
+        # measured and it would otherwise arrive as an unexplained error line in an unrelated test's output.
+        loop.set_exception_handler(lambda _loop, _context: None)
+        loop.close()
+
+        class Monitored:
+            """Stands in for the object whose collection fires ``executor.close``."""
+
+        monitored = Monitored()
+        finalizer = weakref.ref(monitored, executor.close)  # monitor.py's shape, verbatim.
+        unraisable: list[str] = []
+        original_hook = sys.unraisablehook
+        sys.unraisablehook = lambda args: unraisable.append(f"{args.exc_type.__name__}: {args.exc_value}")
+        try:
+            del monitored
+            gc.collect()
+        finally:
+            sys.unraisablehook = original_hook
+
+        assert finalizer() is None, "the stand-in survived collection, so the callback never ran"
+        assert unraisable == ["RuntimeError: Event loop is closed"], (
+            f"pymongo {version('pymongo')} raised {unraisable} from a weakref callback on a closed loop; "
+            f"if that list is empty the driver now guards the cancel and pyproject.toml's filterwarnings "
+            f"can be widened to ['error']"
+        )
+
+    def test_the_driver_still_calls_that_close_from_a_weakref_callback(self) -> None:
+        """AT-191 -- the premise of the test above, which is the part that could go stale quietly.
+
+        The wiring is not reachable through behaviour: the callback is registered inside ``Monitor.open``
+        on an object that closes over ``self``, and nothing exposes it. So the module is read. A brittle
+        assertion on purpose -- if pymongo stops passing ``executor.close`` to ``weakref.ref``, the
+        reproduction above is testing a shape the driver no longer builds, and this is the only test that
+        would say so.
+        """
+        import pymongo.asynchronous.monitor as monitor
+
+        assert "weakref.ref(self, executor.close)" in inspect.getsource(monitor), (
+            f"pymongo {version('pymongo')} no longer registers the executor's close as a weakref callback, "
+            f"so AT-191's reproduction no longer mirrors the driver -- re-derive it from monitor.py"
         )
 
 

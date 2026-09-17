@@ -436,19 +436,17 @@ class TestDriverAttributionReachesTheServer:
         assert "Strands" in injected.options.pool_options.metadata["driver"]["name"]
 
     def test_repeated_attribution_of_one_client_is_idempotent(self) -> None:
-        """A characterization test of pymongo, not an assertion about our control flow.
+        """The metadata a caller ends up holding, whichever layer kept it to one entry.
 
-        Labeled that way because it cannot fail on anything we write, and a reader is entitled to know
-        which tests are load bearing. Confirmed by mutation: removing the cache-hit early return from
-        ``resolve`` leaves this passing.
-
+        Two layers now keep it there and this test cannot tell them apart, which is why
+        :class:`TestAttributionHappensAtMostOncePerClient` counts the calls instead.
         ``PoolOptions._update_metadata`` returns early when the name is already in the pipe-delimited
-        chain, comparing case-insensitively, so appending ``Strands`` twice is a no-op and only a
-        different name stacks. The spec asserted the opposite until this was read rather than inferred.
+        chain -- from pymongo 4.14.1 onward, measured; **not** on the declared floor 4.14.0 -- and
+        ``_already_attributed`` does the same comparison a layer up, on every version.
 
-        Kept because we rely on it. Resolving one config repeatedly is the normal case
-        (``REQ-E-012``), and if a future pymongo drops the dedupe, the attribution string starts
-        growing once per store and this is the test that says so.
+        Kept for the outcome rather than the mechanism. Resolving one config repeatedly is the normal
+        case (``REQ-E-012``), and this is the test that says so in the terms a caller reads: the driver
+        name they hand us comes back naming Strands once.
         """
         injected: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/")
         config: MongoDBConfig = {"database": "appdb", "client": injected}
@@ -476,6 +474,121 @@ class TestDriverAttributionReachesTheServer:
         injected: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/")
 
         assert callable(inspect.getattr_static(type(injected), "append_metadata", None))
+
+
+class TestAttributionHappensAtMostOncePerClient:
+    """``AT-190`` / ``REQ-E-185`` -- the floor's pymongo stacks what the code assumed it deduped.
+
+    :func:`_client._attribute_injected_client` runs once per registry slot, and ``close`` releases the
+    slot, so a caller who closes a store and resolves the same client again is attributed again. Whether
+    that mattered was answered from the installed 4.17.0, where ``PoolOptions._update_metadata`` compares
+    the incoming name against the pipe-delimited chain case-insensitively and returns early. A comment in
+    ``resolve`` said so in as many words.
+
+    Measured across the declared range instead, one venv per release: **4.14.0 does not have that
+    comparison and 4.14.1 onward does.** 4.14.0 is the floor, and the ``Dependency floors`` job installs
+    exactly it. On the floor each cycle appends another ``Strands`` and another version to the handshake
+    document, and against ``mongo:8`` the twenty-second cycle ends with every new connection failing --
+    ``OperationFailure: The client metadata document must be less than or equal to 512 bytes``. A dead
+    client in a process that did nothing wrong, and nothing in the package's own behaviour to see it by.
+
+    So the guard is this package's now, and these tests count the calls *this package* makes rather than
+    reading the chain the driver may have deduped for us. Counting is the whole point: on 4.14.1 upward
+    the chain looks identical either way, so a test that read the chain would have passed on the floor
+    while the floor was broken -- which is what happened.
+    """
+
+    @staticmethod
+    def _record_appends(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Record every ``append_metadata`` name, and let the real call proceed.
+
+        Patched on the class rather than the instance, because ``AsyncMongoClient.__getattr__`` treats an
+        unknown attribute as a database name and an instance attribute would be a fresh surface rather
+        than the method under test. The original is called through, so the metadata a later assertion
+        reads is the metadata pymongo would really have built.
+
+        Args:
+            monkeypatch: The fixture that undoes the patch when the test ends.
+
+        Returns:
+            A list that grows by one driver name per call, in call order.
+        """
+        appended: list[str] = []
+        original = AsyncMongoClient.append_metadata
+
+        def record(self: AsyncMongoClient[Any], driver_info: DriverInfo) -> None:
+            appended.append(driver_info.name)
+            original(self, driver_info)
+
+        monkeypatch.setattr(AsyncMongoClient, "append_metadata", record)
+        return appended
+
+    async def test_closing_and_resolving_again_does_not_attribute_again(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AT-190 -- the cycle that killed the client on the floor, run three times.
+
+        Three rather than twenty-two because the failure this asserts is the second append, not the
+        twenty-second: the server's limit is where an unbounded chain is finally noticed, and the bug is
+        that the chain grows at all. Removing the guard fails this on every supported pymongo, which the
+        earlier reading of the chain could not do.
+        """
+        injected: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/")
+        appended = self._record_appends(monkeypatch)
+        config: MongoDBConfig = {"database": "appdb", "client": injected}
+
+        for _ in range(3):
+            _client.resolve(config)
+            await _client.close(config)
+
+        assert appended == ["Strands"], f"attributed {len(appended)} times across three cycles: {appended}"
+        assert injected.options.pool_options.metadata["driver"]["name"].count("Strands") == 1
+
+    def test_a_client_the_caller_attributed_first_is_left_alone(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AT-190 -- the same guard from the other side, where the existing entry is not ours to blame.
+
+        A caller who runs their own ``append_metadata`` with this name -- copying the snippet from the
+        migration guide, or wrapping two Strands packages -- reaches ``resolve`` with the chain already
+        naming Strands. Appending a second entry there is the same unbounded growth arriving through a
+        supported call rather than through our own cycle.
+        """
+        injected: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/")
+        injected.append_metadata(DriverInfo("Strands", "theirs"))
+        appended = self._record_appends(monkeypatch)
+
+        _client.resolve({"database": "appdb", "client": injected})
+
+        assert appended == [], f"attributed a client that already named Strands: {appended}"
+
+    def test_the_comparison_ignores_case_the_way_the_driver_does(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AT-190 -- ``strands`` and ``Strands`` are one entry, because server-side grouping folds them.
+
+        This mirrors ``_update_metadata`` from 4.14.1 rather than inventing a rule: a case-sensitive guard
+        here would append beside the caller's lowercase entry and produce the growth on a chain the driver
+        would have refused to extend.
+        """
+        injected: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/")
+        injected.append_metadata(DriverInfo("strands", "theirs"))
+        appended = self._record_appends(monkeypatch)
+
+        _client.resolve({"database": "appdb", "client": injected})
+
+        assert appended == [], f"a lowercase entry read as a different driver: {appended}"
+
+    def test_a_longer_name_that_starts_with_ours_is_not_ours(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AT-190 -- the vacuity guard, and the reason the comparison splits on the delimiter.
+
+        ``"Strands" in chain`` is the obvious way to write this guard and it is wrong: a client already
+        carrying ``StrandsToolkit`` has not been attributed to Strands, and skipping the append there
+        loses the attribution entirely rather than duplicating it. Whole entries, so this client is still
+        attributed and a test that could only ever see a skip cannot pass by accident.
+        """
+        injected: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/")
+        injected.append_metadata(DriverInfo("StrandsToolkit", "theirs"))
+        appended = self._record_appends(monkeypatch)
+
+        _client.resolve({"database": "appdb", "client": injected})
+
+        assert appended == ["Strands"], f"a different driver's name was read as ours: {appended}"
+        assert injected.options.pool_options.metadata["driver"]["name"].endswith("StrandsToolkit|Strands")
 
 
 class TestRetryWritesDisabledIsWorthSaying:

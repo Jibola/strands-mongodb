@@ -323,23 +323,55 @@ def _warn_if_retries_disabled(client: AsyncMongoClient[Any]) -> None:
         logger.warning(_RETRY_WRITES_DISABLED)
 
 
+def _already_attributed(client: AsyncMongoClient[Any]) -> bool:
+    """Whether this client's driver metadata already names Strands (``REQ-E-185``).
+
+    The metadata's ``driver.name`` is a pipe-delimited chain -- ``PyMongo|c|async|Strands`` -- and
+    ``append_metadata`` appends to it. Splitting on the delimiter and comparing whole entries
+    case-insensitively is what pymongo's own ``PoolOptions._update_metadata`` does from 4.14.1 onward,
+    and doing it here is what makes the answer independent of which pymongo is installed.
+
+    Whole entries rather than a substring search, because a caller whose own attribution is
+    ``StrandsToolkit`` has not been attributed as Strands and must not be treated as though they had.
+
+    Args:
+        client: The client to inspect. Read through ``options``, which is public and is what
+            ``AT-013a`` already asserts against.
+
+    Returns:
+        Whether an entry equal to this package's driver name is already in the chain.
+    """
+    chain = client.options.pool_options.metadata["driver"]["name"]
+    return _DRIVER_NAME.casefold() in (entry.casefold() for entry in chain.split("|"))
+
+
 def _attribute_injected_client(client: AsyncMongoClient[Any]) -> None:
-    """Attach Strands attribution to a client we did not build (``REQ-E-013``).
+    """Attach Strands attribution to a client we did not build (``REQ-E-013``), at most once.
 
     This is ``pymongo_search_utils.append_client_metadata`` inlined. That function is three lines and
     would be the obvious thing to call, but it lives in the ``[memory]`` extra, and this module is
     reachable from ``storage.py`` under a ``[storage]``-only install.
 
-    Unguarded, because the declared pymongo floor is 4.14.0 and ``AsyncMongoClient.append_metadata``
-    arrived in that release. Below it the attribute still resolves -- ``__getattr__`` hands back a
-    ``Database`` of that name -- so a probe would have to test callability rather than presence, and
-    the branch behind it could only log. Attribution is bookkeeping this package does for MongoDB's
-    own usage counting; a caller did not ask for it and has nothing to do about it, so the floor
-    carries the requirement instead of a message at runtime.
+    The call is made without probing for the method, because the declared pymongo floor is 4.14.0 and
+    ``AsyncMongoClient.append_metadata`` arrived in that release. Below it the attribute still resolves
+    -- ``__getattr__`` hands back a ``Database`` of that name -- so a probe would have to test
+    callability rather than presence, and the branch behind it could only log. Attribution is
+    bookkeeping this package does for MongoDB's own usage counting; a caller did not ask for it and has
+    nothing to do about it, so the floor carries the requirement instead of a message at runtime.
 
     Args:
         client: The injected client to attribute in place.
     """
+    # At most once per client, and this guard is the whole of that (``REQ-E-185``). A caller who closes
+    # a store and resolves the same client again reaches this function again, because `close` releases
+    # the registry slot the second `resolve` then misses. On pymongo 4.14.1 and later the second append
+    # is a no-op inside the driver; on 4.14.0, which is this package's declared floor, it is not, and
+    # the chain grows by one entry per cycle until the handshake exceeds the server's 512-byte limit on
+    # client metadata and every new connection fails with an `OperationFailure` naming a document size.
+    # Measured against mongod 8: dead at 22 cycles.
+    if _already_attributed(client):
+        return
+
     client.append_metadata(_driver_info())
 
 
@@ -384,8 +416,9 @@ def resolve(config: MongoDBConfig) -> _Connection:
         if existing is not None:
             # Returning here is what keeps REQ-E-016's warning to one line per connection rather than one
             # per store, and a Storage is resolved once per SDK subsystem that consumes it. Reapplying the
-            # attribution would in fact be harmless, since `_update_metadata` dedupes by driver name, but
-            # re-warning would not be.
+            # attribution would be harmless too, but for our own reason rather than pymongo's: this comment
+            # used to credit `_update_metadata`'s dedupe, which the declared floor 4.14.0 does not have.
+            # `_already_attributed` is what makes it harmless on every supported version (``REQ-E-185``).
             return existing
 
         if running is not None:
