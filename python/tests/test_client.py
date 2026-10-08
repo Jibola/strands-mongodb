@@ -927,7 +927,7 @@ class TestThePasswordNeverLeavesTheConfig:
 
 
 class TestTheCredentialsTheUriRedactionDoesNotCover:
-    """AT-177 / ``REQ-E-171`` — premortem **P-3** again, on the half ``AT-014`` could not see.
+    """AT-177 / ``REQ-E-171`` — credential leakage again, on the half ``AT-014`` could not see.
 
     ``AT-014`` above asserts that the password does not render, and it passed for four reasons, only
     three of which were ours. The fourth was pymongo: ``AsyncMongoClient.__repr__`` prints every

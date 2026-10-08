@@ -1401,7 +1401,7 @@ async def _wait_until_ready(
                 #   against what was asked for at all -- the cold read found nothing, so
                 #   ``_ensure_search`` had no document to check and never got another.
                 #
-                # Accepting either ships premortem **P-2** with the loudest symptom removed: searches run,
+                # Accepting either ships a silent empty result with the loudest symptom removed: searches run,
                 # return nothing or the wrong thing, and every index reports READY. One extra containment
                 # check over a document already in hand is the whole cost; there is no additional read.
                 _check_definition(collection.name, namespace, pending[name], document or {})

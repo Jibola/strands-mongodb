@@ -1511,7 +1511,7 @@ class TestSearchIndexesAgainstAFake:
         assert "vector_index" in message
 
     async def test_the_default_timeout_is_measured_and_the_interval_matches_the_reference(self) -> None:
-        """AT-125 / ``REQ-E-123``, ``INV-009``. The interval is inherited; the budget is not, any more.
+        """AT-125 / ``REQ-E-123``. The interval is inherited; the budget is not, any more.
 
         ``pymongo_search_utils`` polls with ``TIMEOUT = 120`` and ``INTERVAL = 0.5``, and reimplementing
         those helpers against ``AsyncCollection`` (``REQ-E-066``) was never a reason to change how long a
@@ -1521,7 +1521,7 @@ class TestSearchIndexesAgainstAFake:
         is the one place a budget must not sit.
 
         The interval is untouched. Raising a ceiling changes when a failure arrives and not when a
-        success does, which is ``INV-009``, and the poll frequency is what decides the latter.
+        success does, and the poll frequency is what decides the latter.
         """
         assert _indexes.READY_TIMEOUT_SECONDS == 300
         assert _indexes.POLL_INTERVAL_SECONDS == 0.5
@@ -1709,7 +1709,7 @@ class TestReadinessIsAboutTheDefinitionAndNotOnlyTheStatus:
       asked for at all. The cold read found nothing, so ``_ensure_search`` had no document to check, and
       the only later document went to a branch that looked at ``status``.
 
-    Accepting either is premortem **P-2** with its loudest symptom removed: every index reports READY,
+    Accepting either is a silent empty result with its loudest symptom removed: every index reports READY,
     ``initialize()`` returns, and searches quietly return nothing or the wrong thing. The cost of closing
     it is one containment check over a document already in hand.
 
@@ -2127,7 +2127,7 @@ class TestTheFakesMatchTheDriver:
 
 @pytest.mark.contract
 class TestACollatedIndexAgainstARealDeployment:
-    """AT-193 / ``REQ-E-187`` — boundary **B-1**. The premise, and what the refusal is refusing.
+    """AT-193 / ``REQ-E-187`` — a real server over the wire. The premise, and what the refusal is refusing.
 
     Two things were assumptions when the finding arrived, and both are asserted here rather than
     reasoned about: that ``index_information`` reports an index's own collation at all -- without which
@@ -2710,7 +2710,7 @@ class TestEveryCallSitePassesTheConfiguredBudget:
 
 @pytest.mark.contract
 class TestCompetingIndexesAgainstARealDeployment:
-    """AT-196 / ``REQ-E-190`` — boundary **B-1**. The premise the fake cannot assert.
+    """AT-196 / ``REQ-E-190`` — a real server over the wire. The premise the fake cannot assert.
 
     Everything in the unit class above rests on one claim about the server: that a second index over the
     same keys under a *different* collation is created rather than refused. If that is wrong, a collection
@@ -2811,7 +2811,7 @@ class TestCompetingIndexesAgainstARealDeployment:
 
 @pytest.mark.contract
 class TestACollatedTtlIndexAgainstARealDeployment:
-    """AT-197 / ``REQ-E-191`` — boundary **B-1**. That the refused index worked, measured.
+    """AT-197 / ``REQ-E-191`` — a real server over the wire. That the refused index worked, measured.
 
     The exemption rests on a claim about the server: that a non-simple collation on a date-only TTL index
     changes nothing about expiry. Reasoning gets you there -- a collation orders strings and a BSON date is

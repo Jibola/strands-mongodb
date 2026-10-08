@@ -68,7 +68,7 @@ score the hybrid tier returns, and that scale is nothing like the other two tier
 about ``1/61``, or ``0.016``, and one first in both about ``0.033``, while ``cosine``
 similarity and BM25 both land in roughly 0 to 1. A ``min_score`` chosen against either of those and
 applied to a fused score filters out every result and looks exactly like an empty collection
-(``REQ-E-145``, premortem ``P-2``).
+(``REQ-E-145``).
 
 So the number is here to be *quoted*: the config docstring and the README operator reference both
 resolve their stated range against this constant rather than against a remembered 60, which is what
@@ -95,7 +95,7 @@ The plainest of the three, and the one most likely to be mistaken for a field ra
 only one of the three whose stage does *not* project it for you -- ``$rankFusion`` emits the fused
 documents with no score field at all, so without the ``$set`` this module appends outside the stage,
 every hybrid result would arrive scoring ``0.0`` and any ``min_score`` would empty the result list.
-That failure is silent and looks exactly like an empty collection, which is premortem ``P-2``.
+That failure is silent and looks exactly like an empty collection, with nothing to say the score was at fault.
 
 Available since 8.0, the same floor as the stage itself (:data:`_indexes.RANK_FUSION_MIN_MAJOR`).
 """

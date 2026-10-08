@@ -1439,7 +1439,7 @@ def _patch_setup(
         rank_fusion: What the ``$rankFusion`` probe answers. Defaults to ``False``, which is the one
             place in this file a fake's default deliberately does not match the common deployment:
             Atlas hands out 8.0.23 and would answer ``True``. It is ``False`` here because that is
-            ``INV-011``'s condition, and the tests that predate the hybrid tier are its coverage —
+            the no-fusion condition, and the tests that predate the hybrid tier are its coverage —
             they assert the vector-first resolution *of a deployment without fusion*, and rewriting them
             to opt out would have made the invariant self-certifying. Every test about hybrid passes
             ``True`` and says so in its name.
@@ -1755,8 +1755,8 @@ class TestTheMemoryStoreRefusesACollationThatFoldsCase:
     stake. The storage surface keeps its namespaces apart in ``_id``; this one keeps its scopes apart in
     ``scope``, because ``_filter.compose`` pins ``{"scope": self.scope, "store_name": self.name}`` on
     every read, update and delete. A collation that folds case therefore turns ``scope="tenant-b"`` into a
-    filter that matches documents written under ``Tenant-B``, which is premortem **P-1** — a cross-scope
-    read — arriving through the collection's comparison rules rather than through a caller's filter, and
+    filter that matches documents written under ``Tenant-B``, which is a cross-scope read
+    arriving through the collection's comparison rules rather than through a caller's filter, and
     so past every check ``TestEveryCallerInputIsCheckedBeforeTheNetwork`` makes.
 
     ``initialize()`` is the only place the check needs to be, and that is a claim rather than a
@@ -1948,7 +1948,7 @@ class TestTheHybridTierIsAStatementAboutTwoOthers:
     async def test_a_deployment_without_the_stage_resolves_as_it_did_before_task_31(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``INV-011``, asserted directly rather than only inherited from the older tests."""
+        """Vector-first resolution without fusion, asserted directly rather than only inherited."""
         recorder = _patch_setup(monkeypatch, rank_fusion=False)
         store = _store()
 
@@ -2135,7 +2135,7 @@ class TestTheQueryShapeOnlyFusionCanRead:
 
 
 class TestAScoreBoundDeclinesTheBetterTier:
-    """AT-148, AT-149 / ``REQ-E-145``, ``INV-012``, premortem **P-2** — the exception that is not a preference.
+    """AT-148, AT-149 / ``REQ-E-145`` — the exception that is not a preference.
 
     The upgrade this protects has no code change in it. A caller who set ``min_score=0.7`` against the
     vector tier, left ``search_type`` at its default, and upgraded this package would have had their
@@ -2899,7 +2899,7 @@ class TestExpiryIsStampedFromTheDocumentsOwnClock:
         assert insert[_indexes.EXPIRES_FIELD] - insert["created_at"] == datetime.timedelta(seconds=ttl)
 
     async def test_no_ttl_stamps_no_field_at_all(self) -> None:
-        """AT-154's negative case, and ``INV-014``: absence writes the original shape, unchanged.
+        """AT-154's negative case: absence writes the original shape, unchanged.
 
         Asserted as the field's absence rather than as a ``None`` value, because a stamped ``None`` is
         indexed by the TTL index as a value that is not a date, which is a different behaviour from not
@@ -3021,7 +3021,7 @@ deployment whose monitor has been turned down finishes in seconds.
 
 @pytest.mark.contract
 class TestAMemoryWithATtlActuallyDisappears:
-    """AT-152 / ``REQ-E-147``, ``REQ-E-149`` -- boundary **B-19**, asserted as a disappearance.
+    """AT-152 / ``REQ-E-147``, ``REQ-E-149`` -- the server's TTL monitor, asserted as a disappearance.
 
     Everything else about expiry is a field in a document this package wrote, and a test of that is a
     test of this package agreeing with itself. What nobody can check without a server is the part that
@@ -4275,7 +4275,7 @@ def _fuse(*orders: list[str]) -> list[str]:
 
 @pytest.mark.integration
 class TestFusionRanksWhatNeitherTierRanksFirst:
-    """AT-143 / ``REQ-E-142``, ``REQ-E-145`` -- boundary **B-11** for the fourth tier.
+    """AT-143 / ``REQ-E-142``, ``REQ-E-145`` -- real ``mongot`` scoring for the fourth tier.
 
     The unit tests assert that this package builds one ``$rankFusion`` with two named input pipelines.
     They cannot assert that the server fuses, because the stage is the server's. This is the test that

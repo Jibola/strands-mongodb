@@ -1378,7 +1378,7 @@ class TestTheIndexReadyBudgetReachesEnsure:
 
 
 class TestNoOrdinaryOperationTouchesAnIndex:
-    """AT-124 / ``REQ-E-121``, ``INV-007`` — the guarantee that keeps ``ensure_indexes()`` explicit.
+    """AT-124 / ``REQ-E-121`` — the guarantee that keeps ``ensure_indexes()`` explicit.
 
     The requirement is a negative, and a negative is the thing a test suite silently stops covering.
     The mechanism here is the fake's own call log: every driver method it offers is recorded, so this
@@ -2393,7 +2393,7 @@ class TestEnsureIndexesAgainstARealDeployment:
 
 @pytest.mark.contract
 class TestACaseFoldingCollectionAgainstARealDeployment:
-    """AT-176 / ``REQ-E-170`` — boundary **B-1**. The refusal, and what it is refusing, measured.
+    """AT-176 / ``REQ-E-170`` — a real server over the wire. The refusal, and what it is refusing, measured.
 
     The unit tier above asserts that a reported collation stops every operation. This asserts that the
     report is real and that what it predicts is real, because both halves were assumptions when the
@@ -2513,7 +2513,7 @@ class TestACaseFoldingCollectionAgainstARealDeployment:
 
 @pytest.mark.contract
 class TestAnAbsentCollectionAgainstARealDeployment:
-    """AT-192 / ``REQ-E-186`` — boundary **B-1**. The premise the whole distinction rests on, measured.
+    """AT-192 / ``REQ-E-186`` — a real server over the wire. The premise the whole distinction rests on, measured.
 
     The unit tier asserts what the package does with the two answers. This asserts that the server really
     gives two answers where it appears to give one: a collection that is not there and a collection with

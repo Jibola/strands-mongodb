@@ -440,6 +440,26 @@ read; and `delete()` reaches exactly as far as `search()` does. Those are `REQ-E
 
 If a tenant boundary is a compliance boundary, use one of the first two rows.
 
+## Where your text goes
+
+<!-- data-flow -->
+What leaves the process depends on the embedding path, and on neither of them does this package send text
+anywhere except the deployment you connected it to.
+
+- **AutoEmbeddings, the default.** The deployment's search process sends the `content` of every memory, and
+  the text of every query that reaches the vector tier (including the vector half of a `hybrid` search), to
+  the embedding model named by `embedding_model`, `voyage-4-lite` unless you set it. That is a call the
+  deployment makes, not this package; the package only names the model in the index definition. The
+  `text` tier sends nothing to a model.
+- **The manual path.** With `embedding_dimensions` and `similarity` set, no model sees your text through
+  this package. Whatever produces the vectors is yours, and runs where you run it.
+
+On both paths `content` is stored in the deployment as written, and `MongoDBStorage` payloads are stored
+the same way. Processing region, storage location and retention, for the text and for any vectors, are
+governed by your Atlas deployment and not by this package, which can neither see nor change them. This
+package makes no confidentiality or isolation claim for text sent to the managed embedding model. Text that
+must not leave your boundary belongs on the manual path, embedded by a model you choose.
+
 ## Erasing memories
 
 `MongoDBMemoryStore` deletes as well as writes, which is what an erasure request against stored facts
@@ -465,6 +485,12 @@ consequences are worth stating rather than leaving to be discovered:
 - **`0` does not mean "no such memory."** A well-formed id gets `0` whether it names a memory already
   deleted, one in another scope, or one in another store in this scope. Telling those apart would
   answer whether an id exists somewhere the caller cannot read.
+
+<!-- erasure-reach -->
+Erasure reaches the live deployment and nothing else. `delete()` and `delete_all()` remove documents from
+the collection, and the search indexes built from them follow; they do not reach backups, snapshots or the
+oplog, which keep what they hold for as long as the deployment's own retention says. A request that has to
+cover those copies is a request to whoever operates the deployment.
 
 ## Indexes and privileges
 
