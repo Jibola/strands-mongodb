@@ -560,7 +560,7 @@ class MongoDBMemoryStore:
             # already holds the connection's. What is at stake on this surface is not `_id` but `scope`:
             # `_filter.compose` pins `{"scope": self.scope, "store_name": self.name}` on every read,
             # update and delete, so a collation that folds case makes `scope="tenant-b"` match documents
-            # written under `Tenant-B` -- premortem **P-1**, a cross-scope read, arriving through the
+            # written under `Tenant-B` -- a cross-scope read, arriving through the
             # collection's own comparison rules rather than through a caller-supplied filter.
             target = (self._database_name, self._collection_name)
             verified = target in connection.binary_keys

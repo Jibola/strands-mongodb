@@ -1388,3 +1388,72 @@ class TestTheLandingPageDescribesThePackageAsItIs:
             f"the landing page describes the search surface without naming {missing}; it is the first "
             f"page a reader sees and it would undersell what the package resolves to"
         )
+
+
+class TestWhereCallerTextGoesIsStated:
+    """``AT-198``–``AT-200`` -- ``REQ-E-192`` to ``REQ-E-194``: the data flow a security review asks for.
+
+    Nothing here is new behaviour. On the default path the deployment embeds what is stored and what is
+    asked, on the manual path nothing does, and erasure stops at the live deployment. All three were true
+    and none was written where a reviewer would look, so a customer's privacy team had to infer the data
+    flow from the index definition. These tests read the marked passages, so the statements cannot drift
+    into an unrelated section, and they read the model name from the package, so a new default fails here.
+    """
+
+    def test_the_section_names_both_paths_and_what_each_sends(self) -> None:
+        """AT-198 -- the default path sends content and query text to a named model; the manual path sends none."""
+        section = _marked_section("data-flow")
+        assert section, f"no passage marked '<!-- data-flow -->' in {_PACKAGE_README.name}"
+        lowered = section.lower()
+
+        assert "`embedding_model`" in section and f"`{_indexes.DEFAULT_EMBEDDING_MODEL}`" in section, (
+            "the data-flow passage does not name the key that picks the model, or the default it picks"
+        )
+        assert "`content`" in section and "query" in lowered, (
+            "the data-flow passage does not say that both stored content and query text reach the model"
+        )
+        assert "manual path" in lowered and "no model" in lowered, (
+            "the data-flow passage does not say that the manual path sends text to no model"
+        )
+        assert "both paths" in lowered and "stored" in lowered, (
+            "the data-flow passage does not say that content is stored in the deployment on both paths"
+        )
+
+    def test_the_section_assigns_residency_and_claims_no_confidentiality(self) -> None:
+        """AT-199 -- region and retention are the deployment's; no guarantee is made for the model."""
+        lowered = _marked_section("data-flow").lower()
+
+        for subject in ("region", "retention"):
+            assert subject in lowered, f"the data-flow passage does not say who governs {subject}"
+        assert "atlas deployment" in lowered and "not by this package" in lowered, (
+            "the data-flow passage does not assign residency and retention to the deployment"
+        )
+        assert "makes no" in lowered and "confidentiality" in lowered, (
+            "the data-flow passage does not disclaim a confidentiality guarantee for the embedding model"
+        )
+        assert "boundary" in lowered and "manual path" in lowered, (
+            "the data-flow passage does not name the manual path for text that must stay in the boundary"
+        )
+
+    def test_erasure_says_what_it_does_not_reach(self) -> None:
+        """AT-200 -- backups, snapshots and the oplog follow the deployment, not ``delete_all()``."""
+        section = _marked_section("erasure-reach")
+        assert section, f"no passage marked '<!-- erasure-reach -->' in {_PACKAGE_README.name}"
+        lowered = section.lower()
+
+        for copy in ("backup", "snapshot", "oplog"):
+            assert copy in lowered, f"the erasure passage does not say that erasure leaves {copy}s alone"
+        assert "`delete()`" in section and "`delete_all()`" in section and "retention" in lowered, (
+            "the erasure passage does not name both calls and say whose retention the copies follow"
+        )
+
+    def test_both_passages_sit_where_a_reader_looks(self) -> None:
+        """AT-198, AT-200 -- the data flow before erasure, and the erasure limit inside its section."""
+        text = _PACKAGE_README.read_text()
+        flow = text.index("<!-- data-flow -->")
+        erasing = text.index("## Erasing memories")
+        reach = text.index("<!-- erasure-reach -->")
+        following = text.index("\n## ", erasing + 1)
+
+        assert text.index("## Tenancy") < flow < erasing, "the data-flow section is not between Tenancy and Erasing"
+        assert erasing < reach < following, "the erasure limit is outside the Erasing memories section"

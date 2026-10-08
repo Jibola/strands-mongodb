@@ -32,7 +32,7 @@ BAKED_IN_FILTER_FIELDS = ("scope", "store_name")
 
 # `bson.Regex`, matched by name instead of by import (``REQ-E-174``). This module states at the top that it
 # imports no part of pymongo, and that is worth more than the two characters an import would save: a guard
-# premortem **P-1** runs through is a guard that has to be cheap to test, and `bson` is a compiled
+# every scope check runs through is a guard that has to be cheap to test, and `bson` is a compiled
 # extension in the default install. The MRO is walked rather than `type(value)` compared, so a subclass
 # cannot slip past. Verified against pymongo 4.x, where the class is `bson.regex.Regex`.
 _REGEX_TYPE_NAMES = frozenset({"bson.regex.Regex"})

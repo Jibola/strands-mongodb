@@ -195,7 +195,7 @@ class TestTheGuardsCoverEveryMappingAndRefuseEveryRegex:
 
     The scope conjunction held in every case, which is what makes this a filter-policy bypass and not a
     cross-scope read: ``compose`` pins ``scope`` and ``store_name`` itself and a caller term can only
-    narrow. That is the difference between this and premortem **P-1**, and it is the reason the finding is
+    narrow. That is the difference between this and a cross-scope read, and it is the reason the finding is
     a P2. The policy is still the thing being defended -- an exact-value filter whose values are not exact
     is a promise this package makes and does not keep.
     """
