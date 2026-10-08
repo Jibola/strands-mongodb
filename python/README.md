@@ -258,6 +258,14 @@ An injected client also carries its own event loop affinity, which matters if yo
 your connection string, so TLS settings, timeouts and read preferences all reach the driver without an
 injected client.
 
+<!-- app-name -->
+A client this package builds announces itself to the server with `appName`, which server logs,
+`$currentOp` and the profiler all show. With no `appName` set, the value is `strands-mongodb`. If you
+set one, in the connection string or in `client_args`, you get `<yours>-strands-mongodb`, so your own
+name stays first. A value that already ends in the suffix is sent unchanged. pymongo limits `appName` to 128 bytes, so a
+value that would not fit with the suffix is shortened until it does. An injected `client` keeps whatever
+`appName` you gave it, unchanged: the driver fixes the value when the client is built.
+
 ### Authentication mechanisms
 
 The driver decides what is available here, not this package. `pymongo` 4.17.0 declares `MONGODB-AWS`,

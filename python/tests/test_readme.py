@@ -52,7 +52,7 @@ from pymongo.auth import MECHANISMS
 from pymongo.errors import OperationFailure
 from strands.types.exceptions import StorageError
 
-from strands_mongodb import _indexes, _pipeline, _telemetry
+from strands_mongodb import _client, _indexes, _pipeline, _telemetry
 from strands_mongodb.memory_store import DEFAULT_COLLECTION, MongoDBMemoryStore
 from strands_mongodb.storage import MAX_DOCUMENT_BYTES, MAX_KEY_BYTES, MongoDBStorage
 from strands_mongodb.types import (
@@ -1467,6 +1467,34 @@ def _span_names() -> set[str]:
         for member in vars(cls).values()
         if inspect.isfunction(member) and "strands_mongodb_span" in member.__dict__
     }
+
+
+class TestTheAppNamePassageMatchesTheCode:
+    """AT-223 / REQ-E-216 -- a reader who sets ``appName`` should learn from here what the server will show."""
+
+    def test_the_passage_states_the_value_the_suffix_the_shortening_and_the_exception(self) -> None:
+        section = _marked_section("app-name")
+        assert section, f"no passage marked '<!-- app-name -->' in {_PACKAGE_README.name}"
+        lowered = section.lower()
+
+        assert f"`{_client._APP_NAME}`" in section and f"`<yours>{_client._APP_NAME_SUFFIX}`" in section, (
+            "the app-name passage does not show both the default value and the suffixed form"
+        )
+        assert f"{_client._APP_NAME_MAX_BYTES} bytes" in section and "shorten" in lowered, (
+            "the app-name passage does not say that an over-long value is shortened to fit the limit"
+        )
+        assert "`client`" in section and "inject" in lowered and "unchanged" in lowered, (
+            "the app-name passage does not say that an injected client keeps its own appName"
+        )
+
+    def test_the_passage_sits_in_the_connecting_section(self) -> None:
+        text = _PACKAGE_README.read_text()
+
+        assert (
+            text.index("## Connecting to a deployment")
+            < text.index("<!-- app-name -->")
+            < text.index("### Authentication mechanisms")
+        )
 
 
 class TestTheObservabilitySectionMatchesTheCode:

@@ -38,6 +38,8 @@ The first version with working code in it. Planned, not released.
   TTL index itself, while `MongoDBStorage` leaves it to an explicit `await storage.ensure_indexes()`
   at startup, because an `Agent` builds its storage where an operator never sees it and DDL should
   not be issued from there.
+- `appName` attribution on every client the package builds from a connection string: `strands-mongodb`,
+  or the caller's own value with `-strands-mongodb` appended. An injected client is left as it is.
 - [MIGRATION.md](MIGRATION.md), mapping three existing MongoDB memory packages onto this one.
 
 ### Not included
