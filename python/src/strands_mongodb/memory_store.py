@@ -316,6 +316,7 @@ def _merge_metadata(
     reserved: Mapping[str, Any],
     *,
     store_name: str,
+    namespace: str | None = None,
 ) -> dict[str, Any]:
     """Merge caller metadata under this package's reserved keys (``REQ-E-040``, ``REQ-E-057``).
 
@@ -333,6 +334,8 @@ def _merge_metadata(
         reserved: This package's four keys and their values for this result.
         store_name: Named in the log record, because one process holds several stores over one
             collection and the store is what locates whatever wrote the document.
+        namespace: The store's ``database.collection``, carried as a structured field like every other
+            event this module logs.
 
     Returns:
         A new dict. Neither argument is modified.
@@ -344,7 +347,7 @@ def _merge_metadata(
             _RESERVED_KEY_COLLISION,
             ", ".join(repr(key) for key in collisions),
             store_name,
-            extra=_telemetry.event_extra("reserved_key_collision"),
+            extra=_telemetry.event_extra("reserved_key_collision", namespace=namespace),
         )
     merged.update(reserved)
     return merged
@@ -1002,6 +1005,7 @@ class MongoDBMemoryStore:
                         "_scope": self.scope,
                     },
                     store_name=self.name,
+                    namespace=self._target,
                 ),
             )
             scored.append((score, entry))

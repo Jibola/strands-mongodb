@@ -13,8 +13,9 @@ than going unmentioned.
 ## What a release is made of
 
 The version is not written down anywhere. `hatch-vcs` derives it from the git tag, matching
-`^python-v(?P<version>.+)$`, so `python-v0.1.0` builds `0.1.0`. A build from a tree with no tag
-produces `0.0.0` — deliberately unmistakable, so such a build is never mistaken for a release.
+`^python-v(?P<version>.+)$`, so `python-v0.1.0` builds `0.1.0`. A build from a tree with no such tag
+gets a development version counted from the first commit, such as `0.0.1.dev69+g20b0ea579`, and a build
+with no git metadata at all falls back to `0.0.0`. Neither can be mistaken for a release.
 
 This means there is no version bump commit and nothing to keep in sync. It also means the tag is the
 whole decision: tag the commit you mean, because the artifact is built from it and from nothing else.
@@ -50,9 +51,9 @@ same history, and its tags must not reach this workflow.
 
 | Job | Name in the Actions UI | What it does |
 |---|---|---|
-| `gate` | Release gate | Formatting, lint, types and both coverage floors, with `STRANDS_MONGODB_BUILD_TIER` set |
+| `gate` | Release gate | `validate-pyproject` on the manifest, then formatting, lint, types and both coverage floors, with `STRANDS_MONGODB_BUILD_TIER` set |
 | `contract` | Contract tier | The contract tests against a real `mongo:8` service container |
-| `build` | Build and verify the artifact | `hatch build`, then the check below, then uploads `python-dist` |
+| `build` | Build and verify the artifact | `hatch build`, then the check below, then `twine check --strict` on what PyPI will render, then uploads `python-dist` |
 | `publish` | Publish to PyPI | Downloads that artifact and uploads it |
 
 `gate` and `contract` run in parallel; `build` needs both; `publish` needs `build`.
@@ -69,6 +70,11 @@ not publish: the run stops at `publish` and waits for a human to approve the dep
 Actions UI. That pause is the last stop before the irreversible step, and it is the one part of this
 process you cannot discover by reading the repository — the environment and its reviewer list live in
 repository settings, not in a file.
+
+**Neither exists yet.** There is no `pypi` environment in the repository settings and no trusted
+publisher on PyPI. GitHub creates a missing environment on first reference, with no reviewers, so a tag
+pushed today would reach the upload unapproved and fail there only because PyPI has nothing to
+exchange the token with. Do not push a `python-v` tag until both are configured.
 
 If the run appears to hang at `publish`, it is not hung. It is waiting for somebody, and if nobody
 who can approve is watching, it waits until the run expires.

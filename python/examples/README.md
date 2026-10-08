@@ -7,7 +7,7 @@ stored then the storage worked.
 
 | Script | What it proves | Needs |
 |---|---|---|
-| `memory_recall.py` | A fact learned in one process comes back in the next, from a query with no word in common with it | Atlas, so `$vectorSearch` and server-side embeddings are available |
+| `memory_recall.py` | A fact learned in one process comes back in the next, from a query with no word in common with it | Atlas with an embedding model registered on the cluster, so `$vectorSearch` can embed server-side. A deployment without one has no vector tier, and the recall step finds nothing |
 | `unified_storage.py` | Three SDK subsystems write to one collection under three key prefixes, and a session survives the process that made it | Any deployment, including a plain local `mongod` |
 
 ## Setup
@@ -20,8 +20,13 @@ export MONGODB_URI="mongodb+srv://..."
 `[all]` because `memory_recall.py` needs the memory surface and `unified_storage.py` needs the storage
 one. `[storage]` alone is enough for `unified_storage.py` if that is all you want to run.
 
+Nothing is on PyPI yet, so that `pip install` resolves to nothing for now. Until it does, install from
+the repository over SSH, as the package README's
+[Before the package reaches PyPI](../README.md#before-the-package-reaches-pypi) section describes.
+
 `MONGODB_URI` is the only variable either script requires. Both refuse to run without it and name it in
-the message, and neither prints a connection string on any path, including failures.
+the message. Where a script prints the URI it prints it redacted, with everything between `://` and
+`@` replaced by `<redacted>`, on every path including failures.
 
 Keep the URI in a file you do not commit and load it at the shell:
 

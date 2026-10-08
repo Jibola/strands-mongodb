@@ -152,9 +152,18 @@ string.
 Two reasons, both about being a third-party integration rather than the SDK itself. The prefix names the
 package in a log stream where the logger name is usually not rendered, and several of these messages are
 explanatory rather than a field list: the one for a deployment with no Atlas Search names the server error
-code the probe saw and what to do about it, which does not fit a key-value line. All ten log calls in the package follow this shape, and
+code the probe saw and what to do about it, which does not fit a key-value line. All thirteen log calls in the package follow this shape, and
 `AT-059b` asserts the content of one of them, so reshaping them is a change with a test to update rather
 than a matter of taste. Placeholders stay `%s`: that half of the rule is enforced by ruff.
+
+Every log call also passes `extra=_telemetry.event_extra(...)`, which adds `strands_mongodb_event` and,
+where the record is about one, `strands_mongodb_namespace` and `strands_mongodb_tier`. A new call needs a
+new name in `_telemetry.LogEvent`, and `tests/test_telemetry.py` fails on a call that skips the helper.
+Spans go through `_telemetry.traced` or `_telemetry.span`, and an attribute is recorded only if it is in
+`_telemetry.Attribute`, the allow-list; anything else is dropped with a `DEBUG` record. Never add an
+attribute that carries caller data: a key, content, metadata, query text, filter values, a scope or a
+memory id. The README's observability section lists every span, attribute and event, and
+`tests/test_readme.py` fails until a new one is named there.
 
 ## What not to do
 

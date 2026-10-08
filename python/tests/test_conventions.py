@@ -612,7 +612,7 @@ class TestTheHouseConventionsAreEnforcedNotDescribed:
     def test_the_logging_rule_is_a_selected_lint_rule(self) -> None:
         """AT-115 — ``%s`` and not f-strings in log calls, enforced the way the SDK enforces it.
 
-        All ten log calls in this package already pass ``G``, and ``LOG`` too. The rule was not selected,
+        All thirteen log calls in this package pass ``G``, and ``LOG`` too. The rule was not selected,
         which made a passing tree a coincidence rather than a gate, so it is selected here.
         """
         selected = _config()["tool"]["ruff"]["lint"]["select"]

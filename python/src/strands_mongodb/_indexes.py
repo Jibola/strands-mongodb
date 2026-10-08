@@ -1256,8 +1256,9 @@ async def _ensure_search(
         raise StorageError(
             f"strands_mongodb: waited {timeout}s for {len(stuck)} search index(es) on "
             f"{namespace} to report READY and they did not: {', '.join(stuck)}. BUILDING at this point means "
-            f"a build slower than the timeout, and initialize() can simply be called again to keep "
-            f"waiting. Any other status is worth reading directly with "
+            f"a build slower than the timeout. A store with a named search_type can call initialize() "
+            f"again to keep waiting; under 'auto' the tier is dropped for this store instance, and a new "
+            f"store picks it up once it is READY. Any other status is worth reading directly with "
             f"db.{collection.name}.getSearchIndexes()."
         )
 
