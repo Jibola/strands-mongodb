@@ -631,6 +631,90 @@ and the last column names the requirement or the id where the detail lives.
 | Vector candidates considered | 10 per result requested. Raise `oversampling_factor` for recall, lower it for latency. | `DEFAULT_OVERSAMPLING_FACTOR` |
 | Waiting for a search index | 300 s, then `initialize()` warns and returns rather than blocking your startup. The index keeps building; the first queries are the ones that miss. Set `index_ready_timeout` to change it. | `READY_TIMEOUT_SECONDS` |
 
+## Observability
+
+<!-- observability -->
+Both stores record an OpenTelemetry span for every public operation, on the tracer provider your
+application already has. The package configures nothing: no provider, no processor, no exporter, no
+sampling. With no provider installed, OpenTelemetry's no-op tracer answers, and each operation costs one
+extra function call. Spans join whatever trace is current, so in an agent traced by Strands each memory
+search shows up inside the model turn or tool call that made it.
+
+To export them, turn on Strands telemetry, which installs a provider:
+
+<!-- skip: it needs strands-agents' otel extra and a collector to send to -->
+```python
+from strands.telemetry import StrandsTelemetry
+
+StrandsTelemetry().setup_otlp_exporter()
+```
+
+Or install a `TracerProvider` yourself. The tracer is looked up on every call, so it does not matter
+whether that happens before or after this package is imported:
+
+<!-- run: unit -->
+```python
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+
+provider = TracerProvider()
+provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+trace.set_tracer_provider(provider)
+```
+
+| Span | Recorded by |
+|---|---|
+| `strands_mongodb.storage.write` | `MongoDBStorage.write()` |
+| `strands_mongodb.storage.read` | `MongoDBStorage.read()` |
+| `strands_mongodb.storage.delete` | `MongoDBStorage.delete()` |
+| `strands_mongodb.storage.list` | `MongoDBStorage.list()` |
+| `strands_mongodb.storage.search` | `MongoDBStorage.search()` |
+| `strands_mongodb.storage.delete_prefix` | `MongoDBStorage.delete_prefix()` |
+| `strands_mongodb.storage.ensure_indexes` | `MongoDBStorage.ensure_indexes()` |
+| `strands_mongodb.memory.initialize` | `MongoDBMemoryStore.initialize()`, only on the call that does the setup. `add()` and `search()` call it every time, and every call after the first records nothing. |
+| `strands_mongodb.memory.add` | `MongoDBMemoryStore.add()` |
+| `strands_mongodb.memory.search` | `MongoDBMemoryStore.search()` |
+| `strands_mongodb.memory.delete` | `MongoDBMemoryStore.delete()` |
+| `strands_mongodb.memory.delete_all` | `MongoDBMemoryStore.delete_all()` |
+
+Every span is `INTERNAL`. It carries the attributes below that apply to it, and none of OpenTelemetry's
+`db.*` attributes: those describe one database command, and an operation here can be several. For a span
+per command, use the driver's command monitoring or an OpenTelemetry instrumentation for pymongo. This
+package does not duplicate either.
+
+| Attribute | On | Value |
+|---|---|---|
+| `strands_mongodb.database` | every span | The database name |
+| `strands_mongodb.collection` | every span | The collection name |
+| `strands_mongodb.store_name` | every `memory.*` span | The store's configured `name` |
+| `strands_mongodb.search.requested` | `memory.search`, `memory.initialize` | The configured `search_type`: `auto`, `vector`, `text` or `hybrid` |
+| `strands_mongodb.search.tier` | `memory.search` | The tier that answered. Alert on it differing from `search.requested` to catch a store that has degraded. |
+| `strands_mongodb.search.tiers` | `memory.initialize` | The tiers that came up, comma-separated |
+| `strands_mongodb.result_count` | `memory.search`, `storage.search`, `storage.list` | Entries or keys returned |
+| `strands_mongodb.deleted_count` | `memory.delete`, `memory.delete_all`, `storage.delete`, `storage.delete_prefix` | Documents removed, as the server reported them |
+| `strands_mongodb.found` | `storage.read` | Whether the key existed |
+| `strands_mongodb.duplicate` | `memory.add` | Whether the fact was already stored, so nothing was written |
+| `strands_mongodb.client.injected` | the `client.acquired` event | Whether you supplied the `client` |
+| `error.type` | a failed span | The exception's qualified class name |
+
+A span whose operation raised has status `ERROR`, with the exception's class name as the description and
+`error.type` set. The exception's message is never recorded, and neither is its traceback: this package's
+messages name the key or namespace on purpose, so you can act on them, and a span is exported to a third
+party where a raised exception is not.
+
+Never recorded, on any span or in any log record: a storage key or prefix, stored content or payload,
+metadata you supplied, query text, filter values, a scope, a memory id, a connection string, a username or
+a password. A scope is usually a tenant or user id, which is why it is on that list. The store name is
+configuration you chose, so it is recorded.
+
+`strands_mongodb.client.acquired` is a span event, recorded once for each connection pool this package
+creates or registers, on the span that is current at that moment. That is the store's constructor, if you
+build the store inside a traced block, or the first operation on a new event loop, if you call a
+synchronous `Agent` repeatedly and each call runs a fresh loop. A store built at import time has no span to
+record on, and its first operation takes over the pool construction built, which creates nothing. The
+driver connects lazily, so the cost of connecting sits inside the first operation's span either way.
+
 ## Examples
 
 Two runnable scripts in [`examples/`](examples/README.md), each split into two commands you run as two

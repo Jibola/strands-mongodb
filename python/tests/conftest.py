@@ -50,8 +50,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 import pytest
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 if TYPE_CHECKING:
+    from opentelemetry.sdk.trace import ReadableSpan
     from pymongo import AsyncMongoClient
 
 # tests/ -> python/
@@ -803,3 +808,65 @@ def unique_collection_name(request: pytest.FixtureRequest) -> str:
     """
     stem = request.node.name.replace("[", "_").replace("]", "").replace("-", "_")
     return f"{stem}_{uuid.uuid4().hex[:6]}"[:100]
+
+
+def rendered(span: ReadableSpan) -> str:
+    """Return every string a span carries, joined, ready for a substring scan.
+
+    Written from the ``ReadableSpan`` surface rather than from the setters, so a value reaches the scan the
+    same way whatever route put it there. Verified against opentelemetry-sdk 1.44.0: ``attributes`` and an
+    event's ``attributes`` are both ``None`` on a span that never set any, and ``status.description`` is
+    ``None`` until a status carries one.
+
+    ``resource.attributes`` is deliberately not read. Those come from the host's ``Resource``, which this
+    package never touches, and they carry a ``service.instance.id`` that changes per process.
+
+    Args:
+        span: A finished span, as the exporter received it.
+
+    Returns:
+        One string holding the span's name, its status description, its instrumentation scope, and the
+        keys and values of its own attributes, of every event, and of every link.
+    """
+    parts = [span.name, str(span.status.description or "")]
+    parts += [f"{key}={value!r}" for key, value in (span.attributes or {}).items()]
+    for event in span.events:
+        parts.append(event.name)
+        parts += [f"{key}={value!r}" for key, value in (event.attributes or {}).items()]
+    for link in span.links:
+        parts += [f"{key}={value!r}" for key, value in (link.attributes or {}).items()]
+    if span.instrumentation_scope is not None:
+        parts.append(span.instrumentation_scope.name)
+    return "\n".join(parts)
+
+
+@pytest.fixture
+def exported_spans() -> Iterator[InMemorySpanExporter]:
+    """Put an in-memory exporter behind the *global* tracer provider, and take it out again.
+
+    Global, because that is the only provider package code would ever reach:
+    ``trace.get_tracer(__name__)`` and ``trace.get_current_span()`` both read it, so a provider kept local
+    to this test would leave a leak writing somewhere nobody was watching.
+
+    Two paths, because both states occur. A fresh interpreter has a ``ProxyTracerProvider`` and takes
+    ``set_tracer_provider``; a suite that already configured tracing has a real one and takes another
+    processor. Measured on 1.44.0: importing ``strands`` does not install a provider, so the first path is
+    the one the unit tier takes.
+
+    ``set_tracer_provider`` cannot be undone, so teardown shuts the exporter down and leaves the provider
+    in place. A shut-down ``InMemorySpanExporter`` records nothing, and the tests that read spans all take
+    this fixture.
+    """
+    exporter = InMemorySpanExporter()
+    processor = SimpleSpanProcessor(exporter)
+    provider = trace.get_tracer_provider()
+    if isinstance(provider, TracerProvider):
+        provider.add_span_processor(processor)
+    else:
+        installed = TracerProvider()
+        installed.add_span_processor(processor)
+        trace.set_tracer_provider(installed)
+    try:
+        yield exporter
+    finally:
+        processor.shutdown()

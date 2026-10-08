@@ -31,6 +31,8 @@ try:
 except ImportError as error:  # pragma: no cover - exercised in a subprocess by AT-008b
     missing_extra("storage", error, module=__name__)
 
+from strands_mongodb import _telemetry
+
 if TYPE_CHECKING:
     from strands_mongodb.types import MongoDBConfig
 
@@ -524,8 +526,14 @@ def _register(
         if attribute:
             _attribute_injected_client(client)
         _warn_if_retries_disabled(client)
-        _REGISTRY[(identity, loop)] = _Connection(client=client, owned=owned)
-        return _REGISTRY[(identity, loop)]
+        connection = _Connection(client=client, owned=owned)
+        _REGISTRY[(identity, loop)] = connection
+    # Here, after the early return, because this is the only line that runs once per registry entry: a
+    # cache hit returns above and adoption never calls this function. So a pool built is an event and a
+    # pool reused is not. `resolve` still holds the reentrant lock around this call. That is fine: adding
+    # an event does no I/O and calls back into nothing, and no span processor sees it until the span ends.
+    _telemetry.event("strands_mongodb.client.acquired", {"strands_mongodb.client.injected": not owned})
+    return connection
 
 
 async def close(config: MongoDBConfig) -> None:

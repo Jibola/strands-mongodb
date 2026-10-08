@@ -52,7 +52,7 @@ from pymongo.auth import MECHANISMS
 from pymongo.errors import OperationFailure
 from strands.types.exceptions import StorageError
 
-from strands_mongodb import _indexes, _pipeline
+from strands_mongodb import _indexes, _pipeline, _telemetry
 from strands_mongodb.memory_store import DEFAULT_COLLECTION, MongoDBMemoryStore
 from strands_mongodb.storage import MAX_DOCUMENT_BYTES, MAX_KEY_BYTES, MongoDBStorage
 from strands_mongodb.types import (
@@ -1457,3 +1457,50 @@ class TestWhereCallerTextGoesIsStated:
 
         assert text.index("## Tenancy") < flow < erasing, "the data-flow section is not between Tenancy and Erasing"
         assert erasing < reach < following, "the erasure limit is outside the Erasing memories section"
+
+
+def _span_names() -> set[str]:
+    """Every span name the two stores can record, read off the decorated methods rather than listed here."""
+    return {
+        member.__dict__["strands_mongodb_span"]
+        for cls in (MongoDBStorage, MongoDBMemoryStore)
+        for member in vars(cls).values()
+        if inspect.isfunction(member) and "strands_mongodb_span" in member.__dict__
+    }
+
+
+class TestTheObservabilitySectionMatchesTheCode:
+    """AT-213 / REQ-E-208 — every span, event and attribute the code can emit is named, and nothing else is.
+
+    Both lists are read from the code. A span added in a later change fails here until the README names
+    it, and a name the README keeps after the code drops it fails the reverse check.
+    """
+
+    def test_every_span_event_and_attribute_is_named(self) -> None:
+        section = _marked_section("observability")
+        assert section, f"no passage marked '<!-- observability -->' in {_PACKAGE_README.name}"
+
+        spans = _span_names()
+        assert len(spans) == 12, sorted(spans)
+        expected = spans | set(get_args(_telemetry.Attribute)) | set(get_args(_telemetry.EventName))
+        missing = sorted(name for name in expected if f"`{name}`" not in section)
+        assert missing == [], f"the observability section does not name {missing}"
+        assert "`error.type`" in section
+
+    def test_it_names_nothing_the_code_does_not_emit(self) -> None:
+        section = _marked_section("observability")
+        expected = _span_names() | set(get_args(_telemetry.Attribute)) | set(get_args(_telemetry.EventName))
+
+        named = set(re.findall(r"`(strands_mongodb\.[a-z_.]+)`", section))
+
+        assert named - expected == set(), f"the section names {sorted(named - expected)}, which nothing emits"
+
+    def test_it_states_the_exclusions_and_how_to_turn_it_on(self) -> None:
+        lowered = _marked_section("observability").lower()
+
+        for value in ("key", "content", "metadata", "query", "filter", "scope", "memory id", "connection string"):
+            assert value in lowered, f"the observability section does not say that {value!r} is never recorded"
+        assert "message" in lowered and "type" in lowered, "it does not say failures record a type, not a message"
+        assert "strandstelemetry" in lowered and "tracerprovider" in lowered, "it does not say how to enable export"
+        assert "configures nothing" in lowered, "it does not say the package installs no provider of its own"
+        assert "first operation" in lowered, "it does not say where the connection cost lands"
