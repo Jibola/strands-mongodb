@@ -340,7 +340,12 @@ def _merge_metadata(
     merged: dict[str, Any] = dict(caller or {})
     collisions = sorted(key for key in reserved if key in merged)
     if collisions:
-        logger.warning(_RESERVED_KEY_COLLISION, ", ".join(repr(key) for key in collisions), store_name)
+        logger.warning(
+            _RESERVED_KEY_COLLISION,
+            ", ".join(repr(key) for key in collisions),
+            store_name,
+            extra=_telemetry.event_extra("reserved_key_collision"),
+        )
     merged.update(reserved)
     return merged
 
@@ -595,7 +600,12 @@ class MongoDBMemoryStore:
                 )
                 connection.capabilities = capabilities
                 if not capabilities.search:
-                    logger.warning(_NO_SEARCH_SETUP, self._target, capabilities.no_search_code)
+                    logger.warning(
+                        _NO_SEARCH_SETUP,
+                        self._target,
+                        capabilities.no_search_code,
+                        extra=_telemetry.event_extra("no_search_setup", namespace=self._target),
+                    )
 
             # Ordinary indexes first, and unconditionally. The uniqueness index behind `add`'s
             # deduplication is one of them, and it is needed whether or not this deployment can search.
@@ -674,7 +684,13 @@ class MongoDBMemoryStore:
             except StorageError as error:
                 if self._search_type != "auto":
                     raise
-                logger.warning(_TIER_UNAVAILABLE, tier, self._target, error)
+                logger.warning(
+                    _TIER_UNAVAILABLE,
+                    tier,
+                    self._target,
+                    error,
+                    extra=_telemetry.event_extra("tier_unavailable", namespace=self._target, tier=tier),
+                )
                 refused = error
                 continue
             available.append(tier)
@@ -704,7 +720,12 @@ class MongoDBMemoryStore:
         # caller's own configuration back to them as a degradation.
         if self._search_type == "auto" and available[0] not in ("hybrid", "vector") and not self._warned_below_vector:
             self._warned_below_vector = True
-            logger.warning(_BELOW_VECTOR, self._target, available[0])
+            logger.warning(
+                _BELOW_VECTOR,
+                self._target,
+                available[0],
+                extra=_telemetry.event_extra("below_vector", namespace=self._target, tier=available[0]),
+            )
         return tuple(available)
 
     def _hybrid_is_available(self, available: list[ResolvedSearchType], *, rank_fusion: bool) -> bool:
@@ -743,7 +764,13 @@ class MongoDBMemoryStore:
         # configuration back to them.
         if self._search_type == "hybrid":
             return True
-        logger.warning(_BOUND_DECLINED_FUSION, self._target, bound, getattr(self, bound))
+        logger.warning(
+            _BOUND_DECLINED_FUSION,
+            self._target,
+            bound,
+            getattr(self, bound),
+            extra=_telemetry.event_extra("bound_declined_fusion", namespace=self._target, tier="hybrid"),
+        )
         return False
 
     @_telemetry.traced("memory", "add")
@@ -893,6 +920,9 @@ class MongoDBMemoryStore:
             StorageError: If the deployment cannot search at all, if no tier could be prepared, or if a
                 driver call fails.
         """
+        # First, before anything that can raise, so a search that fails before reaching a tier still says
+        # what was asked for.
+        _telemetry.annotate("strands_mongodb.search.requested", self._search_type)
         parts: MongoDBSearchQuery = {"text": query} if isinstance(query, str) else query
         query_text = parts.get("text")
         query_vector = parts.get("vector")
@@ -916,7 +946,6 @@ class MongoDBMemoryStore:
 
         await self.initialize()
         tier = self._pick_tier(query_text=query_text, query_vector=query_vector)
-        _telemetry.annotate("strands_mongodb.search.requested", self._search_type)
         _telemetry.annotate("strands_mongodb.search.tier", tier)
         if tier == "hybrid":
             # Not None on this branch: `_pick_tier` returns "hybrid" only where both keys its two
@@ -1092,7 +1121,15 @@ class MongoDBMemoryStore:
         # problem and reading it as an empty memory. Silent on a no-op, so polling for a corpus that has
         # not reached mongot yet does not fill the log.
         if len(kept) != len(scored):
-            logger.debug(_SCORE_BOUND_APPLIED, name, bound, self._target, len(kept), len(scored))
+            logger.debug(
+                _SCORE_BOUND_APPLIED,
+                name,
+                bound,
+                self._target,
+                len(kept),
+                len(scored),
+                extra=_telemetry.event_extra("score_bound_applied", namespace=self._target),
+            )
         return kept
 
     @_telemetry.traced("memory", "delete")

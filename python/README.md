@@ -644,8 +644,8 @@ and the last column names the requirement or the id where the detail lives.
 <!-- observability -->
 Both stores record an OpenTelemetry span for every public operation, on the tracer provider your
 application already has. The package configures nothing: no provider, no processor, no exporter, no
-sampling. With no provider installed, OpenTelemetry's no-op tracer answers, and each operation costs one
-extra function call. Spans join whatever trace is current, so in an agent traced by Strands each memory
+sampling. With no provider installed, OpenTelemetry's no-op tracer answers, and each operation costs
+a few microseconds. Spans join whatever trace is current, so in an agent traced by Strands each memory
 search shows up inside the model turn or tool call that made it.
 
 To export them, turn on Strands telemetry, which installs a provider:
@@ -685,6 +685,12 @@ trace.set_tracer_provider(provider)
 | `strands_mongodb.memory.search` | `MongoDBMemoryStore.search()` |
 | `strands_mongodb.memory.delete` | `MongoDBMemoryStore.delete()` |
 | `strands_mongodb.memory.delete_all` | `MongoDBMemoryStore.delete_all()` |
+| `strands_mongodb.indexes.ensure` | Creating or checking indexes, inside `memory.initialize` or `storage.ensure_indexes` |
+| `strands_mongodb.indexes.probe` | Asking the deployment what it supports: Atlas Search, `$rankFusion`, or the collection's collation |
+| `strands_mongodb.indexes.wait` | Waiting for search indexes to finish building. One span for the whole wait, not one per poll. |
+
+The three `indexes.*` spans are children of the operation that needed them, so a slow first `search()`
+shows where its time went.
 
 Every span is `INTERNAL`. It carries the attributes below that apply to it, and none of OpenTelemetry's
 `db.*` attributes: those describe one database command, and an operation here can be several. For a span
@@ -703,6 +709,10 @@ package does not duplicate either.
 | `strands_mongodb.deleted_count` | `memory.delete`, `memory.delete_all`, `storage.delete`, `storage.delete_prefix` | Documents removed, as the server reported them |
 | `strands_mongodb.found` | `storage.read` | Whether the key existed |
 | `strands_mongodb.duplicate` | `memory.add` | Whether the fact was already stored, so nothing was written |
+| `strands_mongodb.indexes.mode` | `indexes.ensure` | `ensure`, or `verify` when `ensure_indexes` is `False` |
+| `strands_mongodb.indexes.created` | `indexes.ensure` | Indexes this call created, `0` when they were all there |
+| `strands_mongodb.indexes.outcome` | `indexes.wait` | `ready`, or `timed_out` when `index_ready_timeout` ran out |
+| `strands_mongodb.indexes.probe` | `indexes.probe` | `search`, `rank_fusion` or `collation` |
 | `strands_mongodb.client.injected` | the `client.acquired` event | Whether you supplied the `client` |
 | `error.type` | a failed span | The exception's qualified class name |
 
@@ -710,6 +720,11 @@ A span whose operation raised has status `ERROR`, with the exception's class nam
 `error.type` set. The exception's message is never recorded, and neither is its traceback: this package's
 messages name the key or namespace on purpose, so you can act on them, and a span is exported to a third
 party where a raised exception is not.
+
+A wait that runs out is the exception. Its `indexes.wait` span says `timed_out` and keeps its status
+`UNSET`, because waiting longer is all that went wrong; the `indexes.ensure` span above it carries the
+`ERROR`. Under `search_type="auto"` the store then carries on without that tier, and `search.tiers` on
+`memory.initialize` shows which ones came up.
 
 Never recorded, on any span or in any log record: a storage key or prefix, stored content or payload,
 metadata you supplied, query text, filter values, a scope, a memory id, a connection string, a username or
@@ -719,9 +734,31 @@ configuration you chose, so it is recorded.
 `strands_mongodb.client.acquired` is a span event, recorded once for each connection pool this package
 creates or registers, on the span that is current at that moment. That is the store's constructor, if you
 build the store inside a traced block, or the first operation on a new event loop, if you call a
-synchronous `Agent` repeatedly and each call runs a fresh loop. A store built at import time has no span to
+synchronous `Agent` repeatedly and each call runs a fresh loop. On the memory store that first operation
+does its setup in `memory.initialize`, so the event lands on that span rather than on `memory.search`. A store built at import time has no span to
 record on, and its first operation takes over the pool construction built, which creates nothing. The
 driver connects lazily, so the cost of connecting sits inside the first operation's span either way.
+
+Log records keep their messages, levels and logger names, and each one also carries fields a JSON
+formatter can index without parsing the message: `strands_mongodb_event`, always, and
+`strands_mongodb_namespace` (`<database>.<collection>`) and `strands_mongodb_tier` where the record is
+about one. The event names are stable:
+
+| `strands_mongodb_event` | Level | Logged when |
+|---|---|---|
+| `retry_writes_disabled` | `WARNING` | The client has retryable writes turned off |
+| `attribution_not_visible` | `DEBUG` | An injected client did not take the Strands handshake attribution |
+| `closed_loop_client_dropped` | `DEBUG` | An event loop closed before its client could be closed |
+| `reserved_key_collision` | `WARNING` | A stored document's metadata uses a key the store sets on every result |
+| `no_search_setup` | `WARNING` | The deployment has no Atlas Search, so no search index is set up |
+| `tier_unavailable` | `WARNING` | Under `auto`, a search tier could not be prepared and was skipped |
+| `below_vector` | `WARNING` | Under `auto`, vector search is unavailable and queries use the text tier |
+| `bound_declined_fusion` | `WARNING` | A score bound kept `auto` off the hybrid tier |
+| `score_bound_applied` | `DEBUG` | `min_score` or `max_score` dropped results |
+| `creating_indexes` | `INFO` | Ordinary indexes are being created |
+| `creating_search_index` | `INFO` | A search index is being created |
+| `search_index_status` | `INFO` | A search index changed status while being waited for |
+| `attribute_dropped` | `DEBUG` | A span attribute was not on the allow-list and was dropped |
 
 ## Examples
 

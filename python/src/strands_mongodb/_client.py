@@ -376,7 +376,7 @@ def _warn_if_retries_disabled(client: AsyncMongoClient[Any]) -> None:
         client: The client about to be registered.
     """
     if client.options.retry_writes is False:
-        logger.warning(_RETRY_WRITES_DISABLED)
+        logger.warning(_RETRY_WRITES_DISABLED, extra=_telemetry.event_extra("retry_writes_disabled"))
 
 
 def _already_attributed(client: AsyncMongoClient[Any]) -> bool:
@@ -467,7 +467,8 @@ def _reattribute_if_it_was_discarded(connection: _Connection) -> None:
     connection.recheck_attribution = False
     logger.debug(
         "strands_mongodb: append_metadata did not become visible on the injected client, so the Strands "
-        "attribution is left as it is"
+        "attribution is left as it is",
+        extra=_telemetry.event_extra("attribution_not_visible"),
     )
 
 
@@ -654,7 +655,8 @@ async def close(config: MongoDBConfig) -> None:
                 pending.close()
                 logger.debug(
                     "strands_mongodb: an event loop closed while its client was being scheduled for "
-                    "close; the slot is released and the client is dropped unclosed"
+                    "close; the slot is released and the client is dropped unclosed",
+                    extra=_telemetry.event_extra("closed_loop_client_dropped"),
                 )
         # A closed loop's client is dropped and not closed. Nothing can close it: `close()` needs the
         # loop the sockets belong to, and the `RuntimeError` pymongo raises instead is not a

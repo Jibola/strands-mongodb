@@ -7,27 +7,38 @@ same way whatever route put it on the span.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import json
 import logging
+import re
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, get_args
 
 import pytest
 from bson import ObjectId
-from conftest import rendered
+from conftest import capturing_spans, rendered
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind, StatusCode
 from pymongo import AsyncMongoClient
 from pymongo.errors import OperationFailure
 from strands.types.exceptions import StorageError
+from test_indexes import (
+    FakeAsyncCollection,
+    FakeAsyncDatabase,
+    FakeSearchIndexCursor,
+    bounded,
+    raiser,
+    search_states,
+)
 from test_memory_store import _connection_config, _metadata, _patch_setup, _prepared, _real_store, _store
 from test_storage import UNREACHABLE, FakeStorageCollection, network_failure, unit_storage
 
 import strands_mongodb
-from strands_mongodb import MongoDBStorage, _client, _pipeline, _telemetry
+from strands_mongodb import MongoDBStorage, _client, _indexes, _pipeline, _telemetry
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -272,7 +283,9 @@ class TestEveryStorageOperationRecordsOneSpan:
         await storage.delete_prefix("notes/")
         await storage.ensure_indexes()
 
-        spans = [span for span in exported_spans.get_finished_spans() if span.name.startswith("strands_mongodb.")]
+        spans = [
+            span for span in exported_spans.get_finished_spans() if span.name.startswith("strands_mongodb.storage.")
+        ]
         called = ("write", "read", "list", "search", "delete", "delete_prefix", "ensure_indexes")
         assert sorted(called) == sorted(STORAGE_OPERATIONS)
         assert [span.name for span in spans] == [f"strands_mongodb.storage.{op}" for op in called]
@@ -397,11 +410,15 @@ class TestEveryMemoryOperationRecordsOneSpan:
         _patch_setup(monkeypatch, failing=frozenset({"vector_index", "text_index"}))
         store = _store()
 
-        with pytest.raises(StorageError):
+        with pytest.raises(StorageError) as caught:
             await store.search("dark mode")
 
         search = _one(exported_spans, "strands_mongodb.memory.search")
         initialize = _one(exported_spans, "strands_mongodb.memory.initialize")
+        # Set before anything that can raise, so a search that never reached a tier still says what was asked.
+        assert (search.attributes or {})["strands_mongodb.search.requested"] == "auto"
+        assert str(caught.value) not in rendered(search) + rendered(initialize)
+        assert "no search tier could be prepared on appdb.memory" in str(caught.value)
         assert initialize.parent is not None
         assert search.context is not None
         assert initialize.parent.span_id == search.context.span_id
@@ -611,3 +628,304 @@ class TestTheSpansAgainstARealDeployment:
             "strands_mongodb.deleted_count"
         ] == 1
         assert _leaks(exported_spans, caplog.records) == []
+
+
+INDEX_SPANS: Final = frozenset(get_args(_telemetry.SpanName))
+
+
+def _children(exporter: InMemorySpanExporter, parent: ReadableSpan, name: str) -> list[ReadableSpan]:
+    """The finished spans called ``name`` whose parent is ``parent``."""
+    span_id = parent.context.span_id if parent.context is not None else None
+    return [span for span in _named(exporter, name) if span.parent is not None and span.parent.span_id == span_id]
+
+
+class _CollatedDatabase(FakeAsyncDatabase):
+    """``test_indexes``'s database fake plus the one call the collation probe makes."""
+
+    async def list_collections(self, filter: dict[str, Any]) -> FakeSearchIndexCursor:  # noqa: A002 - pymongo's name
+        return FakeSearchIndexCursor([{"name": filter["name"], "options": {}}])
+
+
+async def _under_parent(awaitable: Any) -> Any:
+    """Run ``awaitable`` inside a span called ``parent``, standing in for the operation that caused it."""
+    with trace.get_tracer("tests").start_as_current_span("parent"):
+        return await bounded(awaitable)
+
+
+class TestIndexWorkIsAChildOfTheOperationThatCausedIt:
+    """AT-204 / REQ-E-199 — ``indexes.ensure``, ``indexes.probe`` and ``indexes.wait``, each one span."""
+
+    async def test_ensure_records_its_mode_and_how_many_it_created(self, exported_spans: InMemorySpanExporter) -> None:
+        collection: Any = FakeAsyncCollection(database=FakeAsyncDatabase(name="appdb"))
+
+        await _under_parent(_indexes.ensure(collection, ordinary=_indexes.storage_specs()))
+        await _under_parent(_indexes.ensure(collection, ordinary=_indexes.storage_specs(), create=False))
+
+        parents = _named(exported_spans, "parent")
+        first, second = (_children(exported_spans, parent, "strands_mongodb.indexes.ensure") for parent in parents)
+        assert len(first) == len(second) == 1
+        created, verified = dict(first[0].attributes or {}), dict(second[0].attributes or {})
+        assert created["strands_mongodb.indexes.mode"] == "ensure"
+        assert created["strands_mongodb.indexes.created"] == len(_indexes.storage_specs())
+        assert verified["strands_mongodb.indexes.mode"] == "verify"
+        assert verified["strands_mongodb.indexes.created"] == 0
+        for attributes in (created, verified):
+            assert attributes["strands_mongodb.database"] == "appdb"
+            assert attributes["strands_mongodb.collection"] == "memory"
+        assert first[0].kind is SpanKind.INTERNAL
+
+    async def test_each_probe_is_a_span_naming_what_it_probed(self, exported_spans: InMemorySpanExporter) -> None:
+        collection: Any = FakeAsyncCollection(database=_CollatedDatabase(name="appdb"))
+
+        await _under_parent(_indexes.search_support(collection))
+        await _under_parent(_indexes.rank_fusion_support(collection))
+        await _under_parent(_indexes.read_collation(collection))
+
+        probes = [
+            dict(_children(exported_spans, parent, "strands_mongodb.indexes.probe")[0].attributes or {})
+            for parent in _named(exported_spans, "parent")
+        ]
+        assert [attributes["strands_mongodb.indexes.probe"] for attributes in probes] == [
+            "search",
+            "rank_fusion",
+            "collation",
+        ]
+        assert {attributes["strands_mongodb.collection"] for attributes in probes} == {"memory"}
+
+    async def test_a_wait_is_one_span_however_many_polls_it_takes(self, exported_spans: InMemorySpanExporter) -> None:
+        spec = _indexes.memory_search_specs({"database": "d"})[0]
+        collection: Any = FakeAsyncCollection(
+            search_states=search_states(spec.name, "BUILDING", "BUILDING", "BUILDING", "READY")
+        )
+
+        await _under_parent(_indexes.ensure(collection, search=[spec], create=False, timeout=5, interval=0))
+
+        ensure = _one(exported_spans, "strands_mongodb.indexes.ensure")
+        waits = _children(exported_spans, ensure, "strands_mongodb.indexes.wait")
+        assert len(waits) == 1
+        assert (waits[0].attributes or {})["strands_mongodb.indexes.outcome"] == "ready"
+        assert waits[0].status.status_code is StatusCode.UNSET
+
+    async def test_storage_ensure_indexes_parents_both_its_probe_and_its_ensure(
+        self, exported_spans: InMemorySpanExporter
+    ) -> None:
+        await unit_storage(FakeStorageCollection()).ensure_indexes()
+
+        operation = _one(exported_spans, "strands_mongodb.storage.ensure_indexes")
+        assert len(_children(exported_spans, operation, "strands_mongodb.indexes.ensure")) == 1
+        probes = _children(exported_spans, operation, "strands_mongodb.indexes.probe")
+        assert [(span.attributes or {})["strands_mongodb.indexes.probe"] for span in probes] == ["collation"]
+
+    async def test_a_failing_ensure_is_an_error_span_with_its_count_so_far(
+        self, exported_spans: InMemorySpanExporter
+    ) -> None:
+        collection: Any = FakeAsyncCollection()
+        collection.create_indexes = raiser(network_failure())
+
+        with pytest.raises(StorageError):
+            await _under_parent(_indexes.ensure(collection, ordinary=_indexes.storage_specs()))
+
+        span = _one(exported_spans, "strands_mongodb.indexes.ensure")
+        assert span.status.status_code is StatusCode.ERROR
+        assert span.status.description == "StorageError"
+        assert (span.attributes or {})["strands_mongodb.indexes.created"] == 0
+
+
+class TestATimedOutWaitIsAnOutcomeAndNotAnError:
+    """AT-209 / REQ-E-204 — ``timed_out`` on the wait span, its status left ``UNSET``."""
+
+    async def test_the_wait_span_says_timed_out_and_the_caller_still_gets_the_error(
+        self, exported_spans: InMemorySpanExporter
+    ) -> None:
+        spec = _indexes.memory_search_specs({"database": "d"})[0]
+        collection: Any = FakeAsyncCollection(search_states=search_states(spec.name, "BUILDING"))
+
+        with pytest.raises(StorageError, match=r"waited 0s for 1 search index\(es\) on testdb\.memory"):
+            await _under_parent(_indexes.ensure(collection, search=[spec], create=False, timeout=0, interval=0))
+
+        wait = _one(exported_spans, "strands_mongodb.indexes.wait")
+        assert (wait.attributes or {})["strands_mongodb.indexes.outcome"] == "timed_out"
+        assert wait.status.status_code is StatusCode.UNSET
+        assert [event.name for event in wait.events] == []
+        # The ensure span is the one that raised, so it is the one marked.
+        assert _one(exported_spans, "strands_mongodb.indexes.ensure").status.status_code is StatusCode.ERROR
+
+    async def test_a_build_that_fails_mid_wait_is_an_error_on_the_wait_span(
+        self, exported_spans: InMemorySpanExporter
+    ) -> None:
+        spec = _indexes.memory_search_specs({"database": "d"})[0]
+        collection: Any = FakeAsyncCollection(search_states=search_states(spec.name, "BUILDING", "FAILED"))
+
+        with pytest.raises(StorageError, match="FAILED"):
+            await _under_parent(_indexes.ensure(collection, search=[spec], create=False, timeout=5, interval=0))
+
+        wait = _one(exported_spans, "strands_mongodb.indexes.wait")
+        assert wait.status.status_code is StatusCode.ERROR
+        assert "strands_mongodb.indexes.outcome" not in (wait.attributes or {})
+
+
+def _log_calls() -> list[tuple[str, str, str, ast.Call]]:
+    """Every ``logger.<level>(...)`` call in the package: file, level, the message argument's source, the call."""
+    package = Path(strands_mongodb.__file__).parent
+    calls = []
+    for path in sorted(package.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "logger"
+            ):
+                calls.append((path.name, node.func.attr, ast.unparse(node.args[0]), node))
+    return sorted(calls, key=lambda call: (call[0], call[3].lineno))
+
+
+#: Every record the package emits, as it stood before structured fields were added (REQ-E-206). A change to
+#: a level or a message fails here, because applications filter on both.
+PINNED_RECORDS: Final = {
+    ("_client.py", "warning", "_RETRY_WRITES_DISABLED"),
+    (
+        "_client.py",
+        "debug",
+        "'strands_mongodb: append_metadata did not become visible on the injected client, so the Strands "
+        "attribution is left as it is'",
+    ),
+    (
+        "_client.py",
+        "debug",
+        "'strands_mongodb: an event loop closed while its client was being scheduled for close; the slot is "
+        "released and the client is dropped unclosed'",
+    ),
+    ("_indexes.py", "info", "'strands_mongodb: creating %d index(es) on %s: %s'"),
+    ("_indexes.py", "info", "'strands_mongodb: creating %s index %r on %s'"),
+    ("_indexes.py", "info", "'strands_mongodb: search index %r on %s is %s'"),
+    ("_telemetry.py", "debug", "'strands_mongodb: dropped span attribute %r, which is not on the allow-list'"),
+    ("memory_store.py", "warning", "_RESERVED_KEY_COLLISION"),
+    ("memory_store.py", "warning", "_NO_SEARCH_SETUP"),
+    ("memory_store.py", "warning", "_TIER_UNAVAILABLE"),
+    ("memory_store.py", "warning", "_BELOW_VECTOR"),
+    ("memory_store.py", "warning", "_BOUND_DECLINED_FUSION"),
+    ("memory_store.py", "debug", "_SCORE_BOUND_APPLIED"),
+}
+
+
+class TestEveryLogRecordCarriesStructuredFields:
+    """AT-210 / REQ-E-205 — an event name on every record, and the namespace and tier where there is one."""
+
+    def test_every_log_call_passes_its_fields_through_event_extra(self) -> None:
+        """Read off the source, so a log line added later without fields fails here before it ships."""
+        bare = [
+            f"{name}:{call.lineno}"
+            for name, _, _, call in _log_calls()
+            if not any(
+                keyword.arg == "extra"
+                and isinstance(keyword.value, ast.Call)
+                and ast.unparse(keyword.value.func).endswith("event_extra")
+                for keyword in call.keywords
+            )
+        ]
+        assert bare == []
+
+    def test_every_event_name_is_used_once_and_is_snake_case(self) -> None:
+        used = [
+            ast.literal_eval(keyword.value.args[0])
+            for _, _, _, call in _log_calls()
+            for keyword in call.keywords
+            if keyword.arg == "extra" and isinstance(keyword.value, ast.Call)
+        ]
+        assert sorted(used) == sorted(get_args(_telemetry.LogEvent))
+        assert all(re.fullmatch(r"[a-z]+(_[a-z]+)*", name) for name in used), used
+
+    def test_event_extra_prefixes_its_keys_and_omits_what_does_not_apply(self) -> None:
+        assert _telemetry.event_extra("tier_unavailable", namespace="appdb.facts", tier="vector") == {
+            "strands_mongodb_event": "tier_unavailable",
+            "strands_mongodb_namespace": "appdb.facts",
+            "strands_mongodb_tier": "vector",
+        }
+        assert _telemetry.event_extra("retry_writes_disabled") == {"strands_mongodb_event": "retry_writes_disabled"}
+
+    async def test_a_record_survives_a_json_formatter_with_its_fields_readable(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.INFO, logger="strands_mongodb")
+        spec = _indexes.memory_search_specs({"database": "d"})[0]
+        collection: Any = FakeAsyncCollection(database=FakeAsyncDatabase(name="appdb"))
+
+        await bounded(_indexes.ensure(collection, ordinary=_indexes.storage_specs(), search=[spec], interval=0))
+
+        records = [record for record in caplog.records if record.name.startswith("strands_mongodb")]
+        assert records
+        parsed = [json.loads(json.dumps(record.__dict__, default=str)) for record in records]
+        assert [entry["strands_mongodb_event"] for entry in parsed] == [
+            "creating_indexes",
+            "creating_search_index",
+            "search_index_status",
+        ]
+        assert {entry["strands_mongodb_namespace"] for entry in parsed} == {"appdb.memory"}
+
+    async def test_a_dropped_tier_names_its_tier(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.WARNING, logger="strands_mongodb")
+        _patch_setup(monkeypatch, failing=frozenset({"vector_index"}))
+        store = _store()
+
+        await store.initialize()
+
+        (record,) = [
+            record for record in caplog.records if getattr(record, "strands_mongodb_event", None) == "tier_unavailable"
+        ]
+        assert vars(record)["strands_mongodb_tier"] == "vector"
+        assert vars(record)["strands_mongodb_namespace"] == store._target
+
+
+class TestEveryExistingRecordIsUnchanged:
+    """AT-211 / REQ-E-206 — the same message, at the same level, under the same logger."""
+
+    def test_every_log_call_matches_the_pinned_list(self) -> None:
+        assert {(name, level, message) for name, level, message, _ in _log_calls()} == PINNED_RECORDS
+        assert len(_log_calls()) == len(PINNED_RECORDS)
+
+    async def test_the_index_records_read_as_they_did(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.INFO, logger="strands_mongodb")
+        spec = _indexes.memory_search_specs({"database": "d"})[0]
+        collection: Any = FakeAsyncCollection(database=FakeAsyncDatabase(name="appdb"))
+
+        await bounded(_indexes.ensure(collection, ordinary=_indexes.storage_specs()[:1], search=[spec], interval=0))
+
+        name = _indexes.storage_specs()[0].name
+        assert [(record.name, record.levelno, record.getMessage()) for record in caplog.records] == [
+            (
+                "strands_mongodb._indexes",
+                logging.INFO,
+                f"strands_mongodb: creating 1 index(es) on appdb.memory: {name}",
+            ),
+            (
+                "strands_mongodb._indexes",
+                logging.INFO,
+                f"strands_mongodb: creating {spec.type} index {spec.name!r} on appdb.memory",
+            ),
+            (
+                "strands_mongodb._indexes",
+                logging.INFO,
+                f"strands_mongodb: search index {spec.name!r} on appdb.memory is READY",
+            ),
+        ]
+
+
+class TestTheSpanFixtureDoesNotAccumulate:
+    """The harness itself: a processor per test would make every later span cost one call per earlier test."""
+
+    def test_the_provider_gains_one_processor_however_many_tests_take_the_fixture(self) -> None:
+        def count() -> int:
+            provider = trace.get_tracer_provider()
+            return len(provider._active_span_processor._span_processors)  # type: ignore[attr-defined]
+
+        with capturing_spans() as first:
+            before = count()
+        with capturing_spans() as second, trace.get_tracer("tests").start_as_current_span("only-second"):
+            pass
+
+        assert count() == before
+        assert [span.name for span in second.get_finished_spans()] == ["only-second"]
+        assert first.get_finished_spans() == ()

@@ -6,7 +6,7 @@ that installs none gets OpenTelemetry's no-op tracer and pays for a function cal
 
 What reaches a span is decided here and nowhere else. ``traced`` reads the instance and never the call's
 arguments, which is where keys, content, queries and filters live. Everything else arrives through
-``annotate`` and ``event``, and their names are restricted to ``Attribute``: a ``Literal``, so ``mypy``
+``span``, ``annotate`` and ``event``, and their names are restricted to ``Attribute``: a ``Literal``, so ``mypy``
 rejects a name outside it, and a runtime check that drops one rather than raising, because a telemetry
 typo must never become a failed write.
 
@@ -17,6 +17,7 @@ exception is not.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 from typing import TYPE_CHECKING, Any, Final, Literal, ParamSpec, TypeVar, get_args
@@ -33,11 +34,11 @@ except ImportError as error:  # pragma: no cover - exercised in a subprocess by 
     missing_extra("storage", error, module=__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine, Mapping
+    from collections.abc import Callable, Coroutine, Iterator, Mapping
 
     from opentelemetry.util.types import AttributeValue
 
-__all__ = ["Attribute", "EventName", "annotate", "event", "traced"]
+__all__ = ["Attribute", "EventName", "LogEvent", "SpanName", "annotate", "event", "event_extra", "span", "traced"]
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,34 @@ Attribute = Literal[
     "strands_mongodb.database",
     "strands_mongodb.collection",
     "strands_mongodb.client.injected",
+    "strands_mongodb.indexes.mode",
+    "strands_mongodb.indexes.created",
+    "strands_mongodb.indexes.outcome",
+    "strands_mongodb.indexes.probe",
+]
+
+#: Every span opened by ``span`` rather than by ``traced``: index work, as a child of the operation that needed it.
+SpanName = Literal[
+    "strands_mongodb.indexes.ensure",
+    "strands_mongodb.indexes.probe",
+    "strands_mongodb.indexes.wait",
+]
+
+#: The ``strands_mongodb_event`` value of every log record the package emits, one per message.
+LogEvent = Literal[
+    "retry_writes_disabled",
+    "attribution_not_visible",
+    "closed_loop_client_dropped",
+    "reserved_key_collision",
+    "no_search_setup",
+    "tier_unavailable",
+    "below_vector",
+    "bound_declined_fusion",
+    "score_bound_applied",
+    "creating_indexes",
+    "creating_search_index",
+    "search_index_status",
+    "attribute_dropped",
 ]
 
 #: Every span event the package may add.
@@ -106,9 +135,7 @@ def traced(
                 except Exception as error:
                     # `Exception`, not `BaseException`: a cancelled call ends its span with the status
                     # unset, because cancelling is the caller's decision and not a store failure.
-                    kind = type(error)
-                    span.set_status(Status(StatusCode.ERROR, kind.__name__))
-                    span.set_attribute("error.type", f"{kind.__module__}.{kind.__qualname__}")
+                    _mark(span, error)
                     raise
 
         # Stored on the wrapper rather than in a module-level registry, so the README test can list the
@@ -117,6 +144,64 @@ def traced(
         return tracing
 
     return decorate
+
+
+@contextlib.contextmanager
+def span(name: SpanName, attributes: Mapping[Attribute, AttributeValue]) -> Iterator[None]:
+    """Open an ``INTERNAL`` child span under the current one, for work a store operation causes.
+
+    The same rules as ``traced``: the tracer looked up on entry, attributes filtered through the allow-list,
+    and an exception recorded as a status and a type name and re-raised unchanged. Inside it, ``annotate``
+    sets attributes on this span rather than on the operation's.
+
+    Args:
+        name: An index span name.
+        attributes: Its starting attributes, usually the namespace and the mode or probe.
+
+    Yields:
+        Nothing. The span is current for the body of the ``with``.
+
+    Raises:
+        Exception: Whatever the body raises, re-raised as the same object after the span is marked. The
+            context manager raises nothing of its own.
+    """
+    kept: dict[str, AttributeValue] = {key: value for key, value in attributes.items() if _allowed(key)}
+    tracer = trace.get_tracer("strands_mongodb", __version__)
+    with tracer.start_as_current_span(
+        name,
+        kind=SpanKind.INTERNAL,
+        attributes=kept,
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as current:
+        try:
+            yield
+        except Exception as error:
+            _mark(current, error)
+            raise
+
+
+def event_extra(event: LogEvent, *, namespace: str | None = None, tier: str | None = None) -> dict[str, str]:
+    """The ``extra`` mapping for one log record, so a JSON formatter can index it without parsing the message.
+
+    Prefixed ``strands_mongodb_`` because ``logging`` raises ``KeyError`` for an ``extra`` key that collides
+    with a ``LogRecord`` attribute such as ``name`` or ``message``. A field that does not apply is omitted
+    rather than set to ``None``, so a formatter's output has no keys that never carry anything.
+
+    Args:
+        event: The record's stable name.
+        namespace: ``<database>.<collection>``, where the record concerns one.
+        tier: The search tier, where the record concerns one.
+
+    Returns:
+        The mapping to pass as ``extra``.
+    """
+    extra: dict[str, str] = {"strands_mongodb_event": event}
+    if namespace is not None:
+        extra["strands_mongodb_namespace"] = namespace
+    if tier is not None:
+        extra["strands_mongodb_tier"] = tier
+    return extra
 
 
 def annotate(name: Attribute, value: AttributeValue) -> None:
@@ -147,8 +232,19 @@ def _allowed(name: str) -> bool:
     """Whether ``name`` is on the allow-list, logging at ``DEBUG`` when it is not."""
     if name in _ALLOWED:
         return True
-    logger.debug("strands_mongodb: dropped span attribute %r, which is not on the allow-list", name)
+    logger.debug(
+        "strands_mongodb: dropped span attribute %r, which is not on the allow-list",
+        name,
+        extra=event_extra("attribute_dropped"),
+    )
     return False
+
+
+def _mark(current: trace.Span, error: Exception) -> None:
+    """Record a failure as ``ERROR`` with the class name, and ``error.type``, never the message."""
+    kind = type(error)
+    current.set_status(Status(StatusCode.ERROR, kind.__name__))
+    current.set_attribute("error.type", f"{kind.__module__}.{kind.__qualname__}")
 
 
 def _base(instance: Any, surface: str) -> dict[str, AttributeValue]:

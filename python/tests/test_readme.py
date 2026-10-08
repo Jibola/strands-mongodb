@@ -1497,6 +1497,13 @@ class TestTheAppNamePassageMatchesTheCode:
         )
 
 
+def _named_by_telemetry() -> set[str]:
+    """Every index span, attribute and event name ``_telemetry`` allows, read off its ``Literal`` types."""
+    return (
+        set(get_args(_telemetry.SpanName)) | set(get_args(_telemetry.Attribute)) | set(get_args(_telemetry.EventName))
+    )
+
+
 class TestTheObservabilitySectionMatchesTheCode:
     """AT-213 / REQ-E-208 — every span, event and attribute the code can emit is named, and nothing else is.
 
@@ -1510,14 +1517,14 @@ class TestTheObservabilitySectionMatchesTheCode:
 
         spans = _span_names()
         assert len(spans) == 12, sorted(spans)
-        expected = spans | set(get_args(_telemetry.Attribute)) | set(get_args(_telemetry.EventName))
+        expected = spans | _named_by_telemetry()
         missing = sorted(name for name in expected if f"`{name}`" not in section)
         assert missing == [], f"the observability section does not name {missing}"
         assert "`error.type`" in section
 
     def test_it_names_nothing_the_code_does_not_emit(self) -> None:
         section = _marked_section("observability")
-        expected = _span_names() | set(get_args(_telemetry.Attribute)) | set(get_args(_telemetry.EventName))
+        expected = _span_names() | _named_by_telemetry()
 
         named = set(re.findall(r"`(strands_mongodb\.[a-z_.]+)`", section))
 
@@ -1532,3 +1539,21 @@ class TestTheObservabilitySectionMatchesTheCode:
         assert "strandstelemetry" in lowered and "tracerprovider" in lowered, "it does not say how to enable export"
         assert "configures nothing" in lowered, "it does not say the package installs no provider of its own"
         assert "first operation" in lowered, "it does not say where the connection cost lands"
+        assert "a few microseconds" in lowered, "it does not say what an operation costs with no provider"
+        assert "`memory.initialize`" in _marked_section("observability"), (
+            "it does not say that a memory store's first pool event lands on the initialize span"
+        )
+
+    def test_the_timed_out_wait_is_explained(self) -> None:
+        lowered = _marked_section("observability").lower()
+
+        assert "`timed_out`" in lowered and "unset" in lowered, "it does not say a timed-out wait is not an error"
+
+    def test_every_log_event_and_field_is_named(self) -> None:
+        """AT-210 / REQ-E-205 — the event names are a contract a log pipeline indexes on, so they are listed."""
+        section = _marked_section("observability")
+
+        missing = sorted(name for name in get_args(_telemetry.LogEvent) if f"`{name}`" not in section)
+        assert missing == [], f"the observability section does not name the log events {missing}"
+        for field in ("strands_mongodb_event", "strands_mongodb_namespace", "strands_mongodb_tier"):
+            assert f"`{field}`" in section, field
