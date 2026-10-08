@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import threading
+import urllib.parse
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any, Final
@@ -42,6 +43,13 @@ logger = logging.getLogger(__name__)
 
 # The name the server logs and Atlas telemetry group by. Changing it orphans historical usage data.
 _DRIVER_NAME = "Strands"
+
+# The handshake's `appName`, which server logs, `$currentOp` and the profiler show. It is a second
+# counter beside `_DRIVER_NAME`, and renaming it orphans historical usage data in the same way.
+_APP_NAME = "strands-mongodb"
+_APP_NAME_SUFFIX = "-" + _APP_NAME
+# pymongo's own limit, in UTF-8 bytes. Over it, `AsyncMongoClient` raises `ValueError`.
+_APP_NAME_MAX_BYTES = 128
 
 _MISSING_CONNECTION = (
     "strands_mongodb: a MongoDB connection is required, but neither 'client' nor "
@@ -273,6 +281,44 @@ def _driver_info() -> DriverInfo:
     return DriverInfo(name=_DRIVER_NAME, version=_package_version())
 
 
+def _app_name(connection_string: str, client_args: dict[str, Any]) -> str:
+    """Derive the ``appName`` a client this package builds sends: the caller's, suffixed, or the package's own.
+
+    The caller's value is the one pymongo would have used. A ``client_args`` key in any letter case wins,
+    as pymongo's keyword options do. Otherwise it is the last ``appName`` in the query string. Only the
+    text after the first ``?`` is read, so the part of the URI that holds credentials is never parsed,
+    and an ``srv`` URI is never resolved: its TXT record cannot carry ``appName`` anyway.
+
+    Args:
+        connection_string: The configured URI.
+        client_args: The configured client arguments.
+
+    Returns:
+        ``strands-mongodb`` when no value is configured. The value unchanged when it already ends in the
+        suffix. Otherwise ``<value>-strands-mongodb``, with the value shortened on a character boundary
+        when the whole would exceed pymongo's 128-byte limit, because the suffix is what does the counting.
+    """
+    configured: str | None = None
+    for key, value in client_args.items():
+        if key.lower() == "appname":
+            configured = None if value is None else str(value)
+    if configured is None:
+        _, _, query = connection_string.partition("?")
+        for pair in query.replace(";", "&").split("&"):
+            key, _, value = pair.partition("=")
+            if key.lower() == "appname":
+                configured = urllib.parse.unquote_plus(value)
+
+    if not configured:
+        return _APP_NAME
+    if configured == _APP_NAME or configured.endswith(_APP_NAME_SUFFIX):
+        return configured
+    room = _APP_NAME_MAX_BYTES - len(_APP_NAME_SUFFIX.encode())
+    # `errors="ignore"` drops a multi-byte character the cut split in half, rather than replacing it.
+    kept = configured.encode()[:room].decode(errors="ignore")
+    return kept + _APP_NAME_SUFFIX
+
+
 def _identity(config: MongoDBConfig) -> str:
     """Compute the registry key for a config.
 
@@ -483,12 +529,17 @@ def resolve(config: MongoDBConfig) -> _Connection:
 
         _reap_closed_loops()
 
-        # `driver=` reaches pymongo through `**kwargs` rather than a named parameter, so nothing type
-        # checks it. AT-013a asserts the resulting pool metadata instead of the call.
+        # `driver=` and `appname=` reach pymongo through `**kwargs` rather than named parameters, so
+        # nothing type checks them. The tests assert the resulting pool metadata instead of the call.
+        # Every case variant of `appname` is removed from a copy, so the client receives exactly one.
+        client_args = dict(config.get("client_args") or {})
+        app_name = _app_name(config["connection_string"], client_args)
+        client_args = {key: value for key, value in client_args.items() if key.lower() != "appname"}
         client: AsyncMongoClient[Any] = AsyncMongoClient(
             config["connection_string"],
             driver=_driver_info(),
-            **(config.get("client_args") or {}),
+            appname=app_name,
+            **client_args,
         )
         return _register(identity, running, client, owned=True, attribute=False)
 

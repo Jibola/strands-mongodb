@@ -475,6 +475,139 @@ class TestDriverAttributionReachesTheServer:
         assert callable(inspect.getattr_static(type(injected), "append_metadata", None))
 
 
+def _app_name_of(client: AsyncMongoClient[Any]) -> str | None:
+    """The ``appName`` the handshake will send, read where pymongo keeps it after parsing every source."""
+    application = client.options.pool_options.metadata.get("application")
+    return None if application is None else application["name"]
+
+
+def _built_app_name(connection_string: str, **client_args: Any) -> str | None:
+    config: MongoDBConfig = {"database": "appdb", "connection_string": connection_string}
+    if client_args:
+        config["client_args"] = client_args
+    return _app_name_of(_client.resolve(config).client)
+
+
+class TestAppNameAttribution:
+    """AT-215 to AT-222 / REQ-E-210 to REQ-E-215, and the three behaviours that must not change.
+
+    ``appName`` is the handshake field that server logs, ``$currentOp`` and the profiler show. Setting it
+    to ``strands-mongodb``, or adding that as a suffix to the caller's own value, is how this package's usage
+    gets counted at the server. Every assertion reads the value pymongo actually parsed, because the kwarg,
+    the URI and their precedence all meet inside pymongo, and only the parsed value is what gets sent.
+    """
+
+    def test_a_uri_without_an_app_name_gets_the_package_name(self) -> None:
+        """AT-215."""
+        assert _built_app_name("mongodb://127.0.0.1:1/") == "strands-mongodb"
+
+    def test_an_empty_app_name_counts_as_none(self) -> None:
+        """AT-215. An empty value has nothing worth keeping, and ``-strands-mongodb`` would be a typo."""
+        assert _built_app_name("mongodb://127.0.0.1:1/", appname="") == "strands-mongodb"
+
+    @pytest.mark.parametrize(
+        ("query", "expected"),
+        [
+            ("?appName=billing", "billing-strands-mongodb"),
+            ("?APPNAME=billing", "billing-strands-mongodb"),
+            ("?retryWrites=true&appName=billing&w=majority", "billing-strands-mongodb"),
+            ("?appName=billing%20api", "billing api-strands-mongodb"),
+        ],
+    )
+    def test_a_uri_app_name_is_kept_and_suffixed(self, query: str, expected: str) -> None:
+        """AT-216. Decoded the way pymongo decodes it, so the server never shows a ``%20``."""
+        assert _built_app_name(f"mongodb://127.0.0.1:1/{query}") == expected
+
+    def test_the_last_uri_app_name_wins_as_it_does_in_pymongo(self) -> None:
+        """AT-216. pymongo keeps the last of a repeated key, so the suffix goes on the value it would have sent."""
+        assert _client._app_name("mongodb://h/?appName=first&appName=second", {}) == "second-strands-mongodb"
+
+    @pytest.mark.parametrize("key", ["appname", "appName", "APPNAME"])
+    def test_a_client_args_app_name_is_suffixed_in_any_case(self, key: str) -> None:
+        """AT-217. Passing the key and the package's own kwarg together would be a ``TypeError`` on every resolve."""
+        assert _built_app_name("mongodb://127.0.0.1:1/", **{key: "billing"}) == "billing-strands-mongodb"
+
+    def test_client_args_wins_over_the_uri_as_it_does_in_pymongo(self) -> None:
+        """AT-217."""
+        assert _built_app_name("mongodb://127.0.0.1:1/?appName=from-uri", appname="from-args") == (
+            "from-args-strands-mongodb"
+        )
+
+    @pytest.mark.parametrize("value", ["strands-mongodb", "billing-strands-mongodb"])
+    def test_a_value_that_already_carries_the_suffix_is_unchanged(self, value: str) -> None:
+        """AT-218. A value copied out of a server log back into a URI must not grow a second suffix."""
+        assert _built_app_name(f"mongodb://127.0.0.1:1/?appName={value}") == value
+
+    def test_an_over_long_value_is_shortened_so_the_suffix_fits(self) -> None:
+        """AT-219. pymongo raises at 129 bytes, so keeping the value whole would break a working config."""
+        name = _built_app_name("mongodb://127.0.0.1:1/", appname="a" * 200)
+
+        assert name == "a" * 112 + "-strands-mongodb"
+
+    def test_a_value_that_exactly_fits_is_not_shortened(self) -> None:
+        """AT-219. The boundary itself: 112 bytes plus 16 is exactly the limit."""
+        assert _built_app_name("mongodb://127.0.0.1:1/", appname="a" * 112) == "a" * 112 + "-strands-mongodb"
+
+    def test_shortening_never_splits_a_multibyte_character(self) -> None:
+        """AT-219. ``€`` is three bytes and 112 is not a multiple of three, so a byte-level cut would split one."""
+        euro = _built_app_name("mongodb://127.0.0.1:1/", appname="€" * 100)
+
+        assert euro == "€" * 37 + "-strands-mongodb"
+        assert len(euro.encode()) <= 128
+
+    def test_an_injected_client_keeps_its_own_app_name(self) -> None:
+        """AT-220 / REQ-E-214. pymongo cannot change it after construction, and the requester ruled it stays."""
+        mine: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/?appName=mine")
+        bare: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/")
+
+        assert _app_name_of(_client.resolve({"database": "appdb", "client": mine}).client) == "mine"
+        assert _app_name_of(_client.resolve({"database": "appdb", "client": bare}).client) is None
+
+    def test_deriving_it_reads_no_credentials_and_resolves_no_dns(self) -> None:
+        """AT-221 / REQ-E-215. An ``srv`` host that cannot exist proves no lookup ran: the call returns."""
+        assert _client._app_name(LEAKY_URI, {}) == "strands-mongodb"
+        assert _client._app_name("mongodb+srv://u:p@cluster.example.invalid/?appName=x", {}) == "x-strands-mongodb"
+        assert "SUPERSECRET" not in _client._app_name(LEAKY_URI + "?appName=svc", {})
+
+    def test_other_client_args_pass_through_and_the_callers_dict_is_untouched(self) -> None:
+        """AT-222. The key is removed from a copy, never from the dict the caller owns."""
+        client_args: dict[str, Any] = {"appname": "billing", "maxPoolSize": 7}
+        connection = _client.resolve(
+            {"database": "appdb", "connection_string": "mongodb://127.0.0.1:1/", "client_args": client_args}
+        )
+
+        assert connection.client.options.pool_options.max_pool_size == 7
+        assert client_args == {"appname": "billing", "maxPoolSize": 7}
+
+    def test_two_configs_with_the_same_uri_still_share_one_client(self) -> None:
+        """AT-222. The identity is the configuration as given, not the derived name."""
+        config: MongoDBConfig = {"database": "appdb", "connection_string": "mongodb://127.0.0.1:1/?appName=x"}
+        twin: MongoDBConfig = {"database": "appdb", "connection_string": "mongodb://127.0.0.1:1/?appName=x"}
+
+        assert _client.resolve(config).client is _client.resolve(twin).client
+
+    @pytest.mark.contract
+    async def test_the_server_sees_the_app_name(self, contract_uri: str) -> None:
+        """AT-224 / REQ-E-210. The real boundary: the server's own record of this connection's handshake.
+
+        ``$currentOp`` lists the aggregation that is asking, and that operation carries the ``appName`` its
+        connection sent. A deployment that refuses ``$currentOp`` to this user cannot answer, so it skips.
+        """
+        connection = _client.resolve({"database": "admin", "connection_string": contract_uri})
+        try:
+            try:
+                cursor = await connection.client.admin.aggregate(
+                    [{"$currentOp": {}}, {"$match": {"appName": {"$regex": "strands-mongodb$"}}}]
+                )
+                ops = await cursor.to_list()
+            except pymongo.errors.OperationFailure as error:
+                pytest.skip(f"$currentOp is not available to this user: {error.code}")
+        finally:
+            await _client.close({"database": "admin", "connection_string": contract_uri})
+
+        assert ops, "the server recorded no operation from a connection whose appName ends in strands-mongodb"
+
+
 class TestAttributionHappensAtMostOncePerClient:
     """``AT-190`` / ``REQ-E-185`` -- the floor's pymongo stacks what the code assumed it deduped.
 
