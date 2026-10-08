@@ -27,7 +27,7 @@ session management and context offloading without a separate session-manager cla
 > | Version | Contains |
 > |---|---|
 > | `0.0.1` | Package metadata, extras, import paths, public names |
-> | `0.1.0` | `MongoDBStorage` + `MongoDBMemoryStore`, the three search tiers, record expiry, docs, tests |
+> | `0.1.0` | `MongoDBStorage` + `MongoDBMemoryStore`, the three search tiers, record expiry, OpenTelemetry spans and structured log fields, docs, tests |
 >
 > Storage `search()` ranks by token overlap in a single aggregation over the key space. Measured over 1,000
 > keys carrying 400-byte payloads: 2 wire commands and 9 ms, against 1,041 commands and 210 ms for the
@@ -110,8 +110,8 @@ pip install 'strands-mongodb[all] @ git+ssh://git@github.com/mongodb/strands-mon
 
 [`python/README.md`](python/README.md) is the reference: quickstarts for both surfaces, every
 configuration key of all three `TypedDict`s, how a search picks its tier, the tenancy boundaries and who
-enforces each one, how to erase stored memories, the index and privilege handoff for a DBA, and the
-limits this package does not remove. This page stays short on purpose. Where the two would say the same
+enforces each one, how to erase stored memories, the index and privilege handoff for a DBA, the
+spans and log fields it emits, and the limits this package does not remove. This page stays short on purpose. Where the two would say the same
 thing, only one of them does.
 
 [`python/MIGRATION.md`](python/MIGRATION.md) is for readers arriving from one of the three MongoDB
@@ -132,6 +132,9 @@ you run as separate processes, so the only thing that carries state between them
 |---|---|
 | Python | >= 3.10 |
 | `strands-agents` | >= 1.54.0, the first release shipping every `strands` module the storage backend imports — `strands.storage.search.keyword` is the binding one |
+| `pymongo` | >= 4.14.0 |
+| `pymongo-search-utils` | >= 0.3.0, with the `memory` extra only |
+| `opentelemetry-api` | >= 1.30.0. The API only; exporting spans is the application's choice |
 | MongoDB | Any deployment serves storage. The text tier needs Atlas Search; the vector tier needs Atlas or an Atlas CLI local deployment. The default embedding path also needs a model registered on the cluster, measured present on Atlas and absent on a local `mongot` 8.3.8. |
 
 ## Erasing memories

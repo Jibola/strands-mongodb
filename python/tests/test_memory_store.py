@@ -542,6 +542,13 @@ class TestReservedMetadataKeysWin:
         assert "_id" in caplog.records[0].message
         assert "facts" in caplog.records[0].message
 
+    def test_the_collision_record_carries_the_namespace(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Every other event this store logs carries its namespace, so a filter on it would miss this one."""
+        with caplog.at_level(logging.WARNING, logger="strands_mongodb.memory_store"):
+            _merge_metadata({"_id": "spoofed"}, {"_id": "real"}, store_name="facts", namespace="appdb.memory")
+
+        assert vars(caplog.records[0])["strands_mongodb_namespace"] == "appdb.memory"
+
     def test_every_reserved_key_is_defended(self) -> None:
         """Parametrized over the constant rather than a hand-written list, so the two cannot drift."""
         for key in RESERVED_METADATA_KEYS:

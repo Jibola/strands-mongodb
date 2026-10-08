@@ -1311,6 +1311,28 @@ class TestSearchIndexesAgainstAFake:
                 )
             )
 
+    async def test_the_timeout_message_does_not_promise_a_retry_under_auto(self) -> None:
+        """Under ``auto`` a tier that times out is dropped and ``initialize()`` returns early ever after,
+        so advice to call it again would do nothing there. The message has to say which stores it helps."""
+        from strands.types.exceptions import StorageError
+
+        collection: Any = FakeAsyncCollection(search_states=search_states("vector_index", "BUILDING"))
+
+        with pytest.raises(StorageError) as caught:
+            await bounded(
+                _indexes.ensure(
+                    collection,
+                    search=[_indexes.memory_search_specs({"database": "d"})[0]],
+                    create=False,
+                    timeout=0,
+                    interval=0,
+                )
+            )
+
+        message = str(caught.value)
+        assert "named search_type" in message
+        assert "'auto'" in message
+
     async def test_a_present_index_with_a_different_definition_raises(self) -> None:
         """Measured: re-issuing a *different* definition under an existing name is code 68, *"already
         exists with a different definition. Drop it first if needed."* That, and not the fact that

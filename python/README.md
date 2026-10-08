@@ -24,7 +24,8 @@ from strands_mongodb.storage import MongoDBStorage  # identical class
 The root import resolves the class lazily, so it imports only the module you name. On a
 `[storage]`-only install, `import strands_mongodb` followed by `MongoDBStorage` never touches the
 memory module and never needs `pymongo-search-utils`. The one exception is
-`from strands_mongodb import *`, which walks `__all__` and therefore loads both.
+`from strands_mongodb import *`, which walks `__all__` and therefore loads every module, the memory one
+included.
 
 The `Storage` protocol is the leverage point: the SDK accepts a single top-level `storage` on
 `Agent`, and five subsystems inherit it. One correct `MongoDBStorage` therefore delivers session
@@ -157,7 +158,7 @@ connection: MongoDBConfig = {
 async def main() -> None:
     store = MongoDBMemoryStore(name="preferences", config=connection, scope="user-abc", writable=True)
     try:
-        await store.initialize()  # creates the indexes; add() and search() call it too
+        await store.initialize()  # creates the indexes; every other operation calls it too
         await store.add("Prefers metric units and a 24-hour clock.")
 
         # Atlas embeds a new document after the write is acknowledged, around 15 seconds on the cluster
@@ -296,8 +297,8 @@ one connection pool.
 | `connection_string` | `str` | no | | A MongoDB URI. Required unless `client` is set; supplying neither raises. |
 | `client_args` | `dict[str, Any]` | no | `{}` | Extra keyword arguments for the client this package builds. Ignored when `client` is set. |
 | `ensure_indexes` | `bool` | no | `True` | Whether to create missing indexes. `False` verifies and reports instead. See below. |
-| `index_ready_timeout` | `float` | no | `300` | Seconds to wait for a search index to become queryable, in total across every index one call builds. Raise it on a shared deployment where a build queues behind somebody else's. |
-| `search_type` | `"auto" \| "vector" \| "text"` | no | `"auto"` | Which memory search tiers to prepare and query. |
+| `index_ready_timeout` | `float` | no | `300` | Seconds to wait for each search index to become queryable, timed separately per index, so an `"auto"` store can wait this long once per tier. Raise it on a shared deployment where a build queues behind somebody else's. |
+| `search_type` | `"auto" \| "vector" \| "text" \| "hybrid"` | no | `"auto"` | Which memory search tiers to prepare and query. |
 | `embedding_model` | `str` | no | `voyage-4-lite` | Atlas embedding model, on the AutoEmbeddings path where the deployment embeds your text. |
 | `embedding_dimensions` | `int` | no | | Vector length, on the manual path where you supply the vectors. Mutually exclusive with `embedding_model`, and requires `similarity`. |
 | `similarity` | `"cosine" \| "dotProduct" \| "euclidean"` | no | | Distance metric, on the manual path. Requires `embedding_dimensions`. No default: the right metric is a property of your embeddings. |
@@ -329,16 +330,59 @@ and behave as they do for any store, with one exception noted below.
 ### `MongoDBSearchQuery`
 
 Passed to `search()` instead of a plain string, when a per-query filter, limit or embedding is needed.
-Every key is optional, but exactly one of `text` and `vector` has to be set.
+Every key is optional, but at least one of `text` and `vector` has to be set. Setting both is valid only
+on a manual-vector store whose `search_type` is `"auto"` or `"hybrid"`, where the hybrid tier reads one
+key in each of its two pipelines; anywhere else it raises `ValueError`.
 
 <!-- keys: MongoDBSearchQuery -->
 | Key | Type | Required | Default | What it does |
 |---|---|---|---|---|
 | `text` | `str` | no | | The query text. What `search("...")` fills in. |
-| `vector` | `list[float]` | no | | A query embedding, on the manual-vector path. Mutually exclusive with `text`. |
+| `vector` | `list[float]` | no | | A query embedding, on the manual-vector path. Combined with `text` only by the hybrid tier, as above. |
 | `filter` | `dict[str, Any]` | no | | Narrows this query only. Same rules as the store's `filter`. |
 | `limit` | `int` | no | `10` | Result ceiling for this query. Outranks both `max_search_results` settings. |
 | `oversampling_factor` | `int` | no | `10` | Multiplier turning the limit into a `$vectorSearch` candidate count. |
+
+### `MongoDBStorage`
+
+`MongoDBStorage(config, /, *, collection="storage", prefix="", ttl_seconds=None)`. The config comes first
+and positionally, and can be the same object a memory store holds.
+
+| Argument | Type | Default | What it does |
+|---|---|---|---|
+| `config` | `MongoDBConfig` | | The connection. Only the connection keys matter here; the search keys are memory-only. |
+| `collection` | `str` | `storage` | Collection holding this instance's documents. |
+| `prefix` | `str` | `""` | Prepended to every key, scoping this instance inside the collection. Normalized to end in one `/`. |
+| `ttl_seconds` | `int \| None` | `None` | Lifetime of the documents this instance writes. Needs the TTL index; see Limits. |
+
+### What the methods return
+
+| Method | Returns |
+|---|---|
+| `MongoDBStorage.read(key)` | `bytes`, or `None` when the key is absent |
+| `MongoDBStorage.list(prefix)` | `list[str]` of keys |
+| `MongoDBStorage.search(query)` | `list[StorageSearchResult]`, the SDK's type |
+| `MongoDBStorage.delete_prefix(prefix)` | `int`, the documents removed |
+| `MongoDBStorage.namespace(prefix)` | A second `MongoDBStorage` over the same collection, scoped under `prefix` |
+| `MongoDBMemoryStore.add(content, metadata)` | `MongoDBAddResult`, with `ids`, `inserted` and `duplicates`. A fact already stored counts as a duplicate rather than a second write |
+| `MongoDBMemoryStore.search(query, options)` | `list[MemoryEntry]`, the SDK's type, carrying the reserved metadata keys below |
+| `MongoDBMemoryStore.delete(memory_id)` and `delete_all()` | `int`, the documents removed |
+
+Failures from the database come back as the SDK's `StorageError`, from `strands.types.exceptions`, with
+the namespace in the message. A caller mistake that no round trip could fix, such as an invalid query,
+is a `ValueError` raised before anything is sent.
+
+### Other public names
+
+| Name | Module | What it is |
+|---|---|---|
+| `SearchType` | `strands_mongodb.types` | The values `search_type` accepts: `auto`, `vector`, `text`, `hybrid` |
+| `ResolvedSearchType` | `strands_mongodb.types` | The tiers that can answer, as `_search_type` reports them |
+| `VectorSimilarity` | `strands_mongodb.types` | The metrics `similarity` accepts |
+| `RESERVED_METADATA_KEYS` | `strands_mongodb.types` | The four metadata keys this package owns |
+| `UNSCOPED` | `strands_mongodb.memory_store` | The scope stamped and filtered on when a store names none |
+| `MongoDBVectorSearchStrategy` | `strands_mongodb` | Declared for a later release, and raises when constructed |
+| `__version__` | `strands_mongodb` | The installed version |
 
 ## Search: what answers a query
 
@@ -407,8 +451,8 @@ await collection.update_one(
 )
 ```
 
-So in `0.1.0` the manual path is a `MongoDBStorage` and pipeline capability rather than a supported
-`MongoDBMemoryStore` configuration: the read half works and the write half is the caller's. The
+So in `0.1.0` the manual path is only half of a `MongoDBMemoryStore` configuration: the read half works
+and the write half is the caller's. The
 AutoEmbeddings default is unaffected, and is the supported memory configuration — there mongot embeds the
 indexed `content` field and the document carries no vector by design.
 
@@ -421,7 +465,7 @@ Every returned entry carries four keys this package owns in its `metadata`, beca
 |---|---|
 | `_relevance_score` | The score from whichever tier answered |
 | `_id` | The document id, which is also the `memory_id` that `delete()` takes |
-| `_search_type` | `vector` or `text`, whichever ran |
+| `_search_type` | `hybrid`, `vector` or `text`, whichever ran |
 | `_scope` | The scope of the store that answered, read from the store and never from the document |
 
 Your own metadata merges underneath these. On a name collision the reserved value wins and the collision
@@ -435,8 +479,8 @@ them:
 | Boundary | Configure | Enforced by |
 |---|---|---|
 | Database per tenant | `database` | MongoDB, if the tenant's user is scoped to that database |
-| Collection per tenant | `collection`, or `prefix` on storage | MongoDB, if privileges are per collection |
-| Scope inside one collection | `scope` on memory, `namespace()` on storage | This package |
+| Collection per tenant | `collection` | MongoDB, if privileges are per collection |
+| Scope inside one collection | `scope` on memory, `prefix` or `namespace()` on storage | This package |
 
 The third one is the cheapest and the one to understand before choosing it. MongoDB applies no
 server-side row filter, so a memory lands in the right scope because `add` put it there, and comes back
@@ -554,7 +598,7 @@ know whether the indexes are there, and what happens when one is absent depends 
 |---|---|---|
 | Ordinary and TTL | Creates what is missing, one `createIndexes` call per collection | Raises. The message is the list of `createIndexes` commands that fix it, one line each |
 | Search, under `search_type: "auto"` | Creates it, then polls until it is queryable | A warning naming the index, and that tier is dropped. The store starts and answers from the tier that is left; if neither is left it raises |
-| Search, under `search_type: "vector"` or `"text"` | Creates it, then polls until it is queryable | Raises. There is no second tier to fall back to, and answering from one you did not ask for changes what matches |
+| Search, under a named `search_type`: `"vector"`, `"text"` or `"hybrid"` | Creates it, then polls until it is queryable | Raises. There is no second tier to fall back to, and answering from one you did not ask for changes what matches |
 
 So verify mode is not a quiet mode. A missing ordinary index stops startup with a work order, because the
 alternative is worse than a late start: the uniqueness index behind `add`'s deduplication is one of them,
@@ -567,8 +611,11 @@ is visible only in your logs, so read the warnings.
 any operation: its collection has one ordinary index and no search index, so `ensure_indexes: False`
 there raises with the command for `strands_expires_at_ttl` and creates nothing.
 
-Waiting is bounded. `initialize()` polls a new search index every 0.5 s for up to 300 s, and past that it
-warns and returns rather than blocking your startup forever.
+Waiting is bounded. `initialize()` polls a new search index every 0.5 s for up to 300 s per index, and
+past that the index counts as unavailable. Under a named `search_type` that raises `StorageError`, and
+calling `initialize()` again keeps waiting. Under `"auto"` the tier is dropped with a warning, as a
+missing one is, and that store instance does not try it again; a store built after the index reports
+`READY` picks it up.
 
 ### Privileges
 
@@ -620,7 +667,9 @@ uses `remove`, which `readWrite` grants.
 ## Limits
 
 Everything a caller runs into that this package does not remove. Each row says what you can do about it,
-and the last column names the requirement or the id where the detail lives.
+and the last column names the requirement or the id where the detail lives. Where it names a
+constant instead, the constant may be private to the package: it is named so the value can be traced,
+not so it can be imported.
 
 <!-- limits -->
 | Limit | Where it bites, and what you can do | Source |
@@ -630,14 +679,15 @@ and the last column names the requirement or the id where the detail lives.
 | `close()` is scoped to the config | Closing one store's connection closes the pool that every store built from the same config is sharing. Siblings with an operation in flight are the ones that notice. | `REQ-E-017c` |
 | A memory is not searchable when `add()` returns | Atlas embeds and indexes asynchronously, about 15 s on the cluster this was developed against. Poll for the memory rather than reading straight back. | `REQ-E-091` |
 | An empty search result is ambiguous | `MemoryManager` turns a failed store into a warning and returns what survived, so zero hits can mean zero matches or a search that failed. Watch for `store search failed` in your logs. | `store search failed` |
-| Document size | 16 MB, the server's `BSON` ceiling. Checked before the write, so you get a `ValueError` naming the size instead of a driver error. Chunk, or store a pointer. | `MAX_DOCUMENT_BYTES` |
-| Storage key length | 1024 bytes, which keeps a key inside an index entry. Same early `ValueError`. | `MAX_KEY_BYTES` |
+| Document size | 16 MB, the server's `BSON` ceiling. Checked before the write, so you get the SDK's `StorageError` naming the size instead of a driver error. Chunk, or store a pointer. | `MAX_DOCUMENT_BYTES` |
+| Storage key length | 1024 bytes, which keeps a key inside an index entry. Same early `StorageError`. | `MAX_KEY_BYTES` |
 | `list()` is unpaginated | The SDK's protocol takes a prefix and no cursor, so a prefix matching a million keys returns a million keys. Use narrower prefixes, or `namespace()`. | `Storage.list()` |
 | On `MongoDBStorage`, `ttl_seconds` needs an index nothing creates implicitly | `write` stamps `expires_at`, and the documents stay until the storage collection has its TTL index. No ordinary operation creates it, so the documents stay forever if nothing does. Call `await storage.ensure_indexes()` once at startup, or run the command above. The memory store is the other way round: `initialize()` creates its TTL index unconditionally, so a `ttl_seconds` there expires from the first write with nothing to call. | `MongoDBStorage.ensure_indexes()` |
 | Vector dimensions | 8192 on the manual vector path, rejected at configuration time rather than by the server. | `MAX_DIMENSIONS` |
 | Results per search | 10 by default. Raise `max_search_results` on the store, or `limit` on a single query. | `DEFAULT_MAX_SEARCH_RESULTS` |
 | Vector candidates considered | 10 per result requested. Raise `oversampling_factor` for recall, lower it for latency. | `DEFAULT_OVERSAMPLING_FACTOR` |
-| Waiting for a search index | 300 s, then `initialize()` warns and returns rather than blocking your startup. The index keeps building; the first queries are the ones that miss. Set `index_ready_timeout` to change it. | `READY_TIMEOUT_SECONDS` |
+| Vector candidates per query | 10000, the server's `numCandidates` ceiling. A `limit` times `oversampling_factor` above it raises `ValueError` before the query is sent. Lower one of the two. | `MAX_NUM_CANDIDATES` |
+| Waiting for a search index | 300 s per index. Past that, `initialize()` raises `StorageError` under a named `search_type`, and under `"auto"` drops the tier with a warning for the life of that store instance. The index keeps building either way. Set `index_ready_timeout` to change it. | `READY_TIMEOUT_SECONDS` |
 
 ## Observability
 
@@ -658,7 +708,8 @@ StrandsTelemetry().setup_otlp_exporter()
 ```
 
 Or install a `TracerProvider` yourself. The tracer is looked up on every call, so it does not matter
-whether that happens before or after this package is imported:
+whether that happens before or after this package is imported. `opentelemetry-sdk` is not a dependency
+of this package; the snippet below works because `strands-agents` already requires it:
 
 <!-- run: unit -->
 ```python
@@ -680,14 +731,14 @@ trace.set_tracer_provider(provider)
 | `strands_mongodb.storage.search` | `MongoDBStorage.search()` |
 | `strands_mongodb.storage.delete_prefix` | `MongoDBStorage.delete_prefix()` |
 | `strands_mongodb.storage.ensure_indexes` | `MongoDBStorage.ensure_indexes()` |
-| `strands_mongodb.memory.initialize` | `MongoDBMemoryStore.initialize()`, only on the call that does the setup. `add()` and `search()` call it every time, and every call after the first records nothing. |
+| `strands_mongodb.memory.initialize` | `MongoDBMemoryStore.initialize()`, only on calls that reach the setup lock: the one that does the setup, and any that queued behind it and record a short span spent waiting. Every operation calls it, and once setup is done the calls record nothing. |
 | `strands_mongodb.memory.add` | `MongoDBMemoryStore.add()` |
 | `strands_mongodb.memory.search` | `MongoDBMemoryStore.search()` |
 | `strands_mongodb.memory.delete` | `MongoDBMemoryStore.delete()` |
 | `strands_mongodb.memory.delete_all` | `MongoDBMemoryStore.delete_all()` |
 | `strands_mongodb.indexes.ensure` | Creating or checking indexes, inside `memory.initialize` or `storage.ensure_indexes` |
 | `strands_mongodb.indexes.probe` | Asking the deployment what it supports: Atlas Search, `$rankFusion`, or the collection's collation |
-| `strands_mongodb.indexes.wait` | Waiting for search indexes to finish building. One span for the whole wait, not one per poll. |
+| `strands_mongodb.indexes.wait` | Waiting for a search index to finish building. One span per index waited on, not one per poll. |
 
 The three `indexes.*` spans are children of the operation that needed them, so a slow first `search()`
 shows where its time went.
@@ -711,7 +762,7 @@ package does not duplicate either.
 | `strands_mongodb.duplicate` | `memory.add` | Whether the fact was already stored, so nothing was written |
 | `strands_mongodb.indexes.mode` | `indexes.ensure` | `ensure`, or `verify` when `ensure_indexes` is `False` |
 | `strands_mongodb.indexes.created` | `indexes.ensure` | Indexes this call created, `0` when they were all there |
-| `strands_mongodb.indexes.outcome` | `indexes.wait` | `ready`, or `timed_out` when `index_ready_timeout` ran out |
+| `strands_mongodb.indexes.outcome` | `indexes.wait` | `ready`, or `timed_out` when `index_ready_timeout` ran out. Absent when a build reports `FAILED`, which ends the span in `ERROR` instead |
 | `strands_mongodb.indexes.probe` | `indexes.probe` | `search`, `rank_fusion` or `collation` |
 | `strands_mongodb.client.injected` | the `client.acquired` event | Whether you supplied the `client` |
 | `error.type` | a failed span | The exception's qualified class name |
@@ -739,8 +790,9 @@ does its setup in `memory.initialize`, so the event lands on that span rather th
 record on, and its first operation takes over the pool construction built, which creates nothing. The
 driver connects lazily, so the cost of connecting sits inside the first operation's span either way.
 
-Log records keep their messages, levels and logger names, and each one also carries fields a JSON
-formatter can index without parsing the message: `strands_mongodb_event`, always, and
+Log records keep their messages, levels and logger names, which are the module names under
+`strands_mongodb`, so a handler on `logging.getLogger("strands_mongodb")` sees every one. Each record
+also carries fields a JSON formatter can index without parsing the message: `strands_mongodb_event`, always, and
 `strands_mongodb_namespace` (`<database>.<collection>`) and `strands_mongodb_tier` where the record is
 about one. The event names are stable:
 
@@ -784,6 +836,10 @@ connecting to anything.
 |---|---|
 | Python | >= 3.10 |
 | `strands-agents` | >= 1.54.0, the first release shipping every `strands` module the storage backend imports |
+| `pymongo` | >= 4.14.0, the async driver both stores run on |
+| `pymongo-search-utils` | >= 0.3.0, pulled in by the `memory` extra (and so by `all`) only |
+| `typing-extensions` | >= 4.13.2 |
+| `opentelemetry-api` | >= 1.30.0. The API only: this package installs no SDK, provider or exporter |
 | MongoDB | Any deployment serves storage. The text tier needs Atlas Search; the vector tier needs Atlas or an Atlas CLI local deployment. The default embedding path also needs a model registered on the cluster, measured present on Atlas and absent on a local `mongot` 8.3.8. |
 
 ## Development
