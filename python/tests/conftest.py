@@ -39,6 +39,7 @@ at a plain deployment for the first time found one class relying on the wider ga
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
 import subprocess
@@ -51,12 +52,10 @@ from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 import pytest
 from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 if TYPE_CHECKING:
-    from opentelemetry.sdk.trace import ReadableSpan
     from pymongo import AsyncMongoClient
 
 # tests/ -> python/
@@ -840,33 +839,59 @@ def rendered(span: ReadableSpan) -> str:
     return "\n".join(parts)
 
 
-@pytest.fixture
-def exported_spans() -> Iterator[InMemorySpanExporter]:
-    """Put an in-memory exporter behind the *global* tracer provider, and take it out again.
+class _ForwardingProcessor(SpanProcessor):
+    """The one processor this harness adds to the global provider, sending each span to whichever test is reading.
 
-    Global, because that is the only provider package code would ever reach:
-    ``trace.get_tracer(__name__)`` and ``trace.get_current_span()`` both read it, so a provider kept local
-    to this test would leave a leak writing somewhere nobody was watching.
+    One, not one per test. A processor cannot be removed from a provider once added, so a fresh
+    ``SimpleSpanProcessor`` per test left every earlier one in place, and by the end of the suite each span
+    was offered to several hundred shut-down exporters.
+    """
+
+    def __init__(self) -> None:
+        self.exporter: InMemorySpanExporter | None = None
+
+    def on_end(self, span: ReadableSpan) -> None:
+        if self.exporter is not None:
+            self.exporter.export((span,))
+
+
+_FORWARDER: Final = _ForwardingProcessor()
+_INSTALLED = False
+
+
+@contextlib.contextmanager
+def capturing_spans() -> Iterator[InMemorySpanExporter]:
+    """Point the harness's processor at a fresh in-memory exporter for the body of the ``with``.
+
+    The processor goes onto the *global* tracer provider, because that is the only provider package code
+    would ever reach: ``trace.get_tracer(__name__)`` and ``trace.get_current_span()`` both read it, so a
+    provider kept local to this test would leave a leak writing somewhere nobody was watching.
 
     Two paths, because both states occur. A fresh interpreter has a ``ProxyTracerProvider`` and takes
-    ``set_tracer_provider``; a suite that already configured tracing has a real one and takes another
+    ``set_tracer_provider``; a suite that already configured tracing has a real one and takes the
     processor. Measured on 1.44.0: importing ``strands`` does not install a provider, so the first path is
-    the one the unit tier takes.
-
-    ``set_tracer_provider`` cannot be undone, so teardown shuts the exporter down and leaves the provider
-    in place. A shut-down ``InMemorySpanExporter`` records nothing, and the tests that read spans all take
-    this fixture.
+    the one the unit tier takes. Either way it happens once per process.
     """
+    global _INSTALLED
+    if not _INSTALLED:
+        provider = trace.get_tracer_provider()
+        if isinstance(provider, TracerProvider):
+            provider.add_span_processor(_FORWARDER)
+        else:
+            installed = TracerProvider()
+            installed.add_span_processor(_FORWARDER)
+            trace.set_tracer_provider(installed)
+        _INSTALLED = True
     exporter = InMemorySpanExporter()
-    processor = SimpleSpanProcessor(exporter)
-    provider = trace.get_tracer_provider()
-    if isinstance(provider, TracerProvider):
-        provider.add_span_processor(processor)
-    else:
-        installed = TracerProvider()
-        installed.add_span_processor(processor)
-        trace.set_tracer_provider(installed)
+    _FORWARDER.exporter = exporter
     try:
         yield exporter
     finally:
-        processor.shutdown()
+        _FORWARDER.exporter = None
+
+
+@pytest.fixture
+def exported_spans() -> Iterator[InMemorySpanExporter]:
+    """An in-memory exporter receiving every span the package records during the test. See ``capturing_spans``."""
+    with capturing_spans() as exporter:
+        yield exporter

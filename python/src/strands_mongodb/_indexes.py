@@ -37,6 +37,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple
 
+from strands_mongodb import _telemetry
 from strands_mongodb._extras import missing_extra
 from strands_mongodb._filter import BAKED_IN_FILTER_FIELDS
 
@@ -54,6 +55,7 @@ except ImportError as error:  # pragma: no cover - exercised in a subprocess by 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+    from opentelemetry.util.types import AttributeValue
     from pymongo.asynchronous.collection import AsyncCollection
 
     from strands_mongodb.types import MongoDBConfig
@@ -665,6 +667,12 @@ async def search_support(collection: AsyncCollection[Any]) -> SearchSupport:
         StorageError: If the call fails for any other reason, including authentication. A probe that
             reported ``False`` on a bad password would send the caller looking for the wrong problem.
     """
+    with _telemetry.span("strands_mongodb.indexes.probe", _probe_attributes(collection, "search")):
+        return await _search_support(collection)
+
+
+async def _search_support(collection: AsyncCollection[Any]) -> SearchSupport:
+    """The body of :func:`search_support`, inside its probe span."""
     try:
         cursor = await collection.list_search_indexes()
         async for _ in cursor:
@@ -735,6 +743,12 @@ async def read_collation(collection: AsyncCollection[Any]) -> CollationReport:
             absent collection is an empty result rather than an error, so anything that arrives here is
             a real failure and reporting the collection as uncollated would be reporting a guess.
     """
+    with _telemetry.span("strands_mongodb.indexes.probe", _probe_attributes(collection, "collation")):
+        return await _read_collation(collection)
+
+
+async def _read_collation(collection: AsyncCollection[Any]) -> CollationReport:
+    """The body of :func:`read_collation`, inside its probe span."""
     try:
         cursor = await collection.database.list_collections(filter={"name": collection.name})
         async for document in cursor:
@@ -836,6 +850,12 @@ async def rank_fusion_support(collection: AsyncCollection[Any]) -> bool:
     Returns:
         ``True`` if the server reports major version :data:`RANK_FUSION_MIN_MAJOR` or later.
     """
+    with _telemetry.span("strands_mongodb.indexes.probe", _probe_attributes(collection, "rank_fusion")):
+        return await _rank_fusion_support(collection)
+
+
+async def _rank_fusion_support(collection: AsyncCollection[Any]) -> bool:
+    """The body of :func:`rank_fusion_support`, inside its probe span."""
     try:
         build_info = await collection.database.command("buildInfo")
     except PyMongoError:
@@ -889,13 +909,40 @@ async def ensure(
             ``False``, or if the driver refuses a call. Driver errors arrive chained, so the server's
             own code and message survive.
     """
-    if ordinary:
-        await _ensure_ordinary(collection, tuple(ordinary), create=create)
-    if search:
-        await _ensure_search(collection, tuple(search), create=create, timeout=timeout, interval=interval)
+    attributes = _namespace_attributes(collection)
+    attributes["strands_mongodb.indexes.mode"] = "ensure" if create else "verify"
+    # A list rather than an int, so the two helpers can add to it and the count still reaches the span when
+    # one of them raises part way through: a failed call that created two indexes created two indexes.
+    created: list[int] = []
+    with _telemetry.span("strands_mongodb.indexes.ensure", attributes):
+        try:
+            if ordinary:
+                await _ensure_ordinary(collection, tuple(ordinary), create=create, created=created)
+            if search:
+                await _ensure_search(
+                    collection, tuple(search), create=create, timeout=timeout, interval=interval, created=created
+                )
+        finally:
+            _telemetry.annotate("strands_mongodb.indexes.created", sum(created))
 
 
-async def _ensure_ordinary(collection: AsyncCollection[Any], specs: tuple[IndexSpec, ...], *, create: bool) -> None:
+def _namespace_attributes(collection: AsyncCollection[Any]) -> dict[_telemetry.Attribute, AttributeValue]:
+    """The database and collection, which every index span carries."""
+    return {"strands_mongodb.database": collection.database.name, "strands_mongodb.collection": collection.name}
+
+
+def _probe_attributes(
+    collection: AsyncCollection[Any], probe: Literal["search", "rank_fusion", "collation"]
+) -> dict[_telemetry.Attribute, AttributeValue]:
+    """A probe span's attributes: the namespace and what it probed."""
+    attributes = _namespace_attributes(collection)
+    attributes["strands_mongodb.indexes.probe"] = probe
+    return attributes
+
+
+async def _ensure_ordinary(
+    collection: AsyncCollection[Any], specs: tuple[IndexSpec, ...], *, create: bool, created: list[int]
+) -> None:
     """Create or verify the ordinary indexes, matching on the key list (``REQ-E-063``)."""
     namespace = f"{collection.database.name}.{collection.name}"
     present = await _guard(collection.index_information(), what=f"reading indexes on {namespace}")
@@ -924,6 +971,7 @@ async def _ensure_ordinary(collection: AsyncCollection[Any], specs: tuple[IndexS
         len(missing),
         namespace,
         ", ".join(spec.name for spec in missing),
+        extra=_telemetry.event_extra("creating_indexes", namespace=namespace),
     )
     # One call for all of them. Three round trips where one would do is three chances for a partial
     # result to leave the collection half indexed, and the server tolerates a concurrent identical
@@ -932,6 +980,7 @@ async def _ensure_ordinary(collection: AsyncCollection[Any], specs: tuple[IndexS
         collection.create_indexes([spec.to_model() for spec in missing]),
         what=f"creating indexes on {namespace}",
     )
+    created.append(len(missing))
 
 
 def _folding_locale(found: Mapping[str, Any]) -> str | None:
@@ -1154,6 +1203,7 @@ async def _ensure_search(
     create: bool,
     timeout: float,
     interval: float,
+    created: list[int],
 ) -> None:
     """Create or verify the Atlas Search indexes, then wait for anything still building."""
     namespace = f"{collection.database.name}.{collection.name}"
@@ -1180,15 +1230,36 @@ async def _ensure_search(
         # while `createIndexes` in the same position creates the collection implicitly (REQ-E-068).
         await _create_collection(collection, namespace)
         for spec in missing:
-            logger.info("strands_mongodb: creating %s index %r on %s", spec.type, spec.name, namespace)
+            logger.info(
+                "strands_mongodb: creating %s index %r on %s",
+                spec.type,
+                spec.name,
+                namespace,
+                extra=_telemetry.event_extra("creating_search_index", namespace=namespace),
+            )
             await _guard(
                 collection.create_search_index(spec.to_model()),
                 what=f"creating search index {spec.name!r} on {namespace}",
             )
+            created.append(1)
         waiting.extend(missing)
 
-    if waiting:
-        await _wait_until_ready(collection, waiting, namespace, timeout=timeout, interval=interval)
+    if not waiting:
+        return
+    # The timeout is raised here, after the wait span has closed, and not inside it. A wait that ran out is
+    # an outcome of the wait rather than a failure of it (REQ-E-204): the span says `timed_out` and keeps
+    # its status unset, and the error belongs to the `ensure` span, which is the call that gives up.
+    with _telemetry.span("strands_mongodb.indexes.wait", _namespace_attributes(collection)):
+        stuck = await _wait_until_ready(collection, waiting, namespace, timeout=timeout, interval=interval)
+        _telemetry.annotate("strands_mongodb.indexes.outcome", "ready" if stuck is None else "timed_out")
+    if stuck is not None:
+        raise StorageError(
+            f"strands_mongodb: waited {timeout}s for {len(stuck)} search index(es) on "
+            f"{namespace} to report READY and they did not: {', '.join(stuck)}. BUILDING at this point means "
+            f"a build slower than the timeout, and initialize() can simply be called again to keep "
+            f"waiting. Any other status is worth reading directly with "
+            f"db.{collection.name}.getSearchIndexes()."
+        )
 
 
 async def _read_search_index(collection: AsyncCollection[Any], name: str, namespace: str) -> dict[str, Any] | None:
@@ -1352,7 +1423,7 @@ async def _wait_until_ready(
     *,
     timeout: float,
     interval: float,
-) -> None:
+) -> list[str] | None:
     """Poll until every index reports READY, or until ``timeout`` (``REQ-E-062``, ``REQ-E-066``).
 
     ``asyncio.sleep`` rather than ``time.sleep``. That single substitution is most of what
@@ -1365,6 +1436,14 @@ async def _wait_until_ready(
     Readiness is a claim about two things, so both are checked before an index leaves ``pending``: the
     status the server reports, and the definition it reports alongside it (``REQ-E-175``). See the
     comment on the ``ready`` branch for what drifts and how.
+
+    Returns:
+        ``None`` once every index is ready, or ``"<name> is <status>"`` for each one still pending when the
+        deadline passed. The caller raises on the second, once its wait span has recorded the outcome.
+
+    Raises:
+        StorageError: If a build reports FAILED, if a ready index's definition does not cover the declared
+            one, or if a read fails.
     """
     deadline = time.monotonic() + timeout
     pending = {spec.name: spec for spec in specs}
@@ -1379,7 +1458,13 @@ async def _wait_until_ready(
             # race whoever is holding the other end of that drop.
             status = "absent" if document is None else str(document.get("status", "unreported"))
             if status != last.get(name):
-                logger.info("strands_mongodb: search index %r on %s is %s", name, namespace, status)
+                logger.info(
+                    "strands_mongodb: search index %r on %s is %s",
+                    name,
+                    namespace,
+                    status,
+                    extra=_telemetry.event_extra("search_index_status", namespace=namespace),
+                )
                 last[name] = status
             state = readiness(status)
             if state == "failed":
@@ -1408,16 +1493,9 @@ async def _wait_until_ready(
                 del pending[name]
 
         if not pending:
-            return
+            return None
         if time.monotonic() >= deadline:
-            stuck = ", ".join(f"{name} is {last[name]}" for name in pending)
-            raise StorageError(
-                f"strands_mongodb: waited {timeout}s for {len(pending)} search index(es) on "
-                f"{namespace} to report READY and they did not: {stuck}. BUILDING at this point means "
-                f"a build slower than the timeout, and initialize() can simply be called again to keep "
-                f"waiting. Any other status is worth reading directly with "
-                f"db.{collection.name}.getSearchIndexes()."
-            )
+            return [f"{name} is {last[name]}" for name in pending]
         await asyncio.sleep(interval)
 
 

@@ -40,6 +40,10 @@ The first version with working code in it. Planned, not released.
   not be issued from there.
 - `appName` attribution on every client the package builds from a connection string: `strands-mongodb`,
   or the caller's own value with `-strands-mongodb` appended. An injected client is left as it is.
+- OpenTelemetry spans for every public operation of both stores, and for the index work they cause,
+  on your application's tracer provider. The package configures no provider. Keys, content, queries,
+  scopes and credentials are never recorded. Every log record also carries a stable
+  `strands_mongodb_event` field for JSON log pipelines.
 - [MIGRATION.md](MIGRATION.md), mapping three existing MongoDB memory packages onto this one.
 
 ### Not included
