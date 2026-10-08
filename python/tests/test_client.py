@@ -23,9 +23,8 @@ from typing import TYPE_CHECKING, Any, Final
 
 import pymongo
 import pytest
+from conftest import rendered
 from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import Status, StatusCode
 from pymongo import AsyncMongoClient
@@ -37,7 +36,7 @@ from strands_mongodb.memory_store import MongoDBMemoryStore
 from strands_mongodb.storage import MongoDBStorage
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Sequence
 
     from opentelemetry.sdk.trace import ReadableSpan
 
@@ -1129,36 +1128,6 @@ class TestTheCredentialsTheUriRedactionDoesNotCover:
 LEAKY_UNREACHABLE = "mongodb://appuser:SUPERSECRET@127.0.0.1:1/?serverSelectionTimeoutMS=50"
 
 
-def _rendered(span: ReadableSpan) -> str:
-    """Return every string a span carries, joined, ready for a substring scan.
-
-    Written from the ``ReadableSpan`` surface rather than from the setters, so a value reaches the scan the
-    same way whatever route put it there. Verified against opentelemetry-sdk 1.44.0: ``attributes`` and an
-    event's ``attributes`` are both ``None`` on a span that never set any, and ``status.description`` is
-    ``None`` until a status carries one.
-
-    ``resource.attributes`` is deliberately not read. Those come from the host's ``Resource``, which this
-    package never touches, and they carry a ``service.instance.id`` that changes per process.
-
-    Args:
-        span: A finished span, as the exporter received it.
-
-    Returns:
-        One string holding the span's name, its status description, its instrumentation scope, and the
-        keys and values of its own attributes, of every event, and of every link.
-    """
-    parts = [span.name, str(span.status.description or "")]
-    parts += [f"{key}={value!r}" for key, value in (span.attributes or {}).items()]
-    for event in span.events:
-        parts.append(event.name)
-        parts += [f"{key}={value!r}" for key, value in (event.attributes or {}).items()]
-    for link in span.links:
-        parts += [f"{key}={value!r}" for key, value in (link.attributes or {}).items()]
-    if span.instrumentation_scope is not None:
-        parts.append(span.instrumentation_scope.name)
-    return "\n".join(parts)
-
-
 def _assert_no_span_leaks(spans: Sequence[ReadableSpan]) -> None:
     """Assert no span renders the password.
 
@@ -1170,39 +1139,7 @@ def _assert_no_span_leaks(spans: Sequence[ReadableSpan]) -> None:
             read in CI output, which is one of the places the password must not reach.
     """
     for span in spans:
-        assert "SUPERSECRET" not in _rendered(span), f"span {span.name!r} leaked the password"
-
-
-@pytest.fixture
-def exported_spans() -> Iterator[InMemorySpanExporter]:
-    """Put an in-memory exporter behind the *global* tracer provider, and take it out again.
-
-    Global, because that is the only provider package code would ever reach:
-    ``trace.get_tracer(__name__)`` and ``trace.get_current_span()`` both read it, so a provider kept local
-    to this test would leave a leak writing somewhere nobody was watching.
-
-    Two paths, because both states occur. A fresh interpreter has a ``ProxyTracerProvider`` and takes
-    ``set_tracer_provider``; a suite that already configured tracing has a real one and takes another
-    processor. Measured on 1.44.0: importing ``strands`` does not install a provider, so the first path is
-    the one the unit tier takes.
-
-    ``set_tracer_provider`` cannot be undone, so teardown shuts the exporter down and leaves the provider
-    in place. A shut-down ``InMemorySpanExporter`` records nothing, and no other test in this suite emits
-    or reads a span.
-    """
-    exporter = InMemorySpanExporter()
-    processor = SimpleSpanProcessor(exporter)
-    provider = trace.get_tracer_provider()
-    if isinstance(provider, TracerProvider):
-        provider.add_span_processor(processor)
-    else:
-        installed = TracerProvider()
-        installed.add_span_processor(processor)
-        trace.set_tracer_provider(installed)
-    try:
-        yield exporter
-    finally:
-        processor.shutdown()
+        assert "SUPERSECRET" not in rendered(span), f"span {span.name!r} leaked the password"
 
 
 class TestNoSpanCarriesThePassword:
@@ -1215,15 +1152,12 @@ class TestNoSpanCarriesThePassword:
     and both of those pass the store instances themselves as subjects, which is what covers ``repr``. No
     test in the suite had ever created a span.
 
-    Measured before writing this: ``src/strands_mongodb/`` contains no occurrence of ``opentelemetry``,
-    ``otel``, ``span`` or ``tracer``. The package emits no spans of its own, and that is deliberate rather
-    than pending, since a partner package must not bring an OTel dependency or configure
-    exporters of its own.
+    Written before the package emitted spans of its own. It now does, through ``_telemetry``, and
+    ``test_telemetry.py`` holds the sweep over them; this class still owns the case it was written for, a
+    password reaching a span by any route at all.
 
-    So this is a tripwire for a leak that does not exist yet, which is the case for writing it now. A
-    package that may not configure an exporter, and later wants to record an operation name and a duration,
-    has one place to put them: the span already current on the calling thread. Whoever adds that line will
-    have the config in scope, and will be adding it to a module whose tests are all about queries.
+    It stays a tripwire. The package now records on the span current at each call, and the config with the
+    password in it is in scope at every one of those call sites.
     """
 
     @pytest.mark.parametrize("surface", ["name", "attribute", "event", "status"])
@@ -1321,7 +1255,7 @@ class TestNoSpanCarriesThePassword:
     ) -> None:
         """The same exercise where every call works, which is the half the failing path cannot cover.
 
-        The instrumentation a later version would add records an operation name, a duration and a result count.
+        The package's spans record an operation name, a duration and a result count.
         Two of those three are only known once a call has succeeded, so a leak could plausibly live on a
         line that a failing exercise never reaches. This is that line's coverage.
 

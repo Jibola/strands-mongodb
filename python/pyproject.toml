@@ -83,11 +83,16 @@ storage = [
     "strands-agents>=1.54.0",
     "pymongo>=4.14.0",
     "typing-extensions>=4.13.2",
+    # `_telemetry` imports it directly, so it is named rather than inherited from strands-agents. The floor
+    # is theirs, so no resolution changes. The SDK, and every exporter, stay the application's choice.
+    "opentelemetry-api>=1.30.0",
 ]
 memory = [
     "strands-agents>=1.54.0",
     "pymongo>=4.14.0",
     "typing-extensions>=4.13.2",
+    # As in `storage`.
+    "opentelemetry-api>=1.30.0",
     # Atlas $vectorSearch / $search stage builders, maintained by MongoDB.
     "pymongo-search-utils>=0.3.0",
 ]
@@ -114,11 +119,9 @@ dev = [
     # Declared rather than silenced with an override: the stubs are what let the workflow tests be checked
     # at the same strictness as everything else.
     "types-PyYAML>=6.0.0",
-    # tests/test_client.py builds a real span pipeline for AT-117 / REQ-E-114 (the fourth surface a password can reach).
-    # Same reason as PyYAML above: importable today only because strands-agents pins it. The floor matches
-    # theirs, and `InMemorySpanExporter` has been at opentelemetry.sdk.trace.export.in_memory_span_exporter
-    # across that range. This adds nothing to any runtime extra: a partner package must not bring
-    # its own OTel dependency, and `dependencies`, `storage`, `memory` and `all` are all unchanged.
+    # The tests build a real span pipeline: test_client.py's password tripwire and test_telemetry.py's
+    # spans. The SDK is a test dependency only. The runtime extras name `opentelemetry-api`, which is the
+    # part the package imports; a provider, a processor and an exporter are the application's to choose.
     "opentelemetry-sdk>=1.30.0",
     # Five test modules parse this file to check it against the workflow, the README and the examples.
     # `tomllib` is 3.11+, so on the oldest interpreter the package supports those assertions were skipped

@@ -33,7 +33,7 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 from strands.memory.types import MemoryEntry
 from strands.types.exceptions import StorageError
 
-from . import _client, _filter, _indexes, _pipeline
+from . import _client, _filter, _indexes, _pipeline, _telemetry
 from .types import DEFAULT_MAX_SEARCH_RESULTS, DEFAULT_OVERSAMPLING_FACTOR, MongoDBAddResult
 
 if TYPE_CHECKING:
@@ -514,7 +514,6 @@ class MongoDBMemoryStore:
         # (`REQ-E-015`) instead of at the first `add`.
         _client.resolve(connection)
 
-    @_reporting("initializing")
     async def initialize(self) -> None:
         """Probe the deployment and create this store's indexes, once (``REQ-E-052``, ``REQ-E-065``).
 
@@ -542,7 +541,19 @@ class MongoDBMemoryStore:
         """
         if self._initialized:
             return
+        await self._initialize()
 
+    @_telemetry.traced("memory", "initialize")
+    @_reporting("initializing")
+    async def _initialize(self) -> None:
+        """The locked half of :meth:`initialize`, and the only half that records a span.
+
+        Split from the fast path so a span costs nothing on the calls that do nothing: ``search`` and
+        ``add`` come through here on every request, and every one after the first returns above. A caller
+        that waited on the lock and found the work done records a short span, which is accurate. It spent
+        that time waiting.
+        """
+        _telemetry.annotate("strands_mongodb.search.requested", self._search_type)
         # Bound once, not re-read through the property at each step. `_connection` resolves per running
         # event loop and this whole block runs on one, so the three reads would return the same object
         # anyway; binding says so, and keeps the lock, the probe and the cache write on one connection
@@ -612,6 +623,9 @@ class MongoDBMemoryStore:
             if not verified and await _indexes.require_binary_comparison(collection):
                 connection.binary_keys.add(target)
 
+            # Comma-separated, and empty on a deployment with no search. The tiers that came up, which on an
+            # `auto` store is how a dashboard tells a degraded store from a healthy one.
+            _telemetry.annotate("strands_mongodb.search.tiers", ",".join(self._tiers))
             self._initialized = True
 
     async def _ensure_search_tiers(
@@ -732,6 +746,7 @@ class MongoDBMemoryStore:
         logger.warning(_BOUND_DECLINED_FUSION, self._target, bound, getattr(self, bound))
         return False
 
+    @_telemetry.traced("memory", "add")
     @_reporting("adding a memory to")
     async def add(self, content: str, metadata: Metadata | None = None) -> MongoDBAddResult:
         """Store one memory, at most once per scope (``REQ-E-042``, ``REQ-E-043``).
@@ -815,6 +830,7 @@ class MongoDBMemoryStore:
 
         if result.upserted_id is None:
             return await self._existing(collection, selector)
+        _telemetry.annotate("strands_mongodb.duplicate", False)
         return MongoDBAddResult(ids=[str(result.upserted_id)], inserted=1, duplicates=0)
 
     async def _existing(
@@ -836,8 +852,10 @@ class MongoDBMemoryStore:
         """
         document = await collection.find_one(dict(selector), {"_id": 1})
         ids = [] if document is None else [str(document["_id"])]
+        _telemetry.annotate("strands_mongodb.duplicate", True)
         return MongoDBAddResult(ids=ids, inserted=0, duplicates=1)
 
+    @_telemetry.traced("memory", "search")
     @_reporting("searching")
     async def search(self, query: str | MongoDBSearchQuery, options: SearchOptions | None = None) -> list[MemoryEntry]:
         """Answer a query from whichever prepared tier fits it (``REQ-E-040``, ``REQ-E-041``).
@@ -898,6 +916,8 @@ class MongoDBMemoryStore:
 
         await self.initialize()
         tier = self._pick_tier(query_text=query_text, query_vector=query_vector)
+        _telemetry.annotate("strands_mongodb.search.requested", self._search_type)
+        _telemetry.annotate("strands_mongodb.search.tier", tier)
         if tier == "hybrid":
             # Not None on this branch: `_pick_tier` returns "hybrid" only where both keys its two
             # branches need are present.
@@ -957,7 +977,9 @@ class MongoDBMemoryStore:
             )
             scored.append((score, entry))
 
-        return self._within_bounds(scored)
+        results = self._within_bounds(scored)
+        _telemetry.annotate("strands_mongodb.result_count", len(results))
+        return results
 
     def _pick_tier(self, *, query_text: str | None, query_vector: list[float] | None) -> ResolvedSearchType:
         """Choose the prepared tier that can answer this query (``REQ-E-054``, ``REQ-E-066``).
@@ -1073,6 +1095,7 @@ class MongoDBMemoryStore:
             logger.debug(_SCORE_BOUND_APPLIED, name, bound, self._target, len(kept), len(scored))
         return kept
 
+    @_telemetry.traced("memory", "delete")
     @_reporting("deleting a memory from")
     async def delete(self, memory_id: str) -> int:
         """Remove one memory this store can see, named by the id ``search`` reported (``REQ-E-076``).
@@ -1116,8 +1139,10 @@ class MongoDBMemoryStore:
         await self.initialize()
         predicate = _filter.compose(self.filter, scope=self.scope, store_name=self.name)
         result = await self._collection().delete_one({**predicate, "_id": object_id})
+        _telemetry.annotate("strands_mongodb.deleted_count", result.deleted_count)
         return result.deleted_count
 
+    @_telemetry.traced("memory", "delete_all")
     @_reporting("deleting every memory in")
     async def delete_all(self) -> int:
         """Remove every memory this store can see (``REQ-E-077``).
@@ -1144,6 +1169,7 @@ class MongoDBMemoryStore:
         await self.initialize()
         predicate = _filter.compose(self.filter, scope=self.scope, store_name=self.name)
         result = await self._collection().delete_many(predicate)
+        _telemetry.annotate("strands_mongodb.deleted_count", result.deleted_count)
         return result.deleted_count
 
     def get_tools(self) -> list[AgentTool]:

@@ -169,6 +169,7 @@ class TestARealFailedImportProducesTheActionableMessage:
             ("strands_mongodb.memory_store", "pymongo_search_utils", "memory"),
             ("strands_mongodb.types", "strands", "storage"),
             ("strands_mongodb._client", "pymongo", "storage"),
+            ("strands_mongodb._telemetry", "opentelemetry", "storage"),
         ],
     )
     def test_importing_the_surface_without_its_dependency_names_the_extra(

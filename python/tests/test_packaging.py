@@ -307,11 +307,17 @@ class TestExtras:
         the split buys the user something.
 
         ``typing-extensions`` joined this set later (see
-        ``test_every_directly_imported_third_party_module_is_declared``).
+        ``test_every_directly_imported_third_party_module_is_declared``). ``opentelemetry-api`` joined it
+        with the package's own spans (``AT-212``).
         """
         by_extra = _requirements_by_extra(dist_metadata)
 
-        assert _distribution_names(by_extra["storage"]) == {"strands-agents", "pymongo", "typing-extensions"}
+        assert _distribution_names(by_extra["storage"]) == {
+            "strands-agents",
+            "pymongo",
+            "typing-extensions",
+            "opentelemetry-api",
+        }
 
     def test_every_directly_imported_third_party_module_is_declared(self, dist_metadata: PackageMetadata) -> None:
         """REQ-E-002 — a dependency we ``import`` is one we name, not one we inherit.
@@ -330,6 +336,18 @@ class TestExtras:
 
         for extra in ("storage", "memory"):
             assert "typing-extensions" in _distribution_names(by_extra[extra]), sorted(by_extra[extra])
+
+    def test_both_store_extras_declare_the_tracing_api_they_import(self, dist_metadata: PackageMetadata) -> None:
+        """AT-212 / REQ-E-207 — ``_telemetry`` imports ``opentelemetry``, so both extras name it.
+
+        The same argument as ``typing-extensions`` above. ``strands-agents`` brings it today, and that is a
+        fact about their release rather than a promise to us. The floor is theirs, so declaring it changes no
+        resolution. The bare install is unaffected: ``dependencies`` is asserted empty elsewhere.
+        """
+        by_extra = _requirements_by_extra(dist_metadata)
+
+        for extra in ("storage", "memory"):
+            assert "opentelemetry-api>=1.30.0" in by_extra[extra], sorted(by_extra[extra])
 
     def test_all_extra_is_self_referential_in_the_manifest(self, manifest: dict[str, Any]) -> None:
         """The manifest expresses ``all`` by reference, so the union cannot drift by editing one list.

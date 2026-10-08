@@ -39,7 +39,7 @@ from strands.storage.search.keyword import tokenize
 from strands.storage.storage import _NAMESPACED, StorageSearchResult, _normalize_key, _normalize_prefix
 from strands.types.exceptions import StorageError
 
-from . import _client, _indexes
+from . import _client, _indexes, _telemetry
 from ._indexes import EXPIRES_FIELD
 
 if TYPE_CHECKING:
@@ -277,6 +277,7 @@ class MongoDBStorage:
         # `ValueError` here (`REQ-E-015`) rather than at the first `write`.
         _client.resolve(config)
 
+    @_telemetry.traced("storage", "write")
     @_reporting("writing")
     async def write(self, key: str, data: bytes) -> None:
         """Store ``data`` under ``key``, replacing whatever was there.
@@ -318,6 +319,7 @@ class MongoDBStorage:
 
         await self._collection().replace_one({"_id": document_id}, document, upsert=True)
 
+    @_telemetry.traced("storage", "read")
     @_reporting("reading")
     async def read(self, key: str) -> bytes | None:
         """Return the bytes stored under ``key``, or ``None`` if there are none.
@@ -337,6 +339,7 @@ class MongoDBStorage:
         """
         await self._require_binary_keys()
         document = await self._collection().find_one({"_id": self._id_for(key)})
+        _telemetry.annotate("strands_mongodb.found", document is not None)
         if document is None:
             return None
         # `bytes(...)` rather than the value as stored, and not for the type annotation's sake. Measured
@@ -346,6 +349,7 @@ class MongoDBStorage:
         # stored. A collection an older driver also wrote is where that arrives.
         return bytes(document["data"])
 
+    @_telemetry.traced("storage", "delete")
     @_reporting("deleting")
     async def delete(self, key: str) -> None:
         """Remove ``key``, doing nothing if it is not there.
@@ -362,8 +366,10 @@ class MongoDBStorage:
                 error chained.
         """
         await self._require_binary_keys()
-        await self._collection().delete_one({"_id": self._id_for(key)})
+        result = await self._collection().delete_one({"_id": self._id_for(key)})
+        _telemetry.annotate("strands_mongodb.deleted_count", int(result.deleted_count))
 
+    @_telemetry.traced("storage", "list")
     @_reporting("listing")
     async def list(self, query: str) -> builtins.list[str]:
         """Return every key under ``query``, in ascending order.
@@ -390,8 +396,11 @@ class MongoDBStorage:
         # Only this instance's prefix comes off, never the queried one: a caller passing `sessions/` has
         # to get keys it can hand back to `read`.
         offset = len(self._prefix)
-        return [str(document["_id"])[offset:] async for document in cursor.sort("_id", 1)]
+        keys = [str(document["_id"])[offset:] async for document in cursor.sort("_id", 1)]
+        _telemetry.annotate("strands_mongodb.result_count", len(keys))
+        return keys
 
+    @_telemetry.traced("storage", "search")
     @_reporting("searching")
     async def search(self, query: str) -> builtins.list[StorageSearchResult]:
         """Search stored content, ranked best-first, in one server-side aggregation.
@@ -427,10 +436,12 @@ class MongoDBStorage:
         await self._require_binary_keys()
         cursor = await self._collection().aggregate(self._search_pipeline(tokens))
         offset = len(self._prefix)
-        return [
+        results = [
             StorageSearchResult(key=str(document["_id"])[offset:], score=float(document["score"]))
             async for document in cursor
         ]
+        _telemetry.annotate("strands_mongodb.result_count", len(results))
+        return results
 
     def _search_pipeline(self, tokens: set[str]) -> builtins.list[dict[str, Any]]:
         """Build the four stages ``search`` sends, exposed so ``AT-032e`` can ``explain`` the real thing.
@@ -488,6 +499,7 @@ class MongoDBStorage:
         stages.append({"$sort": {"score": -1, "_id": 1}})
         return stages
 
+    @_telemetry.traced("storage", "delete_prefix")
     @_reporting("deleting the prefix")
     async def delete_prefix(self, prefix: str) -> int:
         """Remove every key under ``prefix`` in one call, returning how many went.
@@ -507,7 +519,9 @@ class MongoDBStorage:
         """
         await self._require_binary_keys()
         result = await self._collection().delete_many(self._range_for(prefix))
-        return int(result.deleted_count)
+        removed = int(result.deleted_count)
+        _telemetry.annotate("strands_mongodb.deleted_count", removed)
+        return removed
 
     def namespace(self, prefix: str) -> MongoDBStorage:
         """Return a second instance scoped to ``prefix`` within the same collection.
@@ -537,6 +551,7 @@ class MongoDBStorage:
         scoped._namespaced = _NAMESPACED
         return scoped
 
+    @_telemetry.traced("storage", "ensure_indexes")
     async def ensure_indexes(self) -> None:
         """Create the indexes this collection needs, or report what is stopping that (``REQ-E-119``).
 
