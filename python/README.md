@@ -191,13 +191,21 @@ To give an agent both surfaces, pass one config to both and let the SDK wire the
 from strands import Agent
 from strands.memory import MemoryManager
 
-store = MongoDBMemoryStore(name="preferences", config=connection, scope="user-abc")
+store = MongoDBMemoryStore(name="preferences", config=connection, scope="user-abc", writable=True)
 agent = Agent(
     model=your_model,
     storage=MongoDBStorage(connection),
-    memory_manager=MemoryManager(stores=[store]),
+    memory_manager=MemoryManager(stores=[store], add_tool_config=True),
 )
 ```
+
+The two `True`s are what let the agent save anything. `MemoryManager` always gives the model a
+`search_memory` tool, but it adds `add_memory` only when `add_tool_config=True`, and the SDK defaults
+that to `False`. The store must also be writable, and this package defaults `writable` to `False`. If no
+store is writable, `add_tool_config=True` raises `ValueError` when you construct the manager. With
+neither set, the agent can recall memories but has no way to save new ones. If you would rather the SDK
+pick facts out of the conversation than leave it to the model, set `extraction=True` on the writable
+store instead of, or as well as, `add_tool_config`.
 
 One `storage` on `Agent` serves five subsystems, so this is also what turns on session persistence and
 context offloading.

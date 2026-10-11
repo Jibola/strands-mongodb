@@ -134,6 +134,12 @@ manager decides when to extract facts from a conversation and when to search, an
 the model. So you stop passing a tool and start passing a store, and the tools the model sees change name
 and shape with it. Map the fields first if you like, but nothing will call them until the wiring moves.
 
+If you want the model to keep deciding what to store, as it did with `record`, construct the manager with
+`MemoryManager(stores=[store], add_tool_config=True)` and the store with `writable=True`. Both default to
+`False`. Without `add_tool_config` the model gets a `search_memory` tool and no `add_memory` tool, so
+it can recall but never save. Without a writable store, `add_tool_config=True` raises `ValueError`
+when the manager is constructed.
+
 One consequence of the shift is worth stating plainly: the plugin let the model pass a `namespace` on some
 paths, and this package does not. `scope` is configured once, stamped by the package on every write, and
 cannot be set, changed or removed through a caller `filter` or through `metadata`. A prompt cannot reach it.
