@@ -294,7 +294,7 @@ class TestTheCandidateCount:
 
     @pytest.mark.parametrize("limit", [0, -1])
     def test_a_non_positive_limit_is_rejected(self, limit: int) -> None:
-        """Measured as code **7912700**, ``Expected limit to be positive``, from a different layer than
+        """Measured as code **7912700** on 8.0 and **65137** on 9.0, from a different layer than
         the ``numCandidates`` checks. The message says so rather than folding both into one."""
         with pytest.raises(ValueError, match=r"limit"):
             _pipeline.candidate_count(limit, 10)
@@ -639,8 +639,8 @@ class TestTheBoundsThisPackageCopiesFromTheServer:
     async def test_a_non_positive_limit_is_the_error_the_message_claims(
         self, atlas_database: Any, unique_collection_name: str
     ) -> None:
-        """The docstring on ``candidate_count`` names code 7912700 for this, and a code in a docstring
-        is a claim like any other.
+        """The comment in ``candidate_count`` names the server's code for this, and a code in a comment
+        is a claim like any other. The code changed between majors: 7912700 on 8.0, 65137 on 9.0.
 
         Guarded like the test above (`AT-168`), though on the same crippled deployment this one still passes:
         ``mongod`` rejects a non-positive ``limit`` before it dispatches anything, so the outage never
@@ -668,7 +668,7 @@ class TestTheBoundsThisPackageCopiesFromTheServer:
             ).to_list()
 
         skip_if_search_is_unreachable(caught.value)
-        assert caught.value.code == 7912700
+        assert caught.value.code in (7912700, 65137)
 
 
 QUERY_TEXT = "dark mode toggle"
@@ -856,16 +856,18 @@ class TestTheOrderingAgainstMongot:
         identical code, for the tie-ordering reason in ``_seed_and_index``. The bound that holds is the
         one above.
 
-        Skips where the deployment does not report the history. Atlas 8.0.30's
-        ``$_internalSearchMongotRemote`` explain carries ``explain``, ``mongotQuery`` and
-        ``requiresSearchMetaCursor`` and nothing else, so the pull protocol is unobservable there rather
-        than different.
+        Two explain shapes report it. 8.0's ``$_internalSearchMongotRemote`` lists every request size.
+        9.0 runs search as an extension, under ``$_internalDocumentResultsAndMetadata``, and reports the
+        first request's size and the number of requests, the second only at ``executionStats``. Measured on
+        9.0.4: a first request of 108 and two requests, for both limits. Skips where neither is reported:
+        Atlas 8.0.30's remote stage carries ``explain``, ``mongotQuery`` and ``requiresSearchMetaCursor``
+        and nothing else, so the pull protocol is unobservable there rather than different.
         """
         collection = await _seed_and_index(
             atlas_database, unique_collection_name, count=200, in_scope_every=20, rank_in_scope_last=True
         )
 
-        async def history(limit: int) -> list[int]:
+        async def history(limit: int) -> dict[str, Any]:
             stages = _pipeline.text_stages(
                 query_text=QUERY_TEXT,
                 index_name=_indexes.DEFAULT_TEXT_INDEX_NAME,
@@ -873,26 +875,30 @@ class TestTheOrderingAgainstMongot:
                 query_filter={"scope": "keep"},
             )
             await _until_answered(collection, stages)
-            explained = await atlas_database.command(
-                "explain", {"aggregate": unique_collection_name, "pipeline": stages, "cursor": {}}
-            )
-            remote = next(
-                stage["$_internalSearchMongotRemote"]
-                for stage in explained["stages"]
-                if "$_internalSearchMongotRemote" in stage
-            )
-            if "internalMongotBatchSizeHistory" not in remote:
-                pytest.skip(
-                    "this deployment's explain omits internalMongotBatchSizeHistory: Atlas 8.0.30 reports "
-                    f"only {sorted(remote)}, so the pull protocol is unobservable here"
-                )
-            return list(remote["internalMongotBatchSizeHistory"])
+            command = {"aggregate": unique_collection_name, "pipeline": stages, "cursor": {}}
+            explained = await atlas_database.command("explain", command, verbosity="executionStats")
+            for stage in explained["stages"]:
+                if "$_internalSearchMongotRemote" in stage:
+                    remote = stage["$_internalSearchMongotRemote"]
+                    if "internalMongotBatchSizeHistory" in remote:
+                        return {"requests": list(remote["internalMongotBatchSizeHistory"])}
+                    pytest.skip(
+                        "this deployment's explain omits internalMongotBatchSizeHistory: Atlas 8.0.30 reports "
+                        f"only {sorted(remote)}, so the pull protocol is unobservable here"
+                    )
+                if "$_internalDocumentResultsAndMetadata" in stage:
+                    search = stage["$_internalDocumentResultsAndMetadata"]["source"]["$search"]["explain"]
+                    return {
+                        "first": search["metadata"]["cursorOptions"]["batchSize"],
+                        "requests": search["resourceUsage"]["numBatches"],
+                    }
+            pytest.skip(f"no search stage this test can read in {[next(iter(s)) for s in explained['stages']]}")
 
         for_one = await history(1)
         for_fifty = await history(50)
 
-        assert for_one[0] == 101
-        assert for_one == for_fifty == [101, 152]
+        assert for_one == for_fifty, "the limit changed what was pulled from mongot"
+        assert for_one in ({"requests": [101, 152]}, {"first": 108, "requests": 2})
 
 
 @pytest.mark.integration

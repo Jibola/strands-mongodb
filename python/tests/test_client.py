@@ -752,6 +752,8 @@ class TestAttributionThatSrvResolutionDiscardsIsReapplied:
         """
         driver = client.options.pool_options.metadata["driver"]
         driver["name"] = "|".join(entry for entry in driver["name"].split("|") if entry.casefold() != "strands")
+        # pymongo 4.19 also dedupes on a private set of appended drivers, which a new ``ClientOptions`` starts empty.
+        getattr(client.options.pool_options, "_PoolOptions__appended_drivers", set()).clear()
 
     def test_an_attribution_that_was_discarded_is_applied_again_on_the_next_resolve(
         self, monkeypatch: pytest.MonkeyPatch

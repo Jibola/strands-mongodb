@@ -205,8 +205,7 @@ sees the typo.
 
 _LIMIT_TOO_LOW = (
     "strands_mongodb: %r is %d, and a search limit must be at least 1. A limit below 1 cannot return "
-    "anything, so it is rejected here rather than sent to a server that would reject it as code "
-    "7912700."
+    "anything, so it is rejected here rather than sent to a server that would reject it."
 )
 """``REQ-E-041``'s floor, applied to any resolved or supplied value and naming which one was wrong."""
 
