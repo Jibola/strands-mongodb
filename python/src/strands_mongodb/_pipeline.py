@@ -142,7 +142,7 @@ def candidate_count(limit: int, oversampling_factor: int = DEFAULT_OVERSAMPLING_
             the caller can lower and only they know which.
     """
     if limit < 1:
-        # Measured as code 7912700, `Expected limit to be positive`, from a different layer than the
+        # Measured as code 7912700 on 8.0 and 65137 on 9.0, from a different layer than the
         # `numCandidates` checks below. Distinct enough to be worth its own message.
         raise ValueError(
             f"strands_mongodb: 'limit' is {limit} and a search limit must be at least 1. The server "
