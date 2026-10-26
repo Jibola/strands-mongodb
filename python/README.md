@@ -28,8 +28,10 @@ memory module and never needs `pymongo-search-utils`. The one exception is
 included.
 
 The `Storage` protocol is the leverage point: the SDK accepts a single top-level `storage` on
-`Agent`, and five subsystems inherit it. One correct `MongoDBStorage` therefore delivers session
-management and context offloading without a separate session-manager class.
+`Agent`, and five subsystems inherit it. One `MongoDBStorage` is therefore the backend for session
+management and context offloading. Each is still turned on with the SDK's own objects
+(`SnapshotSessionManager`, and `ContextOffloader` or `context_manager="auto"`), and neither needs a
+MongoDB-specific class.
 
 **Already using another MongoDB backend for Strands?** Three exist: the archived `mongodb_memory` tool
 in `strands-agents-tools`, and the community `strands-mongodb-store` and `strands-mongodb-storage`
@@ -190,11 +192,13 @@ To give an agent both surfaces, pass one config to both and let the SDK wire the
 ```python
 from strands import Agent
 from strands.memory import MemoryManager
+from strands.session import SnapshotSessionManager
 
 store = MongoDBMemoryStore(name="preferences", config=connection, scope="user-abc", writable=True)
 agent = Agent(
     model=your_model,
     storage=MongoDBStorage(connection),
+    session_manager=SnapshotSessionManager(session_id="support-ticket-4127"),
     memory_manager=MemoryManager(stores=[store], add_tool_config=True),
 )
 ```
@@ -207,8 +211,10 @@ neither set, the agent can recall memories but has no way to save new ones. If y
 pick facts out of the conversation than leave it to the model, set `extraction=True` on the writable
 store instead of, or as well as, `add_tool_config`.
 
-One `storage` on `Agent` serves five subsystems, so this is also what turns on session persistence and
-context offloading.
+One `storage` on `Agent` serves five subsystems, but it doesn't turn them on. The `session_manager`
+line above is what persists the conversation under its session ID. To offload context as well, pass
+`context_manager="auto"` or a `ContextOffloader` plugin. Both use this storage, and
+`examples/unified_storage.py` wires all three.
 
 A type checker will reject `stores=[store]`, and the reason is the SDK's rather than yours: its
 `MemoryStore` protocol declares `add_messages` as a member while its own docstring calls it optional, so

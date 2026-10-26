@@ -10,8 +10,10 @@ One MongoDB deployment behind the SDK's two extension points:
 | Memory | `MongoDBMemoryStore` | `strands.memory` `MemoryStore` | Semantic recall over Atlas Vector Search, extraction writes |
 
 The `Storage` protocol is the leverage point: the SDK accepts a single top-level `storage` on
-`Agent`, and **five** subsystems inherit it. One correct `MongoDBStorage` therefore delivers
-session management and context offloading without a separate session-manager class.
+`Agent`, and **five** subsystems inherit it. One `MongoDBStorage` is therefore the backend for
+session management and context offloading. Each is still turned on with the SDK's own objects
+(`SnapshotSessionManager`, and `ContextOffloader` or `context_manager="auto"`), and neither needs a
+MongoDB-specific class.
 
 ## Status
 
