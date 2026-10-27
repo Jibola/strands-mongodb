@@ -14,7 +14,7 @@ The SDK accepts a single top-level `storage` on `Agent`, and **five** subsystems
 turned on with the SDK's own objects (`SnapshotSessionManager`, and `ContextOffloader` or
 `context_manager="auto"`), and neither needs a MongoDB-specific class.
 
-![strands-mongodb in a Strands agent: the SDK's session manager, context offloader and memory manager use MongoDBStorage and MongoDBMemoryStore, which store to MongoDB](docs/images/architecture.svg)
+![strands-mongodb in a Strands agent: the SDK's session manager, context offloader and memory manager use MongoDBStorage and MongoDBMemoryStore, which store to MongoDB](docs/images/architecture.png)
 
 ## Status
 

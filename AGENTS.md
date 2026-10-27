@@ -18,7 +18,7 @@ files.
 | `python/` | The `strands-mongodb` package. `src/`, `tests/`, `examples/`, `pyproject.toml`, and the reference `README.md` and `MIGRATION.md` |
 | `.github/workflows/ci-python.yml` | Every gate a pull request meets |
 | `README.md` | The landing page. Short on purpose: `python/README.md` is the reference |
-| `docs/` | The diagrams the READMEs show: Mermaid sources in `docs/diagrams/`, rendered SVG and PNG in `docs/images/` |
+| `docs/images/` | The diagrams the READMEs and `CONTRIBUTING.md` show, as PNG |
 | `AGENTS.md`, `CONTRIBUTING.md` | This file and the process |
 
 Everything with a version number lives under `python/`. When a second language lands, this file gains a
