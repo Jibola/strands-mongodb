@@ -38,7 +38,7 @@ import time
 from collections.abc import Callable, Sequence
 from typing import Any, Final
 
-__all__ = ["LIFETIME", "PREFIX", "check_name", "cluster_config", "connection_uri", "expired", "main"]
+__all__ = ["LIFETIME", "PREFIX", "check_name", "cluster_config", "connection_uri", "expired", "main", "wait_until_idle"]
 
 PREFIX: Final = "sm-ci-"
 """Name prefix of every cluster this script creates, and the only clusters it ever deletes."""
@@ -50,6 +50,7 @@ LIFETIME: Final = datetime.timedelta(hours=3)
 """How long a cluster, its user and its access-list entry may live. A full run takes under an hour."""
 
 _SEARCH_WAIT_SECONDS: Final = 600
+_CREATE_WAIT_SECONDS: Final = 1800
 
 Runner = Callable[[Sequence[str]], str]
 
@@ -169,6 +170,37 @@ def connection_uri(standard_srv: str, username: str, password: str) -> str:
     return f"{scheme}{username}:{password}@{host}/?retryWrites=true&w=majority"
 
 
+def wait_until_idle(
+    name: str,
+    run: Runner,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> None:
+    """Poll the cluster until Atlas reports it ``IDLE``, which is when it accepts connections.
+
+    Polled here rather than with the CLI's ``--watch``, which fails when the first read reports no state.
+    An empty or unfamiliar state is read as "not ready yet".
+
+    Args:
+        name: The cluster name.
+        run: Runs one Atlas CLI command.
+        sleep: Waits between polls. Replaced in tests.
+        clock: Reads the time. Replaced in tests.
+
+    Raises:
+        TimeoutError: If the cluster is not ``IDLE`` within :data:`_CREATE_WAIT_SECONDS`.
+    """
+    deadline = clock() + _CREATE_WAIT_SECONDS
+    while True:
+        state = json.loads(run(["clusters", "describe", name, "-o", "json"]) or "{}").get("stateName", "")
+        if state == "IDLE":
+            return
+        if clock() > deadline:
+            raise TimeoutError(f"{name} is still {state or 'without a state'} after {_CREATE_WAIT_SECONDS}s")
+        sleep(20)
+
+
 def _wait_for_search(uri: str) -> None:
     """Wait until the cluster's search process answers ``$listSearchIndexes``.
 
@@ -250,9 +282,10 @@ def up(run: Runner = _atlas, *, now: datetime.datetime | None = None) -> str:
         json.dump(cluster_config(name, region=os.environ.get("ATLAS_CI_REGION", "US_EAST_1")), handle)
     try:
         print(f"creating {name}; an M10 takes about ten minutes. If this run stops, delete it with: down {name}")
-        run(["clusters", "create", "--file", handle.name, "--watch", "--watchTimeout", "1800"])
+        run(["clusters", "create", "--file", handle.name])
     finally:
         os.unlink(handle.name)
+    wait_until_idle(name, run)
 
     run(
         [

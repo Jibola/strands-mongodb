@@ -55,6 +55,8 @@ class FakeAtlas:
             return json.dumps({"results": self.clusters})
         if call[:2] == ["clusters", "create"]:
             self.created = json.loads(Path(call[call.index("--file") + 1]).read_text())
+        if call[:2] == ["clusters", "describe"]:
+            return json.dumps({"stateName": "IDLE"})
         if call[:3] == ["clusters", "connectionStrings", "describe"]:
             return json.dumps({"standardSrv": "mongodb+srv://sm-ci-1.abcde.mongodb.net"})
         return ""
@@ -215,3 +217,37 @@ def test_a_name_atlas_would_reject_or_this_script_does_not_own_is_refused(script
     """AT-233. Too long, a hostname prefix ending in a dash, or not this script's prefix."""
     with pytest.raises(ValueError):
         script.check_name(name)
+
+
+class TestWaitingForTheCluster:
+    """AT-233. ``up`` polls the cluster's state itself; an empty or unknown state is not a failure."""
+
+    def test_it_waits_through_creating_and_empty_states_until_idle(self, script: ModuleType) -> None:
+        states = iter(["", "CREATING", "CREATING", "IDLE"])
+        calls: list[list[str]] = []
+
+        def describe(arguments: Sequence[str]) -> str:
+            calls.append(list(arguments))
+            return json.dumps({"stateName": next(states)})
+
+        script.wait_until_idle("sm-ci-1-1", describe, sleep=lambda seconds: None)
+
+        assert calls == [["clusters", "describe", "sm-ci-1-1", "-o", "json"]] * 4
+
+    def test_it_gives_up_at_the_deadline(self, script: ModuleType) -> None:
+        clock = iter(range(0, 10_000, 600))
+
+        with pytest.raises(TimeoutError, match="sm-ci-1-1"):
+            script.wait_until_idle(
+                "sm-ci-1-1",
+                lambda arguments: json.dumps({"stateName": "CREATING"}),
+                sleep=lambda seconds: None,
+                clock=lambda: next(clock),
+            )
+
+    def test_up_creates_without_the_clis_own_watch(self, script: ModuleType, atlas: FakeAtlas) -> None:
+        script.up(atlas, now=NOW)
+
+        (create,) = atlas.named("clusters", "create")
+        assert "--watch" not in create
+        assert atlas.named("clusters", "describe")
