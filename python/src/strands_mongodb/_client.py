@@ -15,7 +15,6 @@ import hashlib
 import json
 import logging
 import threading
-import urllib.parse
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any, Final
@@ -38,15 +37,9 @@ __all__ = ["Capabilities", "close", "resolve"]
 
 logger = logging.getLogger(__name__)
 
-# The name the server logs and Atlas telemetry group by. Changing it orphans historical usage data.
-_DRIVER_NAME = "Strands"
-
-# The handshake `appName` shown in server logs, `$currentOp` and the profiler. Renaming it also orphans
-# historical usage data.
-_APP_NAME = "strands-mongodb"
-_APP_NAME_SUFFIX = "-" + _APP_NAME
-# pymongo's limit, in UTF-8 bytes. Over it, `AsyncMongoClient` raises `ValueError`.
-_APP_NAME_MAX_BYTES = 128
+# The `driver.name` entry server logs and Atlas telemetry group by. Specific to this package: the archived
+# `mongodb_memory` tool in strands-agents-tools reports plain "Strands". Changing it orphans usage data.
+_DRIVER_NAME = "Strands-MongoDB"
 
 _MISSING_CONNECTION = (
     "strands_mongodb: a MongoDB connection is required, but neither 'client' nor "
@@ -228,47 +221,9 @@ def _driver_info() -> DriverInfo:
     """Build the attribution PyMongo appends to its own driver metadata.
 
     Returns:
-        A ``DriverInfo`` naming Strands and the installed package version.
+        A ``DriverInfo`` naming this package and its installed version.
     """
     return DriverInfo(name=_DRIVER_NAME, version=_package_version())
-
-
-def _app_name(connection_string: str, client_args: dict[str, Any]) -> str:
-    """Derive the ``appName`` a client this package builds sends: the caller's, suffixed, or the package's own.
-
-    The caller's value is the one pymongo would have used. A ``client_args`` key in any letter case wins,
-    as pymongo's keyword options do. Otherwise it is the last ``appName`` in the query string. Only the
-    text after the first ``?`` is read, so the part of the URI that holds credentials is never parsed,
-    and an ``srv`` URI is never resolved: its TXT record cannot carry ``appName`` anyway.
-
-    Args:
-        connection_string: The configured URI.
-        client_args: The configured client arguments.
-
-    Returns:
-        ``strands-mongodb`` when no value is configured. The value unchanged when it already ends in the
-        suffix. Otherwise ``<value>-strands-mongodb``, with the value shortened on a character boundary
-        when the whole would exceed pymongo's 128-byte limit, so the suffix always survives.
-    """
-    configured: str | None = None
-    for key, value in client_args.items():
-        if key.lower() == "appname":
-            configured = None if value is None else str(value)
-    if configured is None:
-        _, _, query = connection_string.partition("?")
-        for pair in query.replace(";", "&").split("&"):
-            key, _, value = pair.partition("=")
-            if key.lower() == "appname":
-                configured = urllib.parse.unquote_plus(value)
-
-    if not configured:
-        return _APP_NAME
-    if configured == _APP_NAME or configured.endswith(_APP_NAME_SUFFIX):
-        return configured
-    room = _APP_NAME_MAX_BYTES - len(_APP_NAME_SUFFIX.encode())
-    # `errors="ignore"` drops a multi-byte character the cut split in half, rather than replacing it.
-    kept = configured.encode()[:room].decode(errors="ignore")
-    return kept + _APP_NAME_SUFFIX
 
 
 def _identity(config: MongoDBConfig) -> str:
@@ -323,24 +278,28 @@ def _warn_if_retries_disabled(client: AsyncMongoClient[Any]) -> None:
 
 
 def _already_attributed(client: AsyncMongoClient[Any]) -> bool:
-    """Whether this client's driver metadata already names Strands.
+    """Whether this client's driver metadata already carries this package's exact entry.
 
-    ``driver.name`` is a pipe-delimited chain such as ``PyMongo|c|async|Strands``. Entries are compared
-    whole and case-insensitively, as pymongo 4.14.1 and later do internally, so the answer does not depend
-    on the installed pymongo. A substring match would wrongly count an entry such as ``StrandsToolkit``.
+    ``driver.name`` and ``driver.version`` are pipe-delimited chains, such as ``PyMongo|c|async|Strands-MongoDB``
+    and ``4.17.0|0.1.0``. Per the MongoDB handshake specification, two entries are the same only when the name
+    and the version are both equal, compared case-sensitively; a name alone is not enough. Entries are paired
+    from the right, because pymongo's own name has more entries than its version.
 
     Args:
         client: The client to inspect, read through its public ``options``.
 
     Returns:
-        Whether an entry equal to this package's driver name is already in the chain.
+        Whether an entry with this package's name and version is already in the chains.
     """
-    chain = client.options.pool_options.metadata["driver"]["name"]
-    return _DRIVER_NAME.casefold() in (entry.casefold() for entry in chain.split("|"))
+    driver = client.options.pool_options.metadata["driver"]
+    ours = _driver_info()
+    # `strict=False` on purpose: the two chains differ in length by design.
+    pairs = zip(reversed(driver["name"].split("|")), reversed(driver["version"].split("|")), strict=False)
+    return any(name == ours.name and version == ours.version for name, version in pairs)
 
 
 def _attribute_injected_client(client: AsyncMongoClient[Any]) -> None:
-    """Attach Strands attribution to a client the caller injected, at most once.
+    """Attach this package's driver attribution to a client the caller injected, at most once.
 
     This inlines ``pymongo_search_utils.append_client_metadata``, which lives in the ``[memory]`` extra,
     while this module must also work under a ``[storage]``-only install.
@@ -366,7 +325,7 @@ def _reattribute_if_it_was_discarded(connection: _Connection) -> None:
 
     ``append_metadata`` writes into the client's ``ClientOptions``, and resolving a ``mongodb+srv://`` URI
     replaces them on the client's first connection. For an injected SRV client the append lands first and
-    is lost (pymongo 4.17.0: ``PyMongo|c|async|Strands`` before, ``PyMongo|c|async`` after). This restores
+    is lost (pymongo 4.17.0: ``PyMongo|c|async|Strands-MongoDB`` before, ``PyMongo|c|async`` after). This restores
     the attribution for every pool built afterwards, not for handshakes already sent.
 
     Args:
@@ -387,7 +346,7 @@ def _reattribute_if_it_was_discarded(connection: _Connection) -> None:
     # that appends without deduping. Stop after one attempt.
     connection.recheck_attribution = False
     logger.debug(
-        "strands_mongodb: append_metadata did not become visible on the injected client, so the Strands "
+        "strands_mongodb: append_metadata did not become visible on the injected client, so the Strands-MongoDB "
         "attribution is left as it is",
         extra=_telemetry.event_extra("attribution_not_visible"),
     )
@@ -445,17 +404,12 @@ def resolve(config: MongoDBConfig) -> _Connection:
 
         _reap_closed_loops()
 
-        # `driver=` and `appname=` reach pymongo through `**kwargs`, so nothing type checks them; the tests
-        # assert the resulting pool metadata. Every case variant of `appname` is removed so the client
-        # receives exactly one.
-        client_args = dict(config.get("client_args") or {})
-        app_name = _app_name(config["connection_string"], client_args)
-        client_args = {key: value for key, value in client_args.items() if key.lower() != "appname"}
+        # `driver=` reaches pymongo through `**kwargs`, so nothing type checks it; the tests assert the
+        # resulting pool metadata. `appName` is left to the application.
         client: AsyncMongoClient[Any] = AsyncMongoClient(
             config["connection_string"],
             driver=_driver_info(),
-            appname=app_name,
-            **client_args,
+            **(config.get("client_args") or {}),
         )
         return _register(identity, running, client, owned=True, attribute=False)
 
@@ -475,7 +429,7 @@ def _register(
         loop: The loop this client serves, or ``None`` for the loop-independent slot.
         client: The client to register.
         owned: Whether this module built it, which decides whether :func:`close` may close it.
-        attribute: Whether to attach Strands attribution, which only an injected client needs.
+        attribute: Whether to attach this package's driver attribution, which only an injected client needs.
 
     Returns:
         The registered connection, existing or new.

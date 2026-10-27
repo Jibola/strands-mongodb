@@ -95,7 +95,7 @@ class _Probe:
 
 
 class TestTheTracerBelongsToTheApplication:
-    """AT-201 / REQ-E-196 — looked up on every call, and nothing configured by the package."""
+    """AT-201 — looked up on every call, and nothing configured by the package."""
 
     async def test_the_tracer_is_looked_up_on_every_call_under_the_package_name(
         self, monkeypatch: pytest.MonkeyPatch, exported_spans: InMemorySpanExporter
@@ -127,7 +127,7 @@ class TestTheTracerBelongsToTheApplication:
 
 
 class TestTheSpanAndItsBaseAttributes:
-    """AT-205 / REQ-E-200 — kind, namespace attributes, and no ``db.*`` key, on the decorator alone."""
+    """AT-205 — kind, namespace attributes, and no ``db.*`` key, on the decorator alone."""
 
     async def test_a_span_is_internal_and_carries_the_namespace_and_store(
         self, exported_spans: InMemorySpanExporter
@@ -150,7 +150,7 @@ class TestTheSpanAndItsBaseAttributes:
 
 
 class TestAFailureMarksTheSpanAndCopiesNothing:
-    """AT-207 / REQ-E-202 — status and type, never the message, and the raise unchanged."""
+    """AT-207 — status and type, never the message, and the raise unchanged."""
 
     async def test_a_raising_operation_is_an_error_named_by_class_alone(
         self, exported_spans: InMemorySpanExporter
@@ -236,7 +236,7 @@ class TestAFailureMarksTheSpanAndCopiesNothing:
 
 
 class TestTheAllowList:
-    """AT-214 / REQ-E-209 — enforced by type, and dropped rather than raised at runtime."""
+    """AT-214 — enforced by type, and dropped rather than raised at runtime."""
 
     async def test_an_unknown_name_is_dropped_and_logged_at_debug(
         self, exported_spans: InMemorySpanExporter, caplog: pytest.LogCaptureFixture
@@ -266,7 +266,7 @@ STORAGE_OPERATIONS: Final = ("write", "read", "delete", "list", "search", "delet
 
 
 class TestEveryStorageOperationRecordsOneSpan:
-    """AT-202, AT-205 / REQ-E-197, REQ-E-200 — the storage half, against the unit fake."""
+    """AT-202, AT-205 — the storage half, against the unit fake."""
 
     async def test_each_operation_records_one_internal_span_on_its_namespace(
         self, exported_spans: InMemorySpanExporter
@@ -333,7 +333,7 @@ class TestEveryStorageOperationRecordsOneSpan:
 
 
 class TestEveryMemoryOperationRecordsOneSpan:
-    """AT-202, AT-205, AT-206 / REQ-E-197, REQ-E-200, REQ-E-201 — the memory half, against the unit fakes."""
+    """AT-202, AT-205, AT-206 — the memory half, against the unit fakes."""
 
     async def test_initialize_records_one_span_and_the_tiers_it_prepared(
         self, monkeypatch: pytest.MonkeyPatch, exported_spans: InMemorySpanExporter
@@ -432,7 +432,7 @@ def _acquired(span: ReadableSpan) -> list[bool]:
 
 
 class TestANewPoolIsAnEventOnTheSpanThatCausedIt:
-    """AT-203 / REQ-E-198 — one event per registry entry created, none per cache hit or adoption."""
+    """AT-203 — one event per registry entry created, none per cache hit or adoption."""
 
     def test_a_store_built_inside_a_traced_block_marks_that_block(self, exported_spans: InMemorySpanExporter) -> None:
         tracer = trace.get_tracer("the-application")
@@ -474,7 +474,7 @@ class TestANewPoolIsAnEventOnTheSpanThatCausedIt:
         assert [_acquired(span) for span in reads] == [[], [False]]
 
 
-#: One distinct marker per value REQ-E-203 forbids, each one unlikely to occur anywhere by chance.
+#: One distinct marker per value that must never reach a span or a log, each unlikely to occur by chance.
 KEY: Final = "mk-key-7f3a"
 PREFIX: Final = "mk-prefix-1c9e"
 PAYLOAD: Final = "mk-payload-55d0"
@@ -520,7 +520,7 @@ def _leaks(exporter: InMemorySpanExporter, records: list[logging.LogRecord]) -> 
 
 
 class TestNothingTheCallerSuppliedReachesASpanOrALog:
-    """AT-208 / REQ-E-203 — a marker in every forbidden value, every operation driven, every surface read.
+    """AT-208 — a marker in every forbidden value, every operation driven, every surface read.
 
     The unit tier, against the fakes, so the credentials can be real-looking and the run needs nothing.
     The contract class below repeats it against a deployment for the values a fake cannot carry back.
@@ -653,7 +653,7 @@ async def _under_parent(awaitable: Any) -> Any:
 
 
 class TestIndexWorkIsAChildOfTheOperationThatCausedIt:
-    """AT-204 / REQ-E-199 — ``indexes.ensure``, ``indexes.probe`` and ``indexes.wait``, each one span."""
+    """AT-204 — ``indexes.ensure``, ``indexes.probe`` and ``indexes.wait``, each one span."""
 
     async def test_ensure_records_its_mode_and_how_many_it_created(self, exported_spans: InMemorySpanExporter) -> None:
         collection: Any = FakeAsyncCollection(database=FakeAsyncDatabase(name="appdb"))
@@ -732,7 +732,7 @@ class TestIndexWorkIsAChildOfTheOperationThatCausedIt:
 
 
 class TestATimedOutWaitIsAnOutcomeAndNotAnError:
-    """AT-209 / REQ-E-204 — ``timed_out`` on the wait span, its status left ``UNSET``."""
+    """AT-209 — ``timed_out`` on the wait span, its status left ``UNSET``."""
 
     async def test_the_wait_span_says_timed_out_and_the_caller_still_gets_the_error(
         self, exported_spans: InMemorySpanExporter
@@ -780,14 +780,14 @@ def _log_calls() -> list[tuple[str, str, str, ast.Call]]:
     return sorted(calls, key=lambda call: (call[0], call[3].lineno))
 
 
-#: Every record the package emits, as it stood before structured fields were added (REQ-E-206). A change to
-#: a level or a message fails here, because applications filter on both.
+#: Every record the package emits, with its level and message. A change to either fails here, because
+#: applications filter on both.
 PINNED_RECORDS: Final = {
     ("_client.py", "warning", "_RETRY_WRITES_DISABLED"),
     (
         "_client.py",
         "debug",
-        "'strands_mongodb: append_metadata did not become visible on the injected client, so the Strands "
+        "'strands_mongodb: append_metadata did not become visible on the injected client, so the Strands-MongoDB "
         "attribution is left as it is'",
     ),
     (
@@ -810,7 +810,7 @@ PINNED_RECORDS: Final = {
 
 
 class TestEveryLogRecordCarriesStructuredFields:
-    """AT-210 / REQ-E-205 — an event name on every record, and the namespace and tier where there is one."""
+    """AT-210 — an event name on every record, and the namespace and tier where there is one."""
 
     def test_every_log_call_passes_its_fields_through_event_extra(self) -> None:
         """Read off the source, so a log line added later without fields fails here before it ships."""
@@ -880,7 +880,7 @@ class TestEveryLogRecordCarriesStructuredFields:
 
 
 class TestEveryExistingRecordIsUnchanged:
-    """AT-211 / REQ-E-206 — the same message, at the same level, under the same logger."""
+    """AT-211 — the same message, at the same level, under the same logger."""
 
     def test_every_log_call_matches_the_pinned_list(self) -> None:
         assert {(name, level, message) for name, level, message, _ in _log_calls()} == PINNED_RECORDS

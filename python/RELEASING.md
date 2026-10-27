@@ -1,20 +1,18 @@
 # Releasing
 
-A release is one push of one tag. Everything after that is automatic except the single approval that
-stops it, and everything before it is undoable. This document is the order of those steps, because
-the cost of not knowing it is paid exactly once, at the only moment that cannot be reversed: an
-upload to PyPI can be yanked, never replaced.
+A release is one push of one tag. Everything after that is automatic except a single approval, and
+everything before it can be undone. This document gives the order of those steps, because the upload
+at the end cannot be reversed: an upload to PyPI can be yanked, never replaced.
 
 The procedure is `.github/workflows/release-python.yml`. That file is the authority; this one is the
-part a person needs and cannot get by reading YAML at speed. `AT-163` asserts that the two agree
-about the jobs, the tag and the environment, so a fifth job added there fails the suite here rather
-than going unmentioned.
+part a person needs to follow it. A test checks that the two agree about the jobs, the tag and the
+environment, so a job added to the workflow and not described here fails the suite.
 
 ## What a release is made of
 
 The version is not written down anywhere. `hatch-vcs` derives it from the git tag, matching
 `^python-v(?P<version>.+)$`, so `python-v0.1.0` builds `0.1.0`. A build from a tree with no such tag
-gets a development version counted from the first commit, such as `0.0.1.dev69+g20b0ea579`, and a build
+gets a development version counted from the first commit, of the form `0.0.1.devN+g<sha>`, and a build
 with no git metadata at all falls back to `0.0.0`. Neither can be mistaken for a release.
 
 This means there is no version bump commit and nothing to keep in sync. It also means the tag is the
@@ -29,12 +27,15 @@ whole decision: tag the commit you mean, because the artifact is built from it a
    the artifact.
 3. **If this is the first release ever**, remove the
    `<!-- skip: these reach PyPI for a package that is not published yet -->` marker from both
-   `README.md` files in the same commit. `AT-164` couples the two: while the marker is present the
+   `README.md` files in the same commit. A test couples the two: while the marker is present the
    changelog may date nothing, and once it is gone the changelog must date something.
 4. **Run the gate locally.** `hatch run format-check`, `hatch run lint`, `hatch run typecheck`,
    `hatch run cov`. The release workflow runs all four again and a failure there wastes only time, but
    it wastes it after you have already pushed a tag, and a tag pointing at a commit that cannot be
    released has to be deleted from the remote by hand.
+5. **Run the Atlas tiers on that commit.** Start `CI - Python` by hand from the Actions tab on `main` and
+   wait for `Atlas tiers`. It is the only job that runs `autoembed`, the package's default search mode,
+   against Atlas, and it does not run on a merge.
 
 ## Tagging
 
@@ -43,7 +44,7 @@ git tag python-v0.1.0
 git push origin python-v0.1.0
 ```
 
-The `python-v` prefix is what starts a release — a plain `v0.1.0` tag does nothing at all. The prefix
+The `python-v` prefix is what starts a release. A plain `v0.1.0` tag does nothing. The prefix
 exists because this repository is a monorepo: a future `typescript/` versions independently off the
 same history, and its tags must not reach this workflow.
 
@@ -58,7 +59,7 @@ same history, and its tags must not reach this workflow.
 
 `gate` and `contract` run in parallel; `build` needs both; `publish` needs `build`.
 
-The check inside `build` is the one worth knowing about: the built wheel's version must equal the
+The check inside `build` compares versions: the built wheel's version must equal the
 tag, compared as PEP 440 objects rather than as strings, so `python-v0.1.0-rc1` and `python-v0.1.0rc1`
 are the same answer while a genuinely different version still fails. A mismatch means `hatch-vcs` saw
 a dirty tree or no tag, and publishing that would put a `.dev` or `0.0.0` artifact on PyPI forever.
@@ -68,7 +69,7 @@ a dirty tree or no tag, and publishing that would put a `.dev` or `0.0.0` artifa
 `publish` is bound to the `pypi` environment, and that environment has required reviewers. A tag does
 not publish: the run stops at `publish` and waits for a human to approve the deployment in the
 Actions UI. That pause is the last stop before the irreversible step, and it is the one part of this
-process you cannot discover by reading the repository — the environment and its reviewer list live in
+process you cannot discover by reading the repository: the environment and its reviewer list live in
 repository settings, not in a file.
 
 **Neither exists yet.** There is no `pypi` environment in the repository settings and no trusted
@@ -86,7 +87,7 @@ repository, so there is nothing to leak or rotate. PyPI verifies the identity of
 in that repository, running in the `pypi` environment, and mints a token good for one upload.
 
 Rename the workflow file or the environment and the upload stops working until the publisher on PyPI
-is updated to match. That coupling is the security property, not an inconvenience.
+is updated to match. That coupling is intended: it is what ties the upload to this workflow.
 
 ## When it goes wrong
 
@@ -97,5 +98,3 @@ is updated to match. That coupling is the security property, not an inconvenienc
 | `wheel is X, tag says Y` | `hatch-vcs` saw a dirty tree or no tag | Tag an exact commit on a clean checkout |
 | Stuck at `publish` | Waiting for a required reviewer | Approve the deployment, or find somebody who can |
 | Wrong artifact uploaded | It is on PyPI permanently | Yank that version on PyPI and release a new patch. There is no replace |
-
-The last row is the reason for every row above it.

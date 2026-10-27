@@ -1,8 +1,8 @@
 """Shared fixtures and tier gating.
 
-Four test tiers, distinguished by the infrastructure they need. A tier whose backend
-is absent **skips with the missing variable named**. It never silently passes, and it never fails
-for lack of a database, because both of those teach the reader to ignore the result:
+Four test tiers, distinguished by the infrastructure they need. A tier whose backend is absent
+**skips with the missing variable named**. It never silently passes, and it never fails for lack of
+a database, because both of those teach the reader to ignore the result:
 
 ===============  =========================  ==============================================
 Marker           Environment variable       Backend
@@ -14,26 +14,24 @@ Marker           Environment variable       Backend
 ===============  =========================  ==============================================
 
 Those three variables are read from the environment, and any the environment lacks are filled from a
-``.env`` file at ``python/.env`` or the repository root. Nothing else in that
-file is read, an existing value is never replaced, and an empty value means "no backend for this tier",
-which is how a run opts out of a configured deployment without editing anything.
+``.env`` file at ``python/.env`` or the repository root. Nothing else in that file is read, an existing
+value is never replaced, and an empty value means "no backend for this tier", which is how a run opts
+out of a configured deployment without editing anything.
 
 ``autoembed`` exists as a separate gate rather than as part of ``integration`` because an Atlas CLI
 local deployment runs vector and full-text search but registers no embedding models, so
 ``$vectorSearch`` with ``autoEmbed`` cannot be exercised there. Folding it into ``integration``
 would report the package's default search mode as covered when it was never run.
 
-**A ``contract`` test may not run a query, and this is enforced by nothing but review.** "Any real
-MongoDB" is meant literally: measured against ``mongo:8``, reported version 8.3.8 with
-``modules: []``, ``$search``, ``$vectorSearch``, ``$listSearchIndexes``, ``list_search_indexes()`` and
-``create_search_index`` all return ``OperationFailure`` code 31082, while ordinary index creation and
-every CRUD path work normally. Three more deployments were measured later and all three refuse the
-same five calls, with a different code: ``mongo:6``, ``mongo:7`` and an enterprise ``mongod`` 7.0.12.
-``REQ-E-053a`` has the table, and the tier boundary is the same on all four. So the contract tier covers
-writes, ordinary indexes and the dedup constraint; anything needing mongot belongs in ``integration``.
-Pointing ``MONGODB_URI``
-at a plain deployment for the first time found one class relying on the wider gate
-(``AT-072b``, re-marked), which is the mistake this paragraph exists to prevent repeating.
+**A ``contract`` test may not run a search query, and only review enforces this.** "Any real MongoDB"
+is meant literally. On ``mongo:8`` (version 8.3.8, ``modules: []``), ``$search``, ``$vectorSearch``,
+``$listSearchIndexes``, ``list_search_indexes()`` and ``create_search_index`` all return
+``OperationFailure`` code 31082, while ordinary index creation and every CRUD path work normally.
+``mongo:6``, ``mongo:7`` and an enterprise ``mongod`` 7.0.12 refuse the same five calls with a different
+code, so the tier boundary is the same on all four. The contract tier therefore covers writes, ordinary
+indexes and the dedup constraint, and anything needing mongot belongs in ``integration``. A test that
+needs search but carries only the ``contract`` marker fails on a plain deployment, so point
+``MONGODB_URI`` at one when adding a contract test.
 """
 
 from __future__ import annotations
@@ -72,8 +70,8 @@ TIER_VARIABLES: dict[str, str] = {
 
 # Where a developer's connection strings may already be written down. `python/.env` first, because
 # the nearer file is the one someone working inside this directory would create, then the repository
-# root, which is where the file actually appeared. Both are `.gitignore`d, and `test_tier_gating`
-# asserts that rather than trusting it: this file holds a live Atlas password.
+# root. Both are `.gitignore`d, and `test_tier_gating` asserts that, because the file holds a connection
+# string with a password in it.
 ENV_FILE_LOCATIONS: tuple[Path, ...] = (_PROJECT_ROOT / ".env", _PROJECT_ROOT.parent / ".env")
 
 
@@ -143,7 +141,7 @@ def fill_tier_variables_from_env(
 
 
 # At import time, so the collection hook and every fixture below see the same environment. Three keys of
-# hand-written parsing, deliberately, rather than a dependency on `python-dotenv`.
+# hand-written parsing rather than a `python-dotenv` dependency; `fill_tier_variables_from_env` says why.
 fill_tier_variables_from_env(os.environ)
 
 # One database per test session, dropped on teardown. Concurrent sessions (a local run beside CI,
@@ -153,7 +151,7 @@ _SESSION_SUFFIX = uuid.uuid4().hex[:8]
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Register the contract-checklist gate, and make the subprocess tests count toward coverage.
+    """Register the contract checklist gate, and make the subprocess tests count toward coverage.
 
     Several tests assert on import-time behavior, which is only observable in a fresh interpreter,
     so they run their assertions in a child process. Nothing a child executes is measured unless
@@ -180,8 +178,9 @@ def pytest_configure(config: pytest.Config) -> None:
     config.pluginmanager.register(ChecklistGate(), ChecklistGate.name)
 
 
-# Acceptance-test ids as this suite writes them: ``AT-021``, ``AT-032a``, ``CH-001``, ``MP-001``. The
-# gate's own marker deliberately does not match, so the gate cannot end up listed as its own evidence.
+# Acceptance-test ids as this suite writes them: ``AT-``, up to three digits and an optional letter
+# suffix, plus two other prefixes the pattern also accepts. ``AT-GATE`` deliberately does not match,
+# so the gate cannot end up listed as its own evidence.
 _AT_ID = re.compile(r"\b((?:AT|CH|MP)-[0-9]{1,3}[a-z]*)")
 
 
@@ -205,16 +204,15 @@ def _declared_ids(item: pytest.Item) -> tuple[set[str], set[str]]:
 
     Only each docstring's **first paragraph** is read, and that is not a stylistic preference. This suite
     declares coverage in the summary line, then discusses other tiers in the body: the two unit classes
-    in ``test_memory_store.py`` covering the metadata merge both name ``AT-040`` several paragraphs down,
-    to say that the assertion lives on the integration tier and not in them. Reading whole docstrings
-    turns that sentence into a coverage claim, and the gate then reports the item as covered by tests
-    which say in writing that they do not cover it. Measured: it passed a run where the integration tier
-    was deselected.
+    in ``test_memory_store.py`` covering the metadata merge both name the search-result checklist id
+    several paragraphs down, to say that the assertion lives on the integration tier and not in them.
+    Reading whole docstrings would turn that sentence into a coverage claim, and the gate would then
+    report the item as covered, and pass, in a run where the integration tier was deselected.
 
     Module docstrings are not read at all, for the same reason one step further out.
 
     Reading collected items rather than parsing the files is what keeps a fake's ids out of the index.
-    ``FakeAggregationCursor`` carries ``AT-032b`` in its docstring and is never collected, so it cannot
+    ``FakeAggregationCursor`` carries an id in its docstring and is never collected, so it cannot
     satisfy a checklist item on its own.
 
     Args:
@@ -243,7 +241,7 @@ def _summary(docstring: str | None) -> str:
 
 
 class ChecklistGate:
-    """Collects the two things the release gate needs and a test cannot see by itself.
+    """Collects the two things the contract checklist's release gate needs and a test cannot see by itself.
 
     A test can assert what it observes. It cannot observe which other tests were collected, nor what
     they did, and the gate's whole claim is about the run around it: that every checklist item has a
@@ -268,14 +266,13 @@ class ChecklistGate:
 
         An id declared by a test wins over the same id on any class, anywhere. A class docstring only
         carries the ids no test declares for itself, which is how a class covering one behaviour across
-        several tests is meant to read. That precedence was measured rather than assumed: without it, an
-        injected failure in the contract ``read`` test was blamed on three checklist items about ``write``
-        and ``list`` ordering, because the contract class in ``test_storage.py`` declares ``AT-020`` and
-        ``AT-027`` in the same summary line as ``AT-021``.
+        several tests is meant to read. Without that precedence, a failure in the contract ``read`` test
+        would be blamed on the checklist items about ``write`` and ``list`` ordering too, because the
+        contract class in ``test_storage.py`` declares all three ids in one summary line.
 
         ``trylast`` is what makes the reordering survive a plugin that shuffles collection order.
-        Nothing in the current pinned set does, and the gate is worthless the moment something does:
-        run before the tests it measures, it would report every one of them as never having run.
+        Nothing in the current pinned set does, but a gate run before the tests it measures would report
+        every one of them as never having run.
         """
         own: dict[str, list[str]] = {}
         inherited: dict[str, list[str]] = {}
@@ -374,8 +371,8 @@ def run_mypy(tmp_path: Path) -> Callable[[str], subprocess.CompletedProcess[str]
 
     Several requirements are promises to a type checker rather than to the interpreter: a
     ``Required`` key, a narrow ``Literal``, the class a lazily exported name resolves to. None of
-    them can be asserted at runtime, and a requirement no test can observe is a comment. This runs
-    the checker the project ships with and lets the test read its output.
+    them can be asserted at runtime. This runs the checker the project ships with and lets the test
+    read its output.
 
     ``MYPYPATH`` names ``src`` rather than relying on the editable install, so the result describes
     the code in this tree and not whichever build the venv last resolved. The subprocess runs in the
@@ -406,8 +403,7 @@ def run_mypy(tmp_path: Path) -> Callable[[str], subprocess.CompletedProcess[str]
 def run_mypy_as_installed(tmp_path: Path) -> Callable[[str], subprocess.CompletedProcess[str]]:
     """Type check a snippet the way a consumer's own project would.
 
-    Three differences from :func:`run_mypy`, and each one removes a way this repository flatters
-    itself:
+    Three differences from :func:`run_mypy`, each removing something a consumer's project would not have:
 
     * No ``MYPYPATH``. The package has to be found through the install, as a dependency, not as a
       directory of source files that happens to be on the path.
@@ -454,8 +450,8 @@ def test_database_name() -> str:
 def pytest_runtest_setup(item: pytest.Item) -> Generator[None]:
     """Turn an unreachable search process into a skip when it surfaces while a fixture is building.
 
-    ``REQ-E-161``. See :func:`pytest_runtest_call` for why both phases are wrapped and why this is a
-    hook rather than another call site.
+    See :func:`pytest_runtest_call` for why both phases are wrapped and why this is a hook rather than
+    another call site.
 
     Args:
         item: The test being set up. Unused: what is inspected is the failure, not the test.
@@ -476,16 +472,14 @@ def pytest_runtest_setup(item: pytest.Item) -> Generator[None]:
 def pytest_runtest_call(item: pytest.Item) -> Generator[None]:
     """Turn an unreachable search process into a skip wherever in the test body it surfaces.
 
-    ``REQ-E-161``, and the part the 2026-09-16 reproduction added. :func:`skip_if_search_is_unreachable`
-    was called from the two search helpers, which covered the failure that prompted it and not the
-    shape it usually takes: ``add`` and ``initialize`` provision the search indexes, so on a deployment
-    whose mongot is gone the outage arrives on the *arrange* line, before any search runs. Ten of that
-    day's twelve failures were standing there.
+    The two search helpers also call :func:`skip_if_search_is_unreachable`, but that alone misses the
+    usual shape of the outage: ``add`` and ``initialize`` provision the search indexes, so on a
+    deployment whose mongot is gone the failure arrives on the *arrange* line, before any search runs.
 
     Adding the guard to every arrange line would mean touching every cluster test and would still miss
-    the next one. A hook sees the failure wherever it stands, and the match it delegates to is exactly
-    as strict as before -- two codes, one of them qualified by a sentence this package cannot produce --
-    so nothing that could be a package regression is affected.
+    the next one. A hook sees the failure wherever it stands, and the match it delegates to stays strict
+    (two codes, one of them qualified by a sentence this package cannot produce), so nothing that could
+    be a package regression is affected.
 
     **Teardown is deliberately not wrapped.** By then the test has its result, and converting a
     teardown failure into a skip would discard an answer the suite already has.
@@ -510,9 +504,8 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
 
     A collection hook rather than an autouse fixture, and the difference is not stylistic. An
     autouse function-scoped fixture runs *after* any session-scoped fixture the test requests, so
-    ``contract_uri`` would be instantiated first and raise before the gate ever ran. The observable
-    result was an **error**, not a skip: a missing backend reported as a broken suite. Found by
-    running the harness smoke tests with no ``MONGODB_URI`` set.
+    ``contract_uri`` would be instantiated first and raise before the gate ever ran. The result would
+    be an **error**, not a skip: a missing backend reported as a broken suite.
 
     Collection-time gating has no such ordering problem, because nothing has been set up yet.
 
@@ -537,17 +530,15 @@ _CREDENTIAL = re.compile(r"://[^@/]+@")
 
 
 class RedactedURI(str):
-    """A connection string whose ``repr`` hides its password (``REQ-E-103``).
+    """A connection string whose ``repr`` hides its password.
 
     A ``str`` subclass rather than a wrapper, because everything downstream is entitled to treat this as
     the string it is: pymongo builds a client from it, tests compare it, f-strings interpolate it.
-    Only ``repr`` changes, and only ``repr`` is what leaks. pytest prints every fixture a failing test
-    requested using ``repr``, so before this the failure header for any test holding a URI carried the
-    password into the run log, which is exactly what this prevents. Measured in the all-tiers run of
-    2026-09-02 on six failures.
+    Only ``repr`` changes, and ``repr`` is what reaches the log: pytest prints every fixture a failing
+    test requested using ``repr``, so without this the failure header of any test holding a URI would
+    carry the password into the run log.
 
-    ``__str__`` deliberately keeps the credential. Redacting it would swap a disclosure that shows up in
-    a log for a connection failure that shows up in production.
+    ``__str__`` deliberately keeps the credential, because the client needs it to connect.
     """
 
     __slots__ = ()
@@ -601,20 +592,20 @@ def autoembed_uri() -> str:
 HOST_UNREACHABLE: Final[int] = 6
 """``HostUnreachable``, the server error code that says a process in the deployment did not answer.
 
-Measured on 2026-09-15 against an Atlas CLI local deployment: ``$vectorSearch`` raised
+On an Atlas CLI local deployment with mongot stopped, ``$vectorSearch`` raises
 ``OperationFailure('Error connecting to localhost:28000 (127.0.0.1:28000) :: caused by ::
 Connection refused', 6)``. The 28000 is mongot, which the CLI runs as a separate process beside
-``mongod``, so the database answered every other call in the same run and only search failed.
+``mongod``, so the database answers every other call and only search fails.
 """
 
 COMMAND_FAILED: Final[int] = 125
 """``CommandFailed``, which is what the *other* channel to the same process answers with.
 
-Measured on 2026-09-16, ``mongod`` 8.0 running with nothing listening on its ``mongotHost`` port. One
-outage, two answers: ``$search`` raised code 6 naming the host and port that refused, while
-``$listSearchIndexes`` and ``createSearchIndexes`` raised ``OperationFailure('... :: caused by ::
-Error connecting to Search Index Management service.', 125)`` -- no host, no port, and a code that is
-general rather than a network answer. mongod reaches mongot over two channels and reports them
+On ``mongod`` 8.0 with nothing listening on its ``mongotHost`` port, one outage gives two answers:
+``$search`` raises code 6 naming the host and port that refused, while ``$listSearchIndexes`` and
+``createSearchIndexes`` raise ``OperationFailure('... :: caused by :: Error connecting to Search Index
+Management service.', 125)``, with no host, no port, and a code that is general rather than a network
+answer. mongod reaches mongot over two channels and reports them
 differently, so a guard that knows one code knows half of the outage.
 """
 
@@ -623,18 +614,17 @@ SEARCH_MANAGEMENT_UNREACHABLE: Final[str] = "Error connecting to Search Index Ma
 
 125 on its own is far too wide to skip on: it is the server's general "that command did not work out",
 and a suite that skipped on it would hide results it exists to report. This sentence is the part no
-change to this package can produce -- the host it stands for comes from a server parameter, and the
-package neither sets it nor knows it. ``AT-167`` asserts both halves, so the pairing stays deliberate.
+change to this package can produce: the host it stands for comes from a server parameter, and the
+package neither sets it nor knows it. The tests of this guard assert both halves of the pairing.
 """
 
 
 def _chain(error: BaseException) -> list[BaseException]:
     """Return ``error`` and every cause under it, outermost first.
 
-    Walked to the end rather than read two links deep, because ``REQ-E-160`` gave the ``auto`` path's
-    "no search tier could be prepared" a cause of its own: this package's error wrapping this package's
-    error wrapping the driver's, and the code is on the last of the three. A guard reading two links
-    stopped exactly one short of the failure that prompted all of this.
+    Walked to the end rather than read two links deep, because the ``auto`` path's "no search tier
+    could be prepared" error has a cause of its own: this package's error wrapping this package's error
+    wrapping the driver's, and the code is on the last of the three.
 
     Args:
         error: The outermost exception.
@@ -673,16 +663,14 @@ def _is_search_unreachable(error: BaseException) -> bool:
 def skip_if_search_is_unreachable(error: BaseException) -> None:
     """Skip the running test if ``error`` is the deployment's search process refusing connections.
 
-    ``REQ-E-124``. The problem this solves is a real one, and it cost a whole tier report: mongot was
-    down, every search-shaped test failed, and the report read as though this package had broken
-    searching. A failure the operator has to fix is not a failure the suite should assert on, and a
-    skip that names the process is the difference between "go restart mongot" and an afternoon.
+    With mongot down, every search-shaped test fails and the report reads as though this package had
+    broken searching. A failure the operator has to fix is not one the suite should assert on, and a
+    skip that names the process tells the operator to restart mongot.
 
-    **Two reports of one outage** (``REQ-E-161``). Written against code 6 alone, which is what the
-    query channel answers with, and that missed every call that provisions or reads an index: those go
-    over mongod's second channel to the same process and come back as 125 with a sentence instead.
-    Reproduced on 2026-09-16 -- a deployment with mongot gone failed twelve cluster tests and not one
-    of them carried a 6. Both conditions live in :func:`_is_search_unreachable`.
+    **Two reports of one outage.** Code 6 is what the query channel answers with. Every call that
+    provisions or reads an index goes over mongod's second channel to the same process and comes back
+    as 125 with a sentence instead, so a guard on code 6 alone misses them. Both conditions live in
+    :func:`_is_search_unreachable`.
 
     **Still deliberately narrow.** 6 matches on its own because it is a network answer this package
     cannot provoke; 125 matches only beside :data:`SEARCH_MANAGEMENT_UNREACHABLE`, because on its own
@@ -693,7 +681,7 @@ def skip_if_search_is_unreachable(error: BaseException) -> None:
     The whole chain is read rather than the first two links, because the callers hold three different
     depths of the same failure: ``test_pipeline.py`` drives the driver and catches the
     ``OperationFailure`` itself, ``test_memory_store.py`` catches this package's ``StorageError`` with
-    the driver's chained, and the ``auto`` path adds a third link on top (``REQ-E-160``). One walk
+    the driver's chained, and the ``auto`` path adds a third link on top. One walk
     reads all three, and the skip message is built from the links that say something new, so the
     namespace and the host that refused both survive however deep they sit.
 
@@ -707,8 +695,8 @@ def skip_if_search_is_unreachable(error: BaseException) -> None:
         return
     # Both links, rather than whichever one was caught. This package's error names the namespace and
     # the operation; the driver's names the host and port that refused, which is the process to go and
-    # restart. `REQ-E-124` asks for both, and building the message from the chain rather than trusting
-    # the wrapper to have embedded its cause is what makes that true of every caller.
+    # restart. Building the message from the chain rather than trusting the wrapper to have embedded its
+    # cause is what keeps both in the message for every caller.
     chain: list[str] = []
     for link in _chain(error):
         text = str(link)
@@ -752,9 +740,8 @@ def _drop_test_databases(test_database_name: str) -> Iterator[None]:
     """Drop this session's database from every configured deployment, on the way out.
 
     Session-scoped and synchronous on purpose. It runs ``asyncio.run`` in a fresh loop rather than
-    holding a client across the session, because sharing one client across every test's loop is the
-    exact pattern ``REQ-E-017`` exists to handle. The harness must not depend on the behavior under
-    test.
+    holding a client across the session, because sharing one client across every test's loop is a
+    pattern the package itself handles, and the harness must not depend on the behavior under test.
     """
     yield
     for variable in ("MONGODB_URI", "MONGODB_ATLAS_URI", "MONGODB_AUTOEMBED_URI"):
@@ -813,7 +800,7 @@ def rendered(span: ReadableSpan) -> str:
     """Return every string a span carries, joined, ready for a substring scan.
 
     Written from the ``ReadableSpan`` surface rather than from the setters, so a value reaches the scan the
-    same way whatever route put it there. Verified against opentelemetry-sdk 1.44.0: ``attributes`` and an
+    same way whatever route put it there. In opentelemetry-sdk 1.44.0, ``attributes`` and an
     event's ``attributes`` are both ``None`` on a span that never set any, and ``status.description`` is
     ``None`` until a status carries one.
 
@@ -843,8 +830,8 @@ class _ForwardingProcessor(SpanProcessor):
     """The one processor this harness adds to the global provider, sending each span to whichever test is reading.
 
     One, not one per test. A processor cannot be removed from a provider once added, so a fresh
-    ``SimpleSpanProcessor`` per test left every earlier one in place, and by the end of the suite each span
-    was offered to several hundred shut-down exporters.
+    ``SimpleSpanProcessor`` per test would leave every earlier one in place, and by the end of the suite
+    each span would be offered to hundreds of shut-down exporters.
     """
 
     def __init__(self) -> None:
@@ -869,8 +856,8 @@ def capturing_spans() -> Iterator[InMemorySpanExporter]:
 
     Two paths, because both states occur. A fresh interpreter has a ``ProxyTracerProvider`` and takes
     ``set_tracer_provider``; a suite that already configured tracing has a real one and takes the
-    processor. Measured on 1.44.0: importing ``strands`` does not install a provider, so the first path is
-    the one the unit tier takes. Either way it happens once per process.
+    processor. As of 1.44.0, importing ``strands`` does not install a provider, so the first path is the
+    one the unit tier takes. Either way it happens once per process.
     """
     global _INSTALLED
     if not _INSTALLED:

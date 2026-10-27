@@ -1,13 +1,13 @@
 """The five ``Storage`` contract methods, plus ``namespace`` and ``delete_prefix``.
 
-``REQ-E-018`` through ``REQ-E-039``. Two tiers, split on the same rule as ``test_indexes.py``: what
+Two tiers, split on the same rule as ``test_indexes.py``: what
 this package *decides* is asserted against a fake, and what **MongoDB** does with an ``_id`` range is
 asserted against a deployment.
 
 The split matters more here than anywhere else in the suite, because the whole data model rests on one
 claim about the server: that ``sort("_id", 1)`` over a bounded range returns keys in the order
 Python's ``sorted()`` would. No mock can support that claim, and the SDK's snapshot history depends on
-it (``AT-027``). The unit tier below therefore never asserts ordering. It asserts what filter, what
+it. The unit tier below therefore never asserts ordering. It asserts what filter, what
 document and what preflight, and leaves the ordering to the contract tier.
 
 Nothing here re-tests connection sharing or ownership. ``test_construction.py`` owns those, and this
@@ -51,13 +51,13 @@ if TYPE_CHECKING:
 UNREACHABLE = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=50"
 
 # A URI whose password must not appear in any message, ``repr`` or traceback this module produces.
-# ``AT-014``'s sweep across the five contract methods, which the connection layer could only leave open.
+# Used by the sweep across the five contract methods in ``TestNoStorageMethodRendersThePassword``.
 LEAKY_URI = "mongodb://appuser:SUPERSECRET@db.example.com:27017/appdb"
 
 
 @pytest.fixture(autouse=True)
 def _clear_registry() -> Iterator[None]:
-    """Isolate each test from the process-global connection registry (``REQ-E-012``)."""
+    """Isolate each test from the process-global connection registry."""
     _client._REGISTRY.clear()
     yield
     _client._REGISTRY.clear()
@@ -66,8 +66,8 @@ def _clear_registry() -> Iterator[None]:
 class FakeCursor:
     """What ``find()`` returns: a cursor that sorts synchronously and iterates asynchronously.
 
-    Both halves are parity claims rather than guesses, and ``MP-001`` checks them against
-    ``AsyncCursor``. ``sort`` is **not** a coroutine function on the real class and returns the cursor
+    Both halves are parity claims rather than guesses, and ``TestTheFakeMatchesTheDriver`` checks them
+    against ``AsyncCursor``. ``sort`` is **not** a coroutine function on the real class and returns the cursor
     itself, so ``await collection.find(...).sort(...)`` would be a ``TypeError`` on a deployment;
     ``__iter__`` does not exist there, so a synchronous ``for`` loop over the results is the same kind
     of failure. A fake that were loose about either would let both pass here.
@@ -87,7 +87,7 @@ class FakeCursor:
             yield document
         # After the documents, never instead of them. A connection that dies while a cursor is being
         # drained raises from the ``async for`` rather than from the ``find`` that produced it, which is
-        # the shape ``REQ-E-036`` is most easily lost to: an error wrapper attached to the call alone
+        # the shape driver-error wrapping is most easily lost to: an error wrapper attached to the call alone
         # lets a bare ``PyMongoError`` out of ``list``.
         if self._error is not None:
             raise self._error
@@ -102,8 +102,8 @@ class FakeAggregationCursor:
 
     It also returns whatever it was handed rather than interpreting the pipeline. Scoring is what the
     server does, and a fake that scored in Python would be checking the SDK's tokenizer against itself.
-    The unit tier below asserts the pipeline this package *emits*; ``AT-032b`` through ``AT-033`` assert
-    what MongoDB *does* with it.
+    The unit tier below asserts the pipeline this package *emits*; ``TestSearchAgainstARealDeployment``
+    asserts what MongoDB *does* with it.
     """
 
     def __init__(self, documents: Iterable[Mapping[str, Any]]) -> None:
@@ -123,7 +123,7 @@ class FakeStorageDatabase:
     version there is no ``create_collection`` here: that call belongs to the search path, and the
     storage collection has no search index at all.
 
-    ``list_collections`` answers the collation preflight (``REQ-E-170``). Its default is a collection
+    ``list_collections`` answers the collation preflight. Its default is a collection
     created without a collation, which is what the server reports for one nobody asked to be different
     and what every other test in this file is written against: the preflight has to be invisible to them
     or it is a preflight that changed what it was guarding.
@@ -144,8 +144,8 @@ class FakeStorageDatabase:
         """Report this collection's creation options, the way ``listCollections`` does.
 
         ``async def`` returning the cursor, not a cursor directly: ``AsyncDatabase.list_collections`` is
-        a coroutine and ``MP-001`` pins the direction, because getting it wrong is ``AttributeError`` on
-        a coroutine against the driver and silently fine against a looser fake.
+        a coroutine and ``TestTheFakeMatchesTheDriver`` pins the direction, because getting it wrong is
+        ``AttributeError`` on a coroutine against the driver and silently fine against a looser fake.
         """
         self.list_collections_filters.append(dict(filter or {}))
         if self.absent:
@@ -160,7 +160,7 @@ class FakeStorageDatabase:
 
 
 class FakeStorageCollection:
-    """``AsyncCollection`` narrowed to the methods ``storage.py`` calls (``MP-001``).
+    """``AsyncCollection`` narrowed to the methods ``storage.py`` calls.
 
     Holds documents in a plain dict keyed by ``_id`` and answers a range query by comparing Python
     strings, which is close enough for *what was asked* and deliberately not offered as evidence of
@@ -251,7 +251,7 @@ class FakeStorageCollection:
         return cursor
 
     async def aggregate(self, pipeline: Iterable[Mapping[str, Any]]) -> FakeAggregationCursor:
-        # ``async def``, unlike ``find``. The driver is not uniform about this and ``MP-001`` pins both
+        # ``async def``, unlike ``find``. The driver is not uniform about this and the parity class pins both
         # directions: the cursor arrives only after an ``await`` here, and without one the caller gets
         # ``AttributeError`` on a coroutine.
         stages = [dict(stage) for stage in pipeline]
@@ -271,8 +271,8 @@ class FakeStorageCollection:
             # way on 4.17.0 rather than reasoned about: ``IndexModel.document`` holds ``key`` as a
             # ``SON`` where the server reports a list of tuples, and it carries the name as a field
             # where the server uses it as the entry's key. Without them a create followed by a verify
-            # reads a shape the server would never have returned, and ``AT-121``'s second call would
-            # create the index again.
+            # reads a shape the server would never have returned, and a second ``ensure_indexes()``
+            # would create the index again.
             name = document.pop("name")
             document["key"] = list(document["key"].items())
             self.indexes[name] = {"v": 2, **document}
@@ -321,9 +321,8 @@ def unit_storage(fake: FakeStorageCollection | None = None, **overrides: Any) ->
 def protocol_members(protocol: type) -> set[str]:
     """The names a ``runtime_checkable`` protocol checks for, on every interpreter the classifiers claim.
 
-    ``AT-111`` / ``REQ-E-110``. ``__protocol_attrs__`` is a 3.12 addition: measured absent on 3.10 and 3.11
-    and present on 3.12, 3.13 and 3.14. Reading it directly is what failed the first time this suite ran on
-    the floor, in the two tests below.
+    ``__protocol_attrs__`` is a 3.12 addition: measured absent on 3.10 and 3.11 and present on 3.12, 3.13
+    and 3.14, so reading it directly fails on the 3.10 floor.
 
     There is no public replacement, so this falls back to ``typing``'s private helper, which returns the same
     five names on all five versions. Deliberately not ``dir()``, which looks public and is wrong here: it
@@ -339,14 +338,14 @@ def protocol_members(protocol: type) -> set[str]:
         members = getattr(typing, "_get_protocol_attrs", lambda _: None)(protocol)
     assert members, (
         f"neither __protocol_attrs__ nor typing._get_protocol_attrs yields the members of {protocol!r} "
-        f"on Python {sys.version.split()[0]}; AT-034 below cannot be checked without them"
+        f"on Python {sys.version.split()[0]}; the protocol conformance tests cannot be checked without them"
     )
     return set(members)
 
 
 @pytest.mark.compat
 class TestTheProtocolIsSatisfiedStructurally:
-    """AT-034, AT-044c / REQ-E-034 — the protocol boundary, checked at runtime rather than by inheritance.
+    """AT-034, AT-044c — the SDK's ``Storage`` protocol, checked at runtime rather than by inheritance.
 
     ``MongoDBStorage`` does not inherit ``Storage``, matching all three backends the SDK ships, so
     nothing but this test connects the class to the protocol. ``runtime_checkable`` makes
@@ -354,9 +353,8 @@ class TestTheProtocolIsSatisfiedStructurally:
     negative case below is here too.
 
     Marked ``compat`` and it still runs in an ordinary session, the same arrangement the memory store's
-    conformance check uses. The marker is what the weekly canary selects, and the release checklist asks for both
-    of these against the newest published SDK. Only the memory one carried it at first, so the job
-    watched one protocol and reported on two; ``AT-119`` in ``test_ci.py`` is what now fails if that recurs.
+    conformance check uses. The marker is what the weekly canary selects, so both protocols are checked
+    against the newest published SDK, and ``test_ci.py`` fails if either check loses the marker.
     """
 
     def test_a_storage_instance_satisfies_the_protocol(self) -> None:
@@ -366,9 +364,8 @@ class TestTheProtocolIsSatisfiedStructurally:
         """The negative half of ``AT-034``, so the positive half fails for a reason rather than by luck.
 
         ``Storage``'s members are ``{write, read, delete, list, search}``. Measured: a class with the
-        first four returns ``False`` and adding ``search`` returns ``True``. That is the whole reason
-        ``search`` is a delegation to the SDK's own strategy instead of waiting for
-        the aggregation pipeline.
+        first four returns ``False`` and adding ``search`` returns ``True``, so a store without
+        ``search`` does not satisfy the protocol at all.
         """
 
         class FourMethods:
@@ -400,11 +397,10 @@ class TestTheProtocolIsSatisfiedStructurally:
 
 
 class TestTheProtocolMemberLookupWorksOnEveryClaimedInterpreter:
-    """AT-111 / REQ-E-110 — the two tests above read a 3.12 attribute and failed on the 3.10 floor.
+    """AT-111 — the protocol member lookup the two tests above use works on the 3.10 floor too.
 
-    A floor-audit finding. Not a defect in the package: ``src`` holds no version gate at all and compiles
-    on 3.10 unchanged. This is about the suite being able to check ``AT-034`` everywhere the classifiers
-    promise the package works.
+    The package itself needs no version gate: ``src`` compiles on 3.10 unchanged. This is about the suite
+    being able to check protocol conformance everywhere the classifiers promise the package works.
     """
 
     def test_it_agrees_with_the_attribute_wherever_the_attribute_exists(self) -> None:
@@ -438,7 +434,7 @@ class TestTheProtocolMemberLookupWorksOnEveryClaimedInterpreter:
 
 
 class TestNamespaceReturnsAnInstanceMarkedAsAlreadyScoped:
-    """AT-030, AT-039 / REQ-E-030, REQ-E-039 — the decision that had been missed.
+    """AT-030, AT-039 — ``namespace()`` returns a real store, marked so the SDK does not wrap it.
 
     ``namespace()`` returning a real ``MongoDBStorage`` rather than the SDK's ``_NamespacedStorage``
     keeps ``list`` a single index range scan and keeps ``delete_prefix`` reachable. Both of those
@@ -474,7 +470,7 @@ class TestNamespaceReturnsAnInstanceMarkedAsAlreadyScoped:
 
     def test_the_scoped_instance_is_a_mongodbstorage_and_not_a_wrapper(self) -> None:
         """``_NamespacedStorage`` has exactly the five protocol methods, so wrapping would make
-        ``delete_prefix`` unreachable (``REQ-E-031``) and turn ``list`` back into a full scan plus a
+        ``delete_prefix`` unreachable and turn ``list`` back into a full scan plus a
         Python-side prefix strip."""
         scoped = unit_storage().namespace("tenant-a")
 
@@ -494,7 +490,7 @@ class TestNamespaceReturnsAnInstanceMarkedAsAlreadyScoped:
         assert scoped._ttl_seconds == 60
 
     def test_the_scoped_instance_shares_the_connection(self) -> None:
-        """``REQ-E-012``: it is built from the same config object, so it must not open a second pool."""
+        """It is built from the same config object, so it must not open a second pool."""
         storage = unit_storage()
 
         storage.namespace("tenant-a")
@@ -510,7 +506,7 @@ class TestNamespaceReturnsAnInstanceMarkedAsAlreadyScoped:
 
 
 class TestKeysAreNormalizedBeforeTheyBecomeIds:
-    """AT-018 / REQ-E-018 — adopted with the SDK's own ``_normalize_key``.
+    """AT-018 — keys are normalized with the SDK's own ``_normalize_key``.
 
     This rejects and merges keys MongoDB would have kept: ``""`` is a legal ``_id`` and ``a//b`` and
     ``a/b`` are two documents. Normalizing anyway is the point. Every SDK-generated key is
@@ -573,7 +569,7 @@ class TestKeysAreNormalizedBeforeTheyBecomeIds:
 
 
 class TestListAndDeletePrefixNormalizeTheirArgument:
-    """AT-019 / REQ-E-019 — ``_normalize_prefix``, which is a different function for a reason.
+    """AT-019 — ``_normalize_prefix``, which is a different function for a reason.
 
     A prefix is not a key: ``""`` is valid and matches everything, and a trailing slash is significant
     rather than noise. ``sessions/`` must not match ``sessions-archive/abc``, which is exactly what
@@ -627,9 +623,9 @@ class TestListAndDeletePrefixNormalizeTheirArgument:
 
 
 class TestTheRangeBoundIsAnEncodableSuccessor:
-    """AT-026b / REQ-E-026 — the two prefixes the one-line successor cannot express.
+    """AT-026b — the two prefixes a one-line successor cannot express.
 
-    The successor recipe on record is ``prefix[:-1] + chr(ord(prefix[-1]) + 1)``. Measured: at ``U+D7FF`` that returns a
+    The obvious successor is ``prefix[:-1] + chr(ord(prefix[-1]) + 1)``. Measured: at ``U+D7FF`` that returns a
     lone surrogate, which ``bson.encode`` refuses with ``UnicodeEncodeError``, and at ``U+10FFFF``
     ``chr`` raises ``ValueError``. Both come out of ``list``, which the protocol says returns a sorted
     list. Neither is reachable through an SDK-generated key and both are reachable through the
@@ -673,8 +669,8 @@ class TestTheRangeBoundIsAnEncodableSuccessor:
         assert collection.calls[0][1][0]["_id"]["$lt"] == "b"
 
 
-class TestTheCallsAndTheDocumentMatchPlanSection66:
-    """Unit companions to `AT-020`, `AT-035` / REQ-E-020, REQ-E-025, REQ-E-035.
+class TestTheCallsAndTheDocumentMatch:
+    """Unit companions to `AT-020`, `AT-035`: the calls each method issues and the document ``write`` builds.
 
     What the contract tier cannot see. A deployment reports the same state after one ``replace_one``
     with ``upsert=True`` as after a delete plus an insert, and a document read back cannot distinguish
@@ -754,7 +750,7 @@ class TestTheCallsAndTheDocumentMatchPlanSection66:
         assert collection.names_called == ["find_one"]
 
     async def test_delete_ignores_the_deleted_count(self) -> None:
-        """``REQ-E-023``: absent and deleted are the same outcome, and ``delete_one`` reports
+        """Absent and deleted are the same outcome, and ``delete_one`` reports
         ``deleted_count`` 0 for the first. Reading it would turn a no-op into an error."""
         collection = FakeStorageCollection()
 
@@ -773,7 +769,7 @@ class TestTheCallsAndTheDocumentMatchPlanSection66:
         assert collection.cursors[0].sort_calls == [("_id", 1)]
 
     async def test_list_strips_the_namespace_prefix_and_keeps_the_query_prefix(self) -> None:
-        """``REQ-E-026`` and ``REQ-E-030`` together, and they pull in opposite directions: a scoped
+        """Key stripping and namespace scoping together, and they pull in opposite directions: a scoped
         store's keys come back without its namespace, and the queried prefix stays on the front. One
         strip of ``len(self._prefix)`` satisfies both; stripping the whole filter satisfies neither."""
         collection = FakeStorageCollection(documents=[{"_id": "tenant-a/sessions/abc"}])
@@ -790,7 +786,7 @@ class TestTheCallsAndTheDocumentMatchPlanSection66:
 
 
 class TestTheKeyCeiling:
-    """AT-037 / REQ-E-037 — 1024 bytes UTF-8, our policy and not the server's.
+    """AT-037 — 1024 bytes UTF-8, our policy and not the server's.
 
     MongoDB 8.3.8 accepts a 1,000,000-byte ``_id`` and round-trips it, so nothing upstream fails when
     this check is missing or wrong. The cost lands on every ``list`` range scan instead, and on any
@@ -838,8 +834,8 @@ class TestTheKeyCeiling:
         assert collection.calls == []
 
     async def test_the_message_shortens_the_key_instead_of_quoting_all_of_it(self) -> None:
-        """Written by a mutation survivor: every assertion above matched on the two numbers, so a message
-        that pasted all 1025 characters in passed them all.
+        """Every assertion above matches on the two numbers, so a message that pasted all 1025 characters
+        in would pass them all.
 
         The message goes to a log, and a rejected key is unbounded in length: the protocol permits any
         string, and the reason this one was rejected is that it is long. Quoting it whole puts the entire
@@ -871,7 +867,7 @@ class TestTheKeyCeiling:
 
 
 class TestTheSizePreflight:
-    """`AT-038a` and the unit companion to `AT-029` / REQ-E-029, REQ-E-038.
+    """`AT-038a` and the unit companion to `AT-029` — the document size preflight.
 
     Two claims, and the second is only sound because of the first. ``write`` rejects an oversized
     payload before issuing the call, and it decides that from arithmetic rather than by encoding the
@@ -896,7 +892,7 @@ class TestTheSizePreflight:
     async def test_the_arithmetic_equals_what_the_encoder_produces(
         self, key: str, payload: bytes, ttl_seconds: int | None
     ) -> None:
-        """AT-038a. The document comes from the module under test rather than from a copy of the schema here,
+        """AT-038a. The document comes from the module under test rather than from a copy of its shape here,
         so a change to the shape moves both sides and the two constants fail together."""
         collection = FakeStorageCollection()
 
@@ -949,7 +945,7 @@ class TestTheSizePreflight:
 
 
 class TestDriverFailuresBecomeStorageErrors:
-    """AT-022, AT-036 / REQ-E-022, REQ-E-036 — the driver's error taxonomy.
+    """AT-022, AT-036 — the driver's error taxonomy, mapped onto ``StorageError``.
 
     ``StorageError`` is what the protocol documents, and a caller who configured this package with a
     dict should not have to import pymongo to handle a failure. The original stays reachable through
@@ -978,7 +974,7 @@ class TestDriverFailuresBecomeStorageErrors:
         """The shape an error wrapper attached to the call alone lets through. ``find`` returns without
         contacting the server, so a connection that dies mid-scan raises from the ``async for``, and a
         helper that wraps one awaitable never sees it. That is why ``list`` decides the wrapping style
-        for the whole module (see the module docstring)."""
+        for the whole module."""
         failure = network_failure()
         collection = FakeStorageCollection(documents=[{"_id": "a/one"}], iteration_error=failure)
 
@@ -1051,10 +1047,10 @@ def assert_no_leak(*subjects: object) -> None:
 
 
 class TestNoStorageMethodRendersThePassword:
-    """AT-014's storage half / REQ-E-014 — the credential sweep, which the connection layer left open.
+    """AT-014's storage half — no contract method renders the connection string's password.
 
-    ``test_client.py`` closed this for construction and for the registry. The five contract methods are
-    the surface that was still missing, and they are the ones that fail in production: a store built
+    ``test_client.py`` covers construction and the registry. The five contract methods are the ones that
+    fail in production: a store built
     once at start-up, then a driver error on every call, each one rendered into a log line or a
     traceback that ends up in a ticket.
     """
@@ -1076,7 +1072,7 @@ class TestNoStorageMethodRendersThePassword:
         dataclass decorator, prints every field including ``_config``.
 
         The config itself is not a subject here. It holds the password by construction, which is the
-        premise ``REQ-E-014`` starts from: the requirement is that the password never leaves it.
+        premise this starts from: the guarantee is that the password never leaves it.
         """
         storage = unit_storage(config={"connection_string": LEAKY_URI})
 
@@ -1101,9 +1097,9 @@ class TestNoStorageMethodRendersThePassword:
 class TestSearchIsOneAggregation:
     """AT-032a, AT-032c — the pipeline this package emits, and the round trips it does not make.
 
-    ``REQ-E-032``'s whole content is a count: **one** server-side aggregation where the SDK's default
-    does ``list("")`` plus one ``read`` per key. So the primary assertion is a call count, not a result
-    set. What MongoDB computes from the pipeline is the contract tier's job (``AT-032b`` onward); this
+    The guarantee is a count: **one** server-side aggregation where the SDK's default does ``list("")``
+    plus one ``read`` per key. So the primary assertion is a call count, not a result set. What MongoDB
+    computes from the pipeline is the contract tier's job (``TestSearchAgainstARealDeployment``); this
     tier asserts the four stages, their order, and the two cases where a stage is absent.
     """
 
@@ -1144,7 +1140,7 @@ class TestSearchIsOneAggregation:
         assert pipeline[0] == {"$match": {"_id": {"$gte": "tenant-a/", "$lt": "tenant-a0"}}}
 
     async def test_a_namespaced_store_scores_keys_without_its_own_prefix(self) -> None:
-        """AT-229 / ``REQ-E-221``. The prefix is cut off before tokenizing, by code point, so a query naming
+        """AT-229. The prefix is cut off before tokenizing, by code point, so a query naming
         the namespace does not match every key in it."""
         collection = FakeStorageCollection()
 
@@ -1156,7 +1152,7 @@ class TestSearchIsOneAggregation:
         }
 
     async def test_the_tokenizer_regex_is_the_unicode_property_form_not_backslash_w(self) -> None:
-        """The finding that made this test exist. MongoDB's ``\\w`` is ASCII-only by default, so the
+        """MongoDB's ``\\w`` is ASCII-only by default, so the
         obvious translation of the SDK's ``re.split(r"\\W+", ...)`` tokenizes ``café`` to ``caf`` and
         drops ``日本語`` entirely. ``AT-032d`` proves the parity against a deployment; this pins the
         pattern so a refactor cannot quietly swap it back.
@@ -1202,7 +1198,7 @@ class TestSearchIsOneAggregation:
 
     @pytest.mark.parametrize("query", ["", "   ", "!!! ---", "\n\t"])
     async def test_a_query_that_tokenizes_to_nothing_costs_zero_round_trips(self, query: str) -> None:
-        """``AT-032c`` (``REQ-E-032a``). The result is ``[]`` either way, which is why this needs its own
+        """``AT-032c``. The result is ``[]`` either way, which is why this needs its own
         assertion: without the short circuit the server scans the whole namespace, scores every key zero
         and the ``$match`` throws all of it away. Matches ``KeywordSearchStrategy``'s own behaviour.
         """
@@ -1215,7 +1211,7 @@ class TestSearchIsOneAggregation:
 
     async def test_results_carry_the_key_without_the_instance_prefix(self) -> None:
         """The same strip ``list`` does. A caller has to be able to hand the key straight back to
-        ``read``, and the prefix is this instance's business rather than theirs (``REQ-E-030``)."""
+        ``read``, and the prefix is this instance's business rather than theirs."""
         collection = FakeStorageCollection(aggregate_result=[{"_id": "tenant-a/notes/dark.md", "score": 2}])
 
         found = await unit_storage(collection, prefix="tenant-a").search("dark")
@@ -1223,7 +1219,7 @@ class TestSearchIsOneAggregation:
         assert [result.key for result in found] == ["notes/dark.md"]
 
     async def test_the_score_is_a_float_and_data_is_left_unset(self) -> None:
-        """``REQ-E-032b``. ``$size`` returns a BSON int32 and ``StorageSearchResult.score`` is annotated
+        """``$size`` returns a BSON int32 and ``StorageSearchResult.score`` is annotated
         ``float``; the SDK's own strategy passes the ``int`` through, so honouring the annotation is a
         deliberate divergence and ``3 == 3.0`` means only a ``type`` check can see it.
         """
@@ -1235,8 +1231,7 @@ class TestSearchIsOneAggregation:
         assert found[0].data is None
 
     async def test_a_failing_aggregation_becomes_a_storage_error(self) -> None:
-        """``REQ-E-036`` covers all five contract methods, and ``search`` was the one still delegating to
-        the SDK, so it had no wrapper of its own to test."""
+        """Driver-error wrapping covers all five contract methods, ``search`` included."""
         collection = FakeStorageCollection(error=network_failure())
 
         with pytest.raises(StorageError) as caught:
@@ -1280,12 +1275,12 @@ def _string_lists(value: Any) -> Iterator[list[str]]:
 
 
 class TestEnsureIndexesIsExplicitAndIdempotent:
-    """AT-121, AT-123 / ``REQ-E-119`` — the method that creates the storage TTL index.
+    """AT-121, AT-123 — the method that creates the TTL index ``ttl_seconds`` depends on.
 
-    ``ttl_seconds`` has stamped ``expires_at`` on every document it writes from the start and nothing in
-    this package has ever created the index that acts on it, so a caller who set the argument got a
-    field and no expiry. The fix is a method rather than work folded into the constructor or the first
-    ``write``: ``Storage``'s round-trip count is its design and a store built by the SDK is built
+    ``ttl_seconds`` stamps ``expires_at`` on every document it writes, and without the index that acts
+    on it a caller who set the argument gets a field and no expiry. It is a method rather than work
+    folded into the constructor or the first ``write``: ``Storage``'s round-trip count is part of its
+    design and a store built by the SDK is built
     in a code path the user does not see, so an index creation hidden there is DDL nobody asked for.
 
     The contract half lives in ``TestEnsureIndexesAgainstARealDeployment`` below, because whether the
@@ -1293,11 +1288,11 @@ class TestEnsureIndexesIsExplicitAndIdempotent:
     """
 
     async def test_it_leaves_the_ttl_index_the_storage_specs_declare(self) -> None:
-        """The outcome ``REQ-E-119`` states: after the call, the index is there with its option set.
+        """After the call, the index is there with its option set.
 
         Asserted against the collection's own index state rather than against the ``create_indexes``
         argument, which is the proxy. ``expireAfterSeconds: 0`` is the option that matters; without it
-        the index exists and expires nothing, which is the same user-visible failure as having no index.
+        the index exists and expires nothing, which is the same user-visible failure as no index.
         """
         collection = FakeStorageCollection()
         storage = unit_storage(collection)
@@ -1308,7 +1303,7 @@ class TestEnsureIndexesIsExplicitAndIdempotent:
         assert collection.indexes["strands_expires_at_ttl"]["expireAfterSeconds"] == 0
 
     async def test_a_second_call_creates_nothing(self) -> None:
-        """``REQ-E-119``'s idempotence, asserted as the absence of the write rather than as a flag.
+        """Idempotence, asserted as the absence of the write rather than as a flag.
 
         No ``_initialized`` attribute is involved and none should be: the guarantee is against the
         server, so a second call reads the indexes and finds the spec already satisfied. A fake that
@@ -1327,7 +1322,7 @@ class TestEnsureIndexesIsExplicitAndIdempotent:
         assert collection.names_called.count("index_information") == 2
 
     async def test_verify_mode_raises_with_the_command_that_would_fix_it(self) -> None:
-        """AT-123 / ``REQ-E-119`` and ``REQ-E-061`` — ``ensure_indexes: False`` is verify, not skip.
+        """AT-123 — ``ensure_indexes: False`` is verify, not skip.
 
         The caller this is for has no DDL rights, so the useful answer is a work order. Three claims:
         it raises rather than returning quietly, the message names the index so a ticket can be
@@ -1347,13 +1342,13 @@ class TestEnsureIndexesIsExplicitAndIdempotent:
 
 
 class TestTheIndexReadyBudgetReachesEnsure:
-    """AT-126 / ``REQ-E-122`` — this class's half of the key, which it passes without ever waiting.
+    """AT-126 — this class's half of the ``index_ready_timeout`` key, which it passes without ever waiting.
 
     ``storage_specs()`` is one ordinary index and ``_ensure_ordinary`` has no poll loop, so the number
     changes nothing here today. It is passed anyway, and asserted anyway, because the key is read from
-    one config that a caller may also hand to a ``MongoDBMemoryStore`` (``REQ-E-012``): a store that
-    quietly ignored it would make the same config mean two things. It also means the assertion still
-    holds if the storage collection ever gains something that builds asynchronously.
+    one config that a caller may also hand to a ``MongoDBMemoryStore``: a store that quietly ignored it
+    would make the same config mean two things. It also means the assertion still holds if the storage
+    collection ever gains an index that builds asynchronously.
     """
 
     @staticmethod
@@ -1390,15 +1385,14 @@ class TestTheIndexReadyBudgetReachesEnsure:
 
 
 class TestNoOrdinaryOperationTouchesAnIndex:
-    """AT-124 / ``REQ-E-121`` — the guarantee that keeps ``ensure_indexes()`` explicit.
+    """AT-124 — the guarantee that keeps ``ensure_indexes()`` explicit.
 
     The requirement is a negative, and a negative is the thing a test suite silently stops covering.
     The mechanism here is the fake's own call log: every driver method it offers is recorded, so this
     walks all six ``Storage``-facing operations and asserts the log holds nothing about indexes.
 
     It is not merely a restatement of "we did not write that code". It is what fails if a later change
-    makes ``write`` self-provisioning, which is the one plausible way somebody creates that index a
-    second time and doubles every write's round-trip count in the process.
+    makes ``write`` self-provisioning, which would double every write's round-trip count.
     """
 
     async def test_the_six_operations_neither_read_nor_create_an_index(self) -> None:
@@ -1431,7 +1425,7 @@ class TestNoOrdinaryOperationTouchesAnIndex:
 #:
 #: ``close`` is the one public coroutine deliberately absent. It releases a connection and reads no key,
 #: and a store that could not be closed because its collection has the wrong collation would leak the
-#: pool it was refusing to use -- a preflight is not worth a resource leak in the teardown path.
+#: pool it was refusing to use, and a preflight is not worth a resource leak in the teardown path.
 _KEY_OPERATIONS: Final[dict[str, tuple[Any, ...]]] = {
     "write": ("k", b"v"),
     "read": ("k",),
@@ -1461,7 +1455,7 @@ _CASE_INSENSITIVE: Final[dict[str, Any]] = {
 
 
 class TestAKeySpaceNeedsACollectionThatComparesBytes:
-    """``AT-176`` / ``REQ-E-170`` -- every key operation inherits the collection's collation.
+    """``AT-176`` -- a collection whose default collation is not binary is refused by every key operation.
 
     This package's whole key model is one document per key with the key in ``_id``: ``read`` is an
     equality match on it, ``list`` and ``delete_prefix`` are a range over it, and ``namespace()`` scopes
@@ -1481,17 +1475,17 @@ class TestAKeySpaceNeedsACollectionThatComparesBytes:
       stops being a second key and becomes a duplicate. The key space does not merely leak, it collapses.
 
     **Why refusing rather than overriding.** Passing ``collation={"locale": "simple"}`` on each query
-    would restore binary comparison for the matching, and was rejected for two reasons that are not
+    would restore binary comparison for the matching, and is not done for two reasons that are not
     stylistic. A query whose collation differs from the collection's cannot use the ``_id`` index, so
-    ``list`` and ``delete_prefix`` -- the two operations the ``_id`` key layout exists to keep on that
-    index -- would become collection scans. And it fixes nothing about uniqueness: ``_id_`` is the one
+    ``list`` and ``delete_prefix``, the two operations the ``_id`` key layout exists to keep on that
+    index, would become collection scans. And it fixes nothing about uniqueness: ``_id_`` is the one
     index whose collation cannot be chosen, so ``write("A")`` and ``write("a")`` would still collide,
     now with a ``DuplicateKeyError`` from a call that had done everything right. A collection like this
-    cannot host this key space, so the honest move is to say so at the first operation rather than to
-    half-fix it.
+    cannot host this key space, so the store says so at the first operation rather than half-fixing it.
 
-    Reported by a production-readiness review as its one P1, against ``storage.py:337`` and
-    ``storage.py:500``. Confirmed by reading: there was no ``collation`` anywhere in the module.
+    The guarantee: keys must compare byte by byte for one namespace's prefix to stay isolated from
+    another's, so every operation that touches a key checks the collection's default collation before
+    its first round trip and refuses anything other than binary comparison.
     """
 
     def _refusing(self) -> tuple[MongoDBStorage, FakeStorageCollection]:
@@ -1514,7 +1508,7 @@ class TestAKeySpaceNeedsACollectionThatComparesBytes:
 
     @pytest.mark.parametrize("operation", sorted(_KEY_OPERATIONS))
     async def test_every_operation_refuses_the_collection(self, operation: str) -> None:
-        """AT-176 -- the finding, once per operation the reviewer's two line numbers stand for."""
+        """AT-176 -- the refusal, once per key operation, before any call reaches the collection."""
         storage, collection = self._refusing()
         with pytest.raises(StorageError) as error:
             await getattr(storage, operation)(*_KEY_OPERATIONS[operation])
@@ -1581,7 +1575,7 @@ class TestAKeySpaceNeedsACollectionThatComparesBytes:
     async def test_a_second_store_on_the_same_collection_does_not_ask_again(self) -> None:
         """AT-176 -- the cache is on the connection, which is the claim the ``namespace()`` case rests on.
 
-        A namespaced store is a second ``MongoDBStorage`` over the same collection (``REQ-E-039``), so a
+        A namespaced store is a second ``MongoDBStorage`` over the same collection, so a
         cache on the instance would ask once per namespace. Both stores here share a config, and so share
         the registry entry the answer is cached on.
         """
@@ -1621,26 +1615,27 @@ class TestAKeySpaceNeedsACollectionThatComparesBytes:
 
 
 class TestAnAbsentCollectionIsNotAVerifiedOne:
-    """``AT-192`` / ``REQ-E-186`` -- the cache in front of ``AT-176``'s check, and what it let through.
+    """``AT-192`` -- the cache in front of ``AT-176``'s check never records an absent collection as verified.
 
-    ``AT-176`` establishes that the check refuses a case-folding collection. This class is about the
-    other half: a namespace that entered ``_Connection.binary_keys`` without ever having been verified.
-    ``listCollections`` answers a collection with no collation and a collection that is not there the
-    same way -- with nothing -- and the preflight cached both as *binary*. The first is a verification.
-    The second is the absence of one, and a namespace in that set is never read again.
+    ``TestAKeySpaceNeedsACollectionThatComparesBytes`` establishes that the check refuses a case-folding
+    collection. This class is about the cache: a namespace enters ``_Connection.binary_keys`` only once it
+    has been verified. ``listCollections`` answers a collection with no collation and a collection that is
+    not there the same way, with nothing. The first is a verification. The second is the absence of one,
+    and a namespace in that set is never read again.
 
-    Reproduced against ``mongod`` 7.0.12 before the fix, and the consequence is the whole of what
-    ``REQ-E-170`` exists to prevent: a store that read an absent collection, another process that then
-    created it with ``{locale: "en", strength: 2}``, and a cross-namespace read, list and prefix delete
-    that all succeeded afterwards while a store with a cleared cache refused the same collection.
-    ``AT-192c`` is that reproduction; these three are its mechanism, with no deployment.
+    Caching absence as binary would allow exactly what the collation check exists to prevent: a store
+    that read an absent collection, another process that then creates it with
+    ``{locale: "en", strength: 2}``, and a cross-namespace read, list and prefix delete that all succeed
+    afterwards while a store with a cleared cache refuses the same collection.
+    ``TestAnAbsentCollectionAgainstARealDeployment`` runs that sequence against ``mongod``; the tests here
+    are its mechanism, with no deployment.
     """
 
     async def test_an_absent_collection_is_asked_about_again_on_the_next_operation(self) -> None:
-        """AT-192 -- the finding. Two reads, two ``listCollections``, because the first verified nothing.
+        """AT-192 -- two reads, two ``listCollections``, because the first verified nothing.
 
-        The count is the assertion rather than an internal flag: what went wrong was a cached answer, and
-        a cache is observable exactly as a round trip that does not happen.
+        The count is the assertion rather than an internal flag: the risk is a cached answer, and a cache
+        is observable exactly as a round trip that does not happen.
         """
         database = FakeStorageDatabase(absent=True)
         storage = unit_storage(FakeStorageCollection(database=database))
@@ -1654,7 +1649,7 @@ class TestAnAbsentCollectionIsNotAVerifiedOne:
         )
 
     async def test_a_collection_created_case_insensitively_after_an_absent_read_is_refused(self) -> None:
-        """AT-192 -- the consequence, in the order it happens. This is the ``mongod`` reproduction's shape.
+        """AT-192 -- the dangerous sequence, in the order it happens, as the contract tier runs it.
 
         The collection is created between the two operations by something that is not this store, which is
         the only way the sequence can arise: this package creates collections implicitly and without a
@@ -1672,7 +1667,7 @@ class TestAnAbsentCollectionIsNotAVerifiedOne:
         assert "'en'" in str(error.value)
 
     async def test_a_collection_that_exists_is_still_cached(self) -> None:
-        """AT-192 -- the vacuity guard, and the regression this fix could have caused.
+        """AT-192 -- the vacuity guard: a collection that exists is still cached.
 
         Not caching *absence* must not stop caching *verification*. Without this, the cheapest way to pass
         the two tests above is to cache nothing at all, which is a ``listCollections`` on every operation
@@ -1710,7 +1705,7 @@ class TestAnAbsentCollectionIsNotAVerifiedOne:
 
 
 class TestTheFakeMatchesTheDriver:
-    """MP-001 — the parity contract for ``FakeStorageCollection`` and ``FakeCursor``.
+    """The parity contract for ``FakeStorageCollection`` and ``FakeCursor``.
 
     Same mechanical shape as ``test_indexes.py``'s, and for the same reason: a fake that returns a
     value where the driver returns a coroutine passes every unit test in this file and fails on the
@@ -1728,7 +1723,7 @@ class TestTheFakeMatchesTheDriver:
         ("delete_many", ({"_id": {"$gte": "a", "$lt": "b"}},), {}),
         # ``ensure_indexes()``'s two, reached through ``_indexes.ensure`` rather than called from
         # ``storage.py`` directly. They are here because the fake is what stands in for the driver when
-        # ``AT-121`` and ``AT-123`` run, so the same coroutine-function trap applies to them.
+        # the ``ensure_indexes()`` tests run, so the same coroutine-function trap applies to them.
         ("index_information", (), {}),
         ("create_indexes", ([],), {}),
     )
@@ -1745,7 +1740,7 @@ class TestTheFakeMatchesTheDriver:
         self, method: str, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> None:
         """A fake with ``**kwargs`` accepts anything. ``upsert`` is the one that matters, because
-        ``REQ-E-020``'s overwrite depends on it and a misspelling would silently insert."""
+        ``write``'s overwrite depends on it and a misspelling would silently insert."""
         inspect.signature(getattr(self._collection_class(), method)).bind(None, *args, **kwargs)
 
     def test_find_is_not_a_coroutine_function_on_either(self) -> None:
@@ -1788,7 +1783,7 @@ class TestTheFakeMatchesTheDriver:
     def test_both_collections_expose_a_database_carrying_a_name(self) -> None:
         """``_ensure_ordinary`` builds its namespace from ``collection.database.name``.
 
-        Two hops, both of which the fake has to offer for ``AT-121`` and ``AT-123`` to mean anything.
+        Two hops, both of which the fake has to offer for the ``ensure_indexes()`` tests to mean anything.
         ``database`` is a property on the real class rather than a method, so this checks the attribute
         rather than binding a signature, and the second assertion is the one that catches a fake whose
         ``database`` is a bare string.
@@ -1797,12 +1792,12 @@ class TestTheFakeMatchesTheDriver:
         assert FakeStorageCollection().database.name == "appdb"
 
     def test_list_collections_is_a_coroutine_on_the_database_on_both(self) -> None:
-        """``REQ-E-170``'s preflight, and the third instance of the trap this class exists for.
+        """The collation preflight, and the third instance of the trap this class exists for.
 
-        ``AsyncDatabase.list_collections`` is a coroutine returning a cursor -- ``aggregate``'s shape, and
-        the opposite of ``find`` -- so the cursor arrives from the ``await`` and not from iterating the
+        ``AsyncDatabase.list_collections`` is a coroutine returning a cursor, ``aggregate``'s shape and
+        the opposite of ``find``, so the cursor arrives from the ``await`` and not from iterating the
         call. Against a fake that handed the cursor back directly, ``async for`` over the un-awaited call
-        is a ``TypeError`` on a deployment and silently fine here, which is ``MP-001`` exactly.
+        is a ``TypeError`` on a deployment and silently fine here, which is the parity gap this class closes.
 
         The ``filter`` keyword is bound rather than assumed. An unfiltered ``listCollections`` would
         answer the same question by reading every collection in the database, and if the keyword were
@@ -1815,7 +1810,7 @@ class TestTheFakeMatchesTheDriver:
         inspect.signature(AsyncDatabase.list_collections).bind(None, filter={"name": "storage"})
 
     def test_the_delete_result_carries_the_attribute_delete_prefix_reads(self) -> None:
-        """``REQ-E-031`` returns a count, and ``DeleteResult.deleted_count`` is where it comes from."""
+        """``delete_prefix`` returns a count, and ``DeleteResult.deleted_count`` is where it comes from."""
         from pymongo.results import DeleteResult
 
         assert "deleted_count" in dir(DeleteResult)
@@ -1847,7 +1842,7 @@ async def contract_storage(
     """A store on a real deployment, in this test's own collection.
 
     One collection per test rather than one per session, so a range scan in one test cannot see
-    another's keys. ``list("")`` is unbounded by design (``REQ-E-025``), which makes a shared
+    another's keys. ``list("")`` is unbounded by design, which makes a shared
     collection the one thing this file's contract tier cannot tolerate.
     """
     config: MongoDBConfig = {"connection_string": contract_uri, "database": test_database_name}
@@ -1860,12 +1855,12 @@ async def contract_storage(
 
 @pytest.mark.contract
 class TestTheFiveMethodsAgainstARealDeployment:
-    """AT-020, 021, 023, 024, 025, 026, 027, 028, 029, 030, 031, 035, 038b, 081 — against a real deployment.
+    """AT-020, 021, 023, 024, 025, 026, 027, 028, 029, 030, 031, 035, 038b, 081 — the contract on a server.
 
     The unit tier above asserts what filter and what document. This asserts what MongoDB does with
     them, and one claim here cannot be moved: that ``sort("_id", 1)`` over a bounded range returns keys
-    in the order Python's ``sorted()`` would. The SDK's snapshot history reads its ordering from that
-    (``AT-027``), and a fake asserting it would be asserting its own implementation.
+    in the order Python's ``sorted()`` would. The SDK's snapshot history reads its ordering from that,
+    and a fake asserting it would be asserting its own implementation.
     """
 
     async def test_write_overwrites_rather_than_appending(self, contract_storage: MongoDBStorage) -> None:
@@ -1878,12 +1873,12 @@ class TestTheFiveMethodsAgainstARealDeployment:
         assert await contract_storage.list("") == ["a/b"]
 
     async def test_reading_an_absent_key_returns_none(self, contract_storage: MongoDBStorage) -> None:
-        """AT-021 / REQ-E-021. The protocol's own miss signal, and the reason ``read`` cannot use a
+        """AT-021. The protocol's own miss signal, and the reason ``read`` cannot use a
         ``KeyError``: the SDK's session manager treats ``None`` as "no session yet"."""
         assert await contract_storage.read("never/written") is None
 
     async def test_deleting_an_absent_key_is_a_no_op(self, contract_storage: MongoDBStorage) -> None:
-        """AT-023 / REQ-E-023. ``delete_one`` reports ``deleted_count`` 0 and no error, so this passes
+        """AT-023. ``delete_one`` reports ``deleted_count`` 0 and no error, so this passes
         only if the count is ignored."""
         await contract_storage.delete("never/written")
 
@@ -1899,7 +1894,7 @@ class TestTheFiveMethodsAgainstARealDeployment:
         ids=["empty", "nul", "every-byte", "four-mebibytes"],
     )
     async def test_bytes_round_trip_unchanged(self, contract_storage: MongoDBStorage, payload: bytes) -> None:
-        """AT-024 / REQ-E-024. ``b""`` is the case that catches an ``or None`` on the way out, and the
+        """AT-024. ``b""`` is the case that catches an ``or None`` on the way out, and the
         4 MiB case is the one that catches a payload the driver had to chunk."""
         await contract_storage.write("a/b", payload)
 
@@ -1910,13 +1905,13 @@ class TestTheFiveMethodsAgainstARealDeployment:
     ) -> None:
         """Why ``read`` converts instead of returning the field as stored.
 
-        Written by a mutation survivor. Measured on pymongo 4.17.0: BSON binary **subtype 0** decodes to
-        exact ``bytes``, so a collection this package wrote by itself makes the conversion a no-op and
-        deleting it changes nothing. Subtype 2 and 0x80 decode to ``Binary``, and ``Binary.__eq__``
-        compares the subtype, so ``value == payload`` is ``False`` for the same 7 bytes. A collection
-        also written by an older driver or another language's driver is where that lands, and there the
-        conversion is the difference between a correct read and a payload that compares unequal to
-        itself. ``bytes(...)`` recovers the payload for every subtype.
+        Measured on pymongo 4.17.0: BSON binary **subtype 0** decodes to exact ``bytes``, so on a
+        collection this package wrote by itself the conversion is a no-op and no other test sees it.
+        Subtype 2 and 0x80 decode to ``Binary``, and ``Binary.__eq__`` compares the subtype, so
+        ``value == payload`` is ``False`` for the same 7 bytes. A collection also written by an older
+        driver or another language's driver is where that lands, and there the conversion is the
+        difference between a correct read and a payload that compares unequal to itself. ``bytes(...)``
+        recovers the payload for every subtype.
         """
         raw = contract_storage._collection()
         await raw.replace_one({"_id": "a/b"}, {"_id": "a/b", "data": bson.Binary(b"payload", 2)}, upsert=True)
@@ -1927,14 +1922,14 @@ class TestTheFiveMethodsAgainstARealDeployment:
         assert found == b"payload"
 
     async def test_list_with_an_empty_prefix_returns_every_key(self, contract_storage: MongoDBStorage) -> None:
-        """AT-025 / REQ-E-025. The SDK's ``KeywordSearchStrategy`` calls exactly this."""
+        """AT-025. The SDK's ``KeywordSearchStrategy`` calls exactly this."""
         for key in ("a/one", "b/two", "c/three"):
             await contract_storage.write(key, b"payload")
 
         assert await contract_storage.list("") == ["a/one", "b/two", "c/three"]
 
     async def test_list_returns_full_keys_rather_than_suffixes(self, contract_storage: MongoDBStorage) -> None:
-        """AT-026 / REQ-E-026. ``LocalFileStorage`` returns the key the caller could pass back to
+        """AT-026. ``LocalFileStorage`` returns the key the caller could pass back to
         ``read``, and a backend returning ``one`` where the key is ``a/one`` breaks every caller that
         does."""
         await contract_storage.write("a/one", b"payload")
@@ -1974,15 +1969,14 @@ class TestTheFiveMethodsAgainstARealDeployment:
     async def test_the_snapshots_directory_round_trips_on_keys_the_sdk_builds(
         self, contract_storage: MongoDBStorage, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """AT-081 — the other half of the snapshot keys: the mutable ``snapshot_latest.json`` key, and both key
-        shapes listed together.
+        """AT-081 — the mutable ``snapshot_latest.json`` key, and both snapshot key shapes listed together.
 
         The test above covers the immutable history's ordering. This one covers the key the manager
         overwrites in place, and it spells no key itself. ``_snapshot_key`` and ``_snapshots_prefix`` are
         module-level in the SDK precisely so a second caller builds the same keys the manager reads, and
         calling them is the difference between testing the SDK's layout and testing a layout this file
-        invented. The checklist writes the mutable key as ``snapshot_latest``; the SDK's constant
-        is ``snapshot_latest.json``, which is why the suffix comes from the SDK here.
+        invented. The SDK's constant is ``snapshot_latest.json``, so the suffix comes from the SDK here
+        rather than being spelled out.
 
         ``_resolve_storage`` is included for the doubling case. The manager namespaces raw storage under
         ``session`` itself, so a caller who hands it a view this package already scoped would otherwise
@@ -2022,7 +2016,7 @@ class TestTheFiveMethodsAgainstARealDeployment:
         assert found == [_snapshot_key("s1", "a1", snapshot_id=i) for i in identifiers] + [latest]
 
     async def test_list_on_a_non_matching_prefix_returns_an_empty_list(self, contract_storage: MongoDBStorage) -> None:
-        """AT-028 / REQ-E-028. ``[]`` rather than an error, and the neighbouring key is there to prove
+        """AT-028. ``[]`` rather than an error, and the neighbouring key is there to prove
         the range bound excludes it rather than the collection being empty."""
         await contract_storage.write("sessions-archive/abc", b"payload")
 
@@ -2031,7 +2025,7 @@ class TestTheFiveMethodsAgainstARealDeployment:
     async def test_an_oversized_payload_raises_before_the_driver_sees_it(
         self, contract_storage: MongoDBStorage
     ) -> None:
-        """AT-029 / REQ-E-029. Our message rather than ``DocumentTooLarge``, and nothing written."""
+        """AT-029. Our message rather than ``DocumentTooLarge``, and nothing written."""
         payload = b"z" * (storage_module.MAX_DOCUMENT_BYTES + 1)
 
         with pytest.raises(StorageError) as caught:
@@ -2041,7 +2035,7 @@ class TestTheFiveMethodsAgainstARealDeployment:
         assert await contract_storage.list("") == []
 
     async def test_the_ceiling_constant_equals_what_the_deployment_advertises(self, contract_database: Any) -> None:
-        """AT-038b / REQ-E-038. The constant is written out in our own module rather than imported from
+        """AT-038b. The constant is written out in our own module rather than imported from
         ``pymongo.common``, which is not public API, so this is what keeps the two from drifting."""
         hello = await contract_database.command("hello")
 
@@ -2050,7 +2044,7 @@ class TestTheFiveMethodsAgainstARealDeployment:
     async def test_a_namespaced_store_prefixes_writes_and_strips_them_from_list(
         self, contract_storage: MongoDBStorage, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """AT-030 / REQ-E-030. Both halves, and the raw ``_id`` is read directly because a store that
+        """AT-030. Both halves, and the raw ``_id`` is read directly because a store that
         neither prefixed nor stripped would pass a test that only used its own ``list``."""
         scoped = contract_storage.namespace("tenant-a")
 
@@ -2071,7 +2065,7 @@ class TestTheFiveMethodsAgainstARealDeployment:
         assert await contract_storage.namespace("tenant-a").read("k") == b"a"
 
     async def test_delete_prefix_removes_a_range_and_returns_the_count(self, contract_storage: MongoDBStorage) -> None:
-        """AT-031 / REQ-E-031. The neighbour outside the range is what makes the count meaningful."""
+        """AT-031. The neighbour outside the range is what makes the count meaningful."""
         for key in ("a/one", "a/two", "a/three", "b/four"):
             await contract_storage.write(key, b"payload")
 
@@ -2086,8 +2080,8 @@ class TestTheFiveMethodsAgainstARealDeployment:
     async def test_a_ttl_store_writes_the_expiry_field(
         self, contract_storage: MongoDBStorage, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """AT-035 / REQ-E-035. Read through the driver rather than through ``read``, which returns only
-        the payload, and the field is what the TTL index acts on."""
+        """AT-035. Read through the driver rather than through ``read``, which returns only the payload,
+        and the field is what the TTL index created by ``ensure_indexes()`` acts on."""
         config: MongoDBConfig = {
             "connection_string": contract_storage._config["connection_string"],
             "database": contract_storage._database_name,
@@ -2104,8 +2098,8 @@ class TestTheFiveMethodsAgainstARealDeployment:
     async def test_the_fake_and_the_driver_agree_on_the_cursor_and_the_count(
         self, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """MP-001's behavioural half. The unit tier compares signatures; this runs the same three calls
-        against a deployment, in the order ``list`` makes them."""
+        """The fake's behavioural parity. ``TestTheFakeMatchesTheDriver`` compares signatures; this runs
+        the same three calls against a deployment, in the order ``list`` makes them."""
         collection = contract_database[unique_collection_name]
         await collection.replace_one({"_id": "a/one"}, {"_id": "a/one", "data": b"x"}, upsert=True)
 
@@ -2118,7 +2112,7 @@ class TestTheFiveMethodsAgainstARealDeployment:
 
 @pytest.mark.contract
 class TestSearchAgainstARealDeployment:
-    """AT-032b, AT-032d, AT-032e, AT-033 — the half no fake can carry.
+    """AT-032b, AT-032d, AT-032e, AT-033 — ``search`` on a server, the half no fake can carry.
 
     Everything that makes the aggregation worth writing lives on the server: whether the tokenizer
     agrees with the SDK's, whether the scan is covered, and what order the ``$sort`` actually returns.
@@ -2140,7 +2134,7 @@ class TestSearchAgainstARealDeployment:
             await storage.write(key, b"x" * 400)
 
     async def test_a_namespaced_store_does_not_match_its_own_prefix(self, contract_storage: MongoDBStorage) -> None:
-        """AT-229 / ``REQ-E-221``. On ``namespace("sessions")`` the query "sessions" matches no key, because
+        """AT-229. On ``namespace("sessions")`` the query "sessions" matches no key, because
         no key the caller wrote contains it, while a token in a key still matches."""
         scoped = contract_storage.namespace("sessions")
         await scoped.write("s1/state.json", b"{}")
@@ -2150,7 +2144,7 @@ class TestSearchAgainstARealDeployment:
         assert [result.key for result in await scoped.search("dark")] == ["s2/dark-mode.json"]
 
     async def test_results_are_keys_and_scores_with_no_payload(self, contract_storage: MongoDBStorage) -> None:
-        """``AT-032b`` (``REQ-E-032b``)."""
+        """``AT-032b``. Keys in score order, each score a ``float``, and no payload fetched."""
         await self._seed(contract_storage)
 
         found = await contract_storage.search("dark mode")
@@ -2172,7 +2166,7 @@ class TestSearchAgainstARealDeployment:
         accepts, so ``\\w+`` tokenizes ``café`` to ``caf``, ``m``, ``nchen`` and drops ``日本語``
         altogether. Both mangled forms still return *results*, which is what makes this invisible without
         a comparison against the SDK's own scorer. The comparison is against ``token_overlap_score`` over
-        the key text alone, because scoring the key space rather than the payload is the decision here.
+        the key text alone, because this package scores the key space rather than the payload.
         """
         from strands.storage.search.keyword import token_overlap_score, tokenize
 
@@ -2188,10 +2182,10 @@ class TestSearchAgainstARealDeployment:
         assert [(result.key, int(result.score)) for result in found] == expected
 
     async def test_a_mixed_case_key_matches_a_lowercase_query(self, contract_storage: MongoDBStorage) -> None:
-        """Written by a mutation survivor: removing ``$toLower`` from the key side changed nothing.
+        """The ``$toLower`` on the key side, which no other test exercises.
 
-        Every other key in this file is already lowercase, so the stage was doing no work anywhere the
-        suite could see. The SDK's ``tokenize`` lowercases whatever it is given, meaning the query side is
+        Every other key in this file is already lowercase, so the stage does no work anywhere else the
+        suite can see. The SDK's ``tokenize`` lowercases whatever it is given, meaning the query side is
         always folded and the key side has to be folded to meet it. ``_normalize_key`` collapses slashes
         and rejects ``..`` and deliberately does **not** change case, so a caller writing
         ``Sessions/Agent-1/State.json`` keeps that ``_id`` and, without the stage, would never match
@@ -2205,14 +2199,13 @@ class TestSearchAgainstARealDeployment:
         assert found[0].score == 2.0
 
     async def test_a_token_only_in_a_payload_does_not_match(self, contract_storage: MongoDBStorage) -> None:
-        """The key-space trade, asserted rather than left as prose.
+        """The trade of scoring keys rather than payloads, asserted rather than only documented.
 
         The SDK's default scores ``f"{key} {content}"`` and would return this key; we score the key space
         alone, so a word that appears only inside a payload finds nothing. This is the one intended
-        behavioural divergence in the method, and it is what buys the covered scan in ``AT-032e``: reading
+        behavioural divergence in the method, and it is what buys the covered scan asserted below: reading
         payload text server-side means fetching every document. The unit tier pins the mechanism (no
-        ``$data`` in the projection); this pins the consequence. Replaces an earlier test that asserted
-        the delegating behaviour, whose docstring already named this as the assertion that would change.
+        ``$data`` in the projection); this pins the consequence.
         """
         await contract_storage.write("notes/one.md", b"needle")
 
@@ -2267,7 +2260,7 @@ class TestSearchAgainstARealDeployment:
     async def test_aggregate_is_awaited_where_find_is_not(
         self, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """MP-001's aggregation half, against the driver rather than against ``inspect``.
+        """The fake's aggregation parity, against the driver rather than against ``inspect``.
 
         ``AsyncCollection.find`` returns a cursor directly and ``aggregate`` returns a coroutine, so the
         missing ``await`` here produces ``AttributeError: 'coroutine' object has no attribute ...`` rather
@@ -2283,17 +2276,17 @@ class TestSearchAgainstARealDeployment:
 
 @pytest.mark.contract
 class TestOneStorageServesTwoSuccessiveEventLoops:
-    """AT-091b / REQ-E-017a — against a deployment, where the wrong answer raises.
+    """AT-091b — one store across successive event loops, against a deployment, where the wrong answer raises.
 
-    ``AT-091`` in ``test_client.py`` asserts which client the registry hands back, which is the mechanism.
-    This asserts the outcome the requirement states: a store built once and written through twice, on two
+    ``test_client.py`` asserts which client the registry hands back, which is the mechanism. This asserts
+    the outcome: a store built once and written through twice, on two
     loops, has to store both payloads. Against a real deployment the broken version does not return a
     surprising value, it raises ``RuntimeError: Cannot use AsyncMongoClient in different event loop``.
 
-    Every test in this file is a single ``asyncio.run`` under pytest-asyncio, which is why none of them
-    caught this. A synchronous ``Agent`` is not: ``strands/_async.py`` gives each entry point a fresh loop
+    Every other test in this file is a single ``asyncio.run`` under pytest-asyncio, so none of them can
+    see this. A synchronous ``Agent`` is not: ``strands/_async.py`` gives each entry point a fresh loop
     in a worker thread, so a store held on the agent crosses loops on the second call. The shape below is
-    the smallest thing that has that property, and it is what ``examples/unified_storage.py`` hit first.
+    the smallest thing that has that property, and ``examples/unified_storage.py`` has it too.
     """
 
     @staticmethod
@@ -2341,13 +2334,14 @@ class TestOneStorageServesTwoSuccessiveEventLoops:
 
 @pytest.mark.contract
 class TestEnsureIndexesAgainstARealDeployment:
-    """AT-121b, AT-122 / ``REQ-E-119``, ``REQ-E-120`` — the server boundary no fake can stand at.
+    """AT-121b, AT-122 — TTL expiry on a real server, which no fake can stand in for.
 
     The unit tier above asserts that ``ensure_indexes()`` asks for the right index. That is the
-    mechanism. The outcome that matters is that a document written with a TTL stops
-    existing, and the thing that removes it is the server's TTL monitor: a background task in ``mongod``
+    mechanism. The outcome a caller setting ``ttl_seconds`` wants is that a document written with a TTL
+    stops existing, and the thing that removes it is the server's TTL monitor: a background task in ``mongod``
     that sweeps once a minute and is reachable from no assertion this package can make about its own
-    code. ``AT-122`` is therefore the only test in the suite that waits on wall-clock time, and it waits
+    code. ``test_a_document_written_with_a_ttl_is_gone`` is therefore the only test in the suite that
+    waits on wall-clock time, and it waits
     because the alternative is asserting the index document and calling that expiry.
     """
 
@@ -2386,7 +2380,7 @@ class TestEnsureIndexesAgainstARealDeployment:
     async def test_a_document_written_with_a_ttl_is_gone(
         self, contract_uri: str, test_database_name: str, unique_collection_name: str
     ) -> None:
-        """AT-122 / ``REQ-E-120`` — the outcome, not the index.
+        """AT-122 — the outcome, not the index.
 
         ``read`` returning ``None`` is the assertion, and it is deliberately the same signal a caller
         gets for a key that was never written: that is what expiry looks like from outside. The write
@@ -2415,23 +2409,23 @@ class TestEnsureIndexesAgainstARealDeployment:
 
 @pytest.mark.contract
 class TestACaseFoldingCollectionAgainstARealDeployment:
-    """AT-176 / ``REQ-E-170`` — a real server over the wire. The refusal, and what it is refusing, measured.
+    """AT-176 — a real server over the wire. The refusal, and what it is refusing, measured.
 
     The unit tier above asserts that a reported collation stops every operation. This asserts that the
-    report is real and that what it predicts is real, because both halves were assumptions when the
-    finding arrived: that ``listCollections`` puts the collation in ``options.collation``, and that a
+    report is real and that what it predicts is real, because both halves are assumptions until a server
+    confirms them: that ``listCollections`` puts the collation in ``options.collation``, and that a
     case-folding one does to a key space what the refusal says it does.
 
-    Measured here on whatever the contract tier is pointed at, and recorded from 8.0.32 while writing it:
+    Measured on whatever the contract tier is pointed at. On 8.0.32:
 
     * a collection created ``{locale: "en", strength: 2}`` reports the resolved ten-field document, and
-      one created ``{locale: "simple"}`` reports ``options`` **empty** -- the server does not store a
+      one created ``{locale: "simple"}`` reports ``options`` **empty**. The server does not store a
       simple collation, which is why the check reads for a locale that is not ``simple`` rather than for
       the key's presence;
     * ``find_one({"_id": "tenant-a/private"})`` returns the document written as ``Tenant-A/private``;
     * a second insert of ``tenant-a/private`` beside it is a ``DuplicateKeyError``, so the unique ``_id``
       index folds too and two keys differing only in case are one key;
-    * ``{"$gte": "tenant-a/", "$lt": "tenant-a0"}`` -- the bounds ``delete_prefix`` builds -- matches
+    * ``{"$gte": "tenant-a/", "$lt": "tenant-a0"}``, the bounds ``delete_prefix`` builds, matches
       ``Tenant-A/private``.
 
     The last three are the cross-namespace read, the collapsed key space and the cross-namespace delete,
@@ -2468,7 +2462,7 @@ class TestACaseFoldingCollectionAgainstARealDeployment:
         report = await _indexes.read_collation(contract_database[f"{unique_collection_name}_plain"])
 
         assert report.collation is None
-        assert report.exists is True, "an uncollated collection read as one that is not there (REQ-E-186)"
+        assert report.exists is True, "an uncollated collection read as one that is not there"
 
     async def test_an_explicit_simple_collation_is_not_stored_by_the_server(
         self, contract_database: Any, unique_collection_name: str
@@ -2485,7 +2479,7 @@ class TestACaseFoldingCollectionAgainstARealDeployment:
     async def test_a_store_over_it_refuses_before_writing_anything(
         self, contract_uri: str, test_database_name: str, folded_collection: Any
     ) -> None:
-        """AT-176 — the finding, end to end: a real store, a real collection, no write."""
+        """AT-176 — the refusal, end to end: a real store, a real collection, no write."""
         config: MongoDBConfig = {"connection_string": contract_uri, "database": test_database_name}
         storage = MongoDBStorage(config, collection=folded_collection.name)
         try:
@@ -2511,7 +2505,7 @@ class TestACaseFoldingCollectionAgainstARealDeployment:
         assert found["_id"] == "Tenant-A/private"
 
     async def test_two_keys_differing_only_in_case_collide_on_the_id_index(self, folded_collection: Any) -> None:
-        """AT-176 — second of three, and the one the review did not name. The ``_id`` index is unique and
+        """AT-176 — second of three. The ``_id`` index is unique and
         its collation cannot be chosen, so the key space does not merely leak across namespaces: it
         collapses, and a legitimate second key arrives as a duplicate."""
         from pymongo.errors import DuplicateKeyError
@@ -2535,23 +2529,23 @@ class TestACaseFoldingCollectionAgainstARealDeployment:
 
 @pytest.mark.contract
 class TestAnAbsentCollectionAgainstARealDeployment:
-    """AT-192 / ``REQ-E-186`` — a real server over the wire. The premise the whole distinction rests on, measured.
+    """AT-192 — a real server over the wire. The premise the whole distinction rests on, measured.
 
     The unit tier asserts what the package does with the two answers. This asserts that the server really
     gives two answers where it appears to give one: a collection that is not there and a collection with
     no collation are both *no collation*, and only ``listCollections`` returning a document at all tells
-    them apart. If that stopped being true -- if the server began reporting an absent collection the way
-    it reports an uncollated one, or stopped reporting uncollated ones -- the caching rule in
+    them apart. If that stopped being true, because the server began reporting an absent collection the
+    way it reports an uncollated one or stopped reporting uncollated ones, the caching rule in
     ``_require_binary_keys`` would be caching the wrong one of the two, and these are the tests that
     would say so rather than a store that silently skipped its preflight.
 
-    Measured from 7.0.12 while writing it, and re-measured by this class wherever the contract tier runs.
+    Measured on 7.0.12, and re-measured by this class wherever the contract tier runs.
     """
 
     async def test_a_collection_that_was_never_created_reports_that_it_is_not_there(
         self, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """The finding's premise: absence is visible, and it is not a collation of ``None``."""
+        """The premise: absence is visible, and it is not a collation of ``None``."""
         report = await _indexes.read_collation(contract_database[f"{unique_collection_name}_never"])
 
         assert report.exists is False
@@ -2562,7 +2556,7 @@ class TestAnAbsentCollectionAgainstARealDeployment:
     ) -> None:
         """The two answers as the caller reads them, in one test so neither can pass alone.
 
-        ``False`` for the collection that is not there is not a refusal -- nothing raises, because this
+        ``False`` for the collection that is not there is not a refusal. Nothing raises, because this
         package creates collections implicitly and refusing would fail the first write to an empty
         database. It is the answer that must not be cached. ``True`` beside it is the vacuity guard: a
         preflight that answered ``False`` for everything would pass the first assertion and stop this
@@ -2579,13 +2573,13 @@ class TestAnAbsentCollectionAgainstARealDeployment:
     async def test_a_store_over_an_empty_database_keeps_asking_until_its_own_write_creates_the_collection(
         self, contract_uri: str, test_database_name: str, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """The finding end to end, on the connection's own cache.
+        """The caching rule end to end, on the connection's own cache.
 
         Before the first write there is nothing to verify, so the namespace stays out of ``binary_keys``
         and every operation asks again. The write creates the collection implicitly; the operation after
-        it has something to read, reads it, and the asking stops. What this rules out is the shape the
-        review found: a namespace recorded as verified while the collection it names does not exist, after
-        which no collation anybody gives that collection is ever looked at.
+        it has something to read, reads it, and the asking stops. What this rules out is a namespace
+        recorded as verified while the collection it names does not exist, after which no collation
+        anybody gives that collection is ever looked at.
         """
         config: MongoDBConfig = {"connection_string": contract_uri, "database": test_database_name}
         storage = MongoDBStorage(config, collection=f"{unique_collection_name}_empty")
@@ -2593,7 +2587,7 @@ class TestAnAbsentCollectionAgainstARealDeployment:
         try:
             assert await storage.read("absent") is None
             assert target not in storage._connection.binary_keys, (
-                "a collection that does not exist was cached as verified (REQ-E-186)"
+                "a collection that does not exist was cached as verified"
             )
 
             await storage.write("k", b"v")

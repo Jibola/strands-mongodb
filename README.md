@@ -9,11 +9,12 @@ One MongoDB deployment behind the SDK's two extension points:
 | Storage | `MongoDBStorage` | `strands.storage.Storage` | Sessions, context offloading, memory persistence, context history, transcripts |
 | Memory | `MongoDBMemoryStore` | `strands.memory` `MemoryStore` | Semantic recall over Atlas Vector Search, extraction writes |
 
-The `Storage` protocol is the leverage point: the SDK accepts a single top-level `storage` on
-`Agent`, and **five** subsystems inherit it. One `MongoDBStorage` is therefore the backend for
-session management and context offloading. Each is still turned on with the SDK's own objects
-(`SnapshotSessionManager`, and `ContextOffloader` or `context_manager="auto"`), and neither needs a
-MongoDB-specific class.
+The SDK accepts a single top-level `storage` on `Agent`, and **five** subsystems inherit it. One
+`MongoDBStorage` is therefore the backend for session management and context offloading. Each is still
+turned on with the SDK's own objects (`SnapshotSessionManager`, and `ContextOffloader` or
+`context_manager="auto"`), and neither needs a MongoDB-specific class.
+
+![strands-mongodb in a Strands agent: the SDK's session manager, context offloader and memory manager use MongoDBStorage and MongoDBMemoryStore, which store to MongoDB](docs/images/architecture.svg)
 
 ## Status
 
@@ -31,22 +32,18 @@ MongoDB-specific class.
 > | `0.0.1` | Package metadata, extras, import paths, public names |
 > | `0.1.0` | `MongoDBStorage` + `MongoDBMemoryStore`, the three search tiers, record expiry, OpenTelemetry spans and structured log fields, docs, tests |
 >
-> Storage `search()` ranks by token overlap in a single aggregation over the key space. Measured over 1,000
-> keys carrying 400-byte payloads: 2 wire commands and 9 ms, against 1,041 commands and 210 ms for the
-> SDK's default, for the same ranking. Scores come from keys rather than payload text, so a word that
-> appears only inside a stored value will not match.
+> Storage `search()` ranks by token overlap in a single aggregation over the key space, where the SDK's
+> default issues one read per key. Scores come from keys rather than payload text, so a word that appears
+> only inside a stored value will not match.
 >
 > Record expiry is armed differently on each surface. `MongoDBMemoryStore.initialize()` provisions the
 > TTL index itself, so a store configured with `ttl_seconds` expires its records without further work.
 > `MongoDBStorage` leaves it to an explicit `await storage.ensure_indexes()` at startup, because an
 > `Agent` builds its storage in a code path the operator never sees and DDL should not be issued from
-> one. Stamping the field is not the same as provisioning the index that acts on it, and only one of
-> the two surfaces can safely do both on its own.
+> one. Without that index, `MongoDBStorage` stamps the expiry field and nothing removes the record.
 >
-> Verified against two deployments rather than one: MongoDB 8.3.8 with a local mongot, and cloud
-> Atlas 8.0.32. The two report search index state differently in six places, and the tests read both
-> spellings, because a suite pinned to one deployment passes everywhere it was written and nowhere
-> else.
+> Tested against MongoDB 8.3.8 with a local `mongot` and against Atlas. The two report search index state
+> differently, and the tests accept both forms.
 
 ## Install
 
@@ -70,7 +67,7 @@ backend. It is metadata only. The extra you choose is what selects the dependenc
 ### Before the package reaches PyPI
 
 Nothing is published yet, so the commands above resolve to nothing. Until they do, install from this
-repository. The obvious URL fails twice over, and neither failure explains the other.
+repository. The plain `https://` URL fails for two separate reasons.
 
 The repository is private and MongoDB enforces SAML single sign-on, so an unauthenticated `https://`
 clone stops before pip ever sees a package:
@@ -98,10 +95,9 @@ This needs a GitHub account in the `mongodb` organization holding an SSH key aut
 sign-on. A CI runner needs a deploy key for the same reason. There is no anonymous path to this
 package until it is published.
 
-What you get is not a release. No release tag exists yet, so the version is derived from the distance
-since the first commit and moves every time `main` does -- an install from `main` reported
-`0.0.1.dev69+g20b0ea579` when this was written. Pin a commit for anything that has to resolve the same
-way twice, after the `.git` and before the fragment:
+What you get is not a release. No release tag exists yet, so the version is a development version of
+the form `0.0.1.devN+g<sha>`, counted from the first commit, and it changes every time `main` does. Pin
+a commit for anything that has to resolve the same way twice, after the `.git` and before the fragment:
 
 <!-- skip: the same private clone as above, against a commit this document does not pin for you -->
 ```bash
@@ -113,8 +109,8 @@ pip install 'strands-mongodb[all] @ git+ssh://git@github.com/mongodb/strands-mon
 [`python/README.md`](python/README.md) is the reference: quickstarts for both surfaces, every
 configuration key of all three `TypedDict`s, how a search picks its tier, the tenancy boundaries and who
 enforces each one, how to erase stored memories, the index and privilege handoff for a DBA, the
-spans and log fields it emits, and the limits this package does not remove. This page stays short on purpose. Where the two would say the same
-thing, only one of them does.
+spans and log fields it emits, and the limits this package does not remove. This page stays short so that
+each fact lives in one place.
 
 [`python/MIGRATION.md`](python/MIGRATION.md) is for readers arriving from one of the three MongoDB
 backends that already exist for Strands: the archived `mongodb_memory` tool in `strands-agents-tools`,
@@ -133,11 +129,11 @@ you run as separate processes, so the only thing that carries state between them
 | | |
 |---|---|
 | Python | >= 3.10 |
-| `strands-agents` | >= 1.54.0, the first release shipping every `strands` module the storage backend imports — `strands.storage.search.keyword` is the binding one |
+| `strands-agents` | >= 1.54.0, the first release shipping every `strands` module the storage backend imports, `strands.storage.search.keyword` among them |
 | `pymongo` | >= 4.14.0 |
 | `pymongo-search-utils` | >= 0.3.0, with the `memory` extra only |
 | `opentelemetry-api` | >= 1.30.0. The API only; exporting spans is the application's choice |
-| MongoDB | Any deployment serves storage. The text tier needs Atlas Search; the vector tier needs Atlas or an Atlas CLI local deployment. The default embedding path also needs a model registered on the cluster, measured present on Atlas and absent on a local `mongot` 8.3.8. |
+| MongoDB | Any deployment serves storage. The text tier needs Atlas Search; the vector tier needs Atlas or an Atlas CLI local deployment. The default embedding path also needs an embedding model registered on the cluster, which Atlas provides and a local `mongot` 8.3.8 does not. |
 
 ## Erasing memories
 
@@ -152,8 +148,8 @@ details, including the two ways this surprises people.
 |---|---|---|
 | `python/` | `strands-mongodb` | PyPI |
 
-A `typescript/` sibling publishing the same name to npm is deferred pending a parity spike;
-the layout above reserves the shape so it can be added without moving files.
+A `typescript/` sibling publishing the same name to npm may follow. The layout reserves room for it so
+it can be added without moving files.
 
 ## Contributing
 

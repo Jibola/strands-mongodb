@@ -1,10 +1,7 @@
 """Characterization tests for the top-level package surface.
 
-Written against the 0.0.1 scaffold **before** any source file moves, so they document what the
-package actually does rather than what the implementation is about to do. That is what makes them a
-regression net: a test written after the change describes the change and can only ever pass.
-
-Covers ``CH-001``, ``CH-004`` and ``CH-005``.
+They pin which names live in which module, that a bare import pulls in no driver, and the spelling of
+the class prefix.
 """
 
 from __future__ import annotations
@@ -22,15 +19,14 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 
 
 class TestPublicSurface:
-    """CH-001 — which names live where."""
+    """Which names live where."""
 
     def test_top_level_declares_the_two_classes_and_the_version(self) -> None:
-        """AT-228 / ``REQ-E-220``. ``__all__`` is the public surface: the two stores and the version.
+        """AT-228 — ``__all__`` is the public surface: the two stores and the version.
 
         ``__all__`` is what documentation tools and ``--no-implicit-reexport`` read, so a class left out
-        of it would make the root import an undocumented accident even though ``REQ-E-006`` makes it
-        work. The cost of listing them is in ``TestStarImportIsTheOneEagerPath`` in
-        ``test_lazy_exports.py``, which carries ``AT-006e``.
+        of it would make the root import undocumented even though the lazy root import works. The cost
+        of listing them is pinned by ``TestStarImportIsTheOneEagerPath`` in ``test_lazy_exports.py``.
         """
         assert strands_mongodb.__all__ == ["MongoDBMemoryStore", "MongoDBStorage", "__version__"]
 
@@ -50,11 +46,7 @@ class TestPublicSurface:
         assert result.stdout.strip() == "True True"
 
     def test_storage_class_lives_in_the_storage_module(self) -> None:
-        """``MongoDBStorage`` is importable from ``strands_mongodb.storage``.
-
-        This path survives the flat-layout move unchanged, because ``storage`` goes from being a
-        package to being a module of the same name.
-        """
+        """``MongoDBStorage`` is importable from ``strands_mongodb.storage``."""
         from strands_mongodb.storage import MongoDBStorage
 
         assert MongoDBStorage.__name__ == "MongoDBStorage"
@@ -62,11 +54,7 @@ class TestPublicSurface:
     def test_memory_class_lives_in_the_memory_store_module(self) -> None:
         """``MongoDBMemoryStore`` is importable from ``strands_mongodb.memory_store``.
 
-        The one import path the layout move deliberately broke. This test named
-        ``strands_mongodb.memory`` against the scaffold; the layout names the module
-        ``memory_store.py``, matching the extension template's own ``memory_store.py``, so it was
-        edited. The edit is the record that the break was chosen rather than discovered, and
-        nothing was published under the old path: 0.0.1 never built.
+        The module name matches the Strands extension template's own ``memory_store.py``.
         """
         from strands_mongodb.memory_store import MongoDBMemoryStore
 
@@ -75,10 +63,9 @@ class TestPublicSurface:
     def test_the_retired_module_path_is_gone(self) -> None:
         """``strands_mongodb.memory`` must not resolve, by leftover directory or by lazy alias.
 
-        A stale ``memory/`` directory with only a ``__pycache__`` in it survives a careless move and
-        still imports as a namespace package on some layouts, giving a module with no
-        ``MongoDBMemoryStore`` in it. That failure reads as a broken install rather than a renamed
-        module.
+        A stale ``memory/`` directory with only a ``__pycache__`` in it still imports as a namespace
+        package on some layouts, giving a module with no ``MongoDBMemoryStore`` in it. That failure
+        reads as a broken install rather than a renamed module.
         """
         with pytest.raises(ImportError):
             import strands_mongodb.memory  # type: ignore[import-not-found]  # noqa: F401
@@ -90,15 +77,14 @@ class TestPublicSurface:
 
 
 class TestBareImportPullsNothing:
-    """CH-004 — importing the package imports no driver."""
+    """Importing the package imports no driver."""
 
     def test_importing_the_package_does_not_import_pymongo(self) -> None:
         """``import strands_mongodb`` leaves ``pymongo`` out of ``sys.modules``.
 
         Runs in a subprocess because this test session has already imported ``pymongo`` through
         other tests and fixtures. Asserting on the current interpreter's ``sys.modules`` would pass
-        or fail based on test ordering, which is worse than not testing it: it would look like
-        coverage while measuring collection order.
+        or fail based on test ordering.
         """
         source = (
             "import sys;"
@@ -119,7 +105,7 @@ class TestBareImportPullsNothing:
 
 
 class TestTheBareInstallPromise:
-    """AT-001a / REQ-E-001 / CH-004 — importable with nothing installed at all.
+    """AT-001a — importable with nothing installed at all.
 
     ``TestBareImportPullsNothing`` above runs in the development venv, where every dependency is
     present and merely goes unimported. That is a weaker claim than the one the package makes. Here
@@ -159,7 +145,7 @@ class TestTheBareInstallPromise:
 
 
 class TestNamingConvention:
-    """CH-005 — the class prefix is ``MongoDB``, not ``Mongodb``."""
+    """The class prefix is ``MongoDB``, not ``Mongodb``."""
 
     def test_both_classes_spell_the_prefix_in_full_caps(self) -> None:
         """A rename here is silent at import time and breaks every consumer.

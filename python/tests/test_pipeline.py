@@ -1,19 +1,18 @@
-"""Search stage construction: ``REQ-E-070`` through ``REQ-E-074a``.
+"""Search stage construction: the vector, full-text and hybrid pipelines this package sends.
 
 Three tiers again, and the split is sharper here than in ``test_indexes.py`` because the unit tier
-can only ever check that a dict has the shape somebody claimed. `AT-070` asserts the AutoEmbeddings
-query shape exactly, and passing it settles nothing about whether Atlas accepts that shape: the question is
-open precisely because two published packages emit different ones. `AT-070i` is the test that would
-settle it and it skips everywhere CI can reach.
+can only ever check that a dict has the shape somebody claimed. ``TestTheAutoEmbeddingsQueryShape``
+asserts the AutoEmbeddings query shape exactly, and passing it settles nothing about whether Atlas
+accepts that shape, because two published packages emit different ones.
+``TestTheAutoEmbeddingsQueryAgainstADeploymentThatCanAnswerIt`` settles it, and it runs only against a
+deployment with automated embedding.
 
 What the contract and integration tiers add is the arithmetic and the ordering. `MAX_NUM_CANDIDATES`
-is a number copied from a server, so `AT-072b` re-reads it from that server. `REQ-E-073`'s ordering is
-the case where pipelines containing identical stages return the requested count or nothing depending
-only on where the ``$limit`` sits, so `AT-073b` runs the wrong ones too rather than asserting the good
-one in isolation.
-
-What was measured is recorded in this suite, including the requirement whose prescribed
-mechanism the measurement contradicted.
+is a number copied from a server, so ``TestTheBoundsThisPackageCopiesFromTheServer`` re-reads it from
+that server. The full-text stage order is the case where pipelines containing identical stages return
+the requested count or nothing depending only on where the ``$limit`` sits, so
+``TestTheOrderingAgainstMongot`` runs the wrong orders too rather than asserting the good one in
+isolation.
 """
 
 from __future__ import annotations
@@ -37,7 +36,7 @@ AUTO_EMBED_MODE = _indexes.vector_mode({"database": "d"})
 """The zero-configuration mode: no vector keys set at all resolves to AutoEmbeddings."""
 
 MANUAL_MODE = _indexes.vector_mode({"database": "d", "embedding_dimensions": 4, "similarity": "cosine"})
-"""The mode CI can actually create an index for."""
+"""The mode CI can actually create an index for: an ``autoEmbed`` index needs a registered model."""
 
 VECTOR = [1.0, 0.0, 0.0, 0.0]
 
@@ -51,17 +50,17 @@ which is the convention the suite already follows for fixture data."""
 
 
 def _names(stages: list[dict[str, Any]]) -> list[str]:
-    """Stage names in order, which is the property `REQ-E-073a` is actually about."""
+    """Stage names in order, which is the property the full-text stage order is actually about."""
     return [next(iter(stage)) for stage in stages]
 
 
 class TestTheAutoEmbeddingsQueryShape:
-    """AT-070 / REQ-E-070, and the shape half of that question.
+    """AT-070 — the AutoEmbeddings ``$vectorSearch`` stage, pinned exactly.
 
     ``pymongo_search_utils`` 0.3.0 emits ``{"query": {"text": q}}`` with a top-level ``model``; the
     community ``strands-mongodb-store`` 0.2.0 emits a bare ``"query": q`` and no ``model``. The two
-    cannot both be right and no deployment CI reaches can adjudicate, so this pins the one we send and
-    the exactness is the point: a test asserting only that ``query`` is present passes for both.
+    cannot both be right, so this pins the one we send and the exactness is the point: a test asserting
+    only that ``query`` is present passes for both.
     """
 
     def test_the_stage_matches_the_builder_exactly(self) -> None:
@@ -87,9 +86,9 @@ class TestTheAutoEmbeddingsQueryShape:
     def test_the_query_is_a_nested_document_and_not_a_bare_string(self) -> None:
         """The one difference between the two candidate shapes, asserted on its own.
 
-        Named separately from the equality above because this is the assertion that would fail if
-        the question resolves the other way, and a reader coming back to this file after that happens needs
-        to find the line to change rather than a dict to diff.
+        Named separately from the equality above because this is the assertion that would fail if the
+        server ever required the other shape, and a reader coming back to this file then needs to find
+        the line to change rather than a dict to diff.
         """
         stage = _pipeline.vector_stages(mode=AUTO_EMBED_MODE, index_name="i", limit=1, query_text="q")[0][
             "$vectorSearch"
@@ -111,10 +110,10 @@ class TestTheAutoEmbeddingsQueryShape:
 
 
 class TestTheBuilderAndPathFollowTheMode:
-    """AT-070a / REQ-E-070, REQ-E-067.
+    """AT-070a.
 
     Two mistakes are possible here and neither is a type error: calling the wrong builder, and giving
-    the right builder the wrong ``path``. The ``autoEmbed`` definition indexes the **text** field,
+    the right builder the wrong ``path``. The ``autoEmbed`` index definition indexes the **text** field,
     so the AutoEmbeddings query paths at ``content`` while the manual query paths at ``embedding``.
     """
 
@@ -153,9 +152,9 @@ class TestTheBuilderAndPathFollowTheMode:
     def test_the_path_is_the_field_the_index_declared(
         self, mode: Any, kwargs: dict[str, Any], expected_path: str
     ) -> None:
-        """The path in the query has to be the path in the index definition, which is the authority
-        for it. Read out of ``vector_index_definition`` rather than restated, so the two cannot
-        drift apart without this failing."""
+        """The path in the query has to be the path in the index definition. Read out of
+        ``vector_index_definition`` rather than restated, so the two cannot drift apart without this
+        failing."""
         declared = _indexes.vector_index_definition(mode)["fields"][0]["path"]
         stage = _pipeline.vector_stages(mode=mode, index_name="i", limit=1, **kwargs)[0]
 
@@ -163,7 +162,7 @@ class TestTheBuilderAndPathFollowTheMode:
 
 
 class TestEveryFunctionReturnsAListOfStages:
-    """AT-070b / REQ-E-070 — the asymmetry this module exists to absorb.
+    """AT-070b — the asymmetry between the library's two builders, absorbed here.
 
     ``vector_search_stage`` returns one dict and ``text_search_stage`` returns a list of four. A
     caller that has to know which is which is a caller writing the branch this module exists to hold.
@@ -199,10 +198,10 @@ class TestEveryFunctionReturnsAListOfStages:
         """The ``list(...)`` around ``text_search_stage``, asserted as identity rather than as equality.
 
         ``pymongo_search_utils`` 0.3.0 builds a fresh list per call, so the test above passes whether or
-        not we copy: deleting the copy left the suite green. That makes
-        the copy a guard against a library that starts sharing, and the only way to observe it is to be
-        the library that shares. Patching the builder rather than trusting it is also the only assertion
-        here that would survive the library changing under us.
+        not we copy, and deleting the copy fails nothing there. That makes the copy a guard against a
+        library that starts sharing, and the only way to observe it is to be the library that shares.
+        Patching the builder rather than trusting it is also the only assertion here that would survive
+        the library changing under us.
         """
         shared: list[dict[str, Any]] = [{"$search": {}}]
         monkeypatch.setattr(_pipeline, "text_search_stage", lambda **_: shared)
@@ -215,7 +214,7 @@ class TestEveryFunctionReturnsAListOfStages:
 
 
 class TestTheScoreProjection:
-    """AT-070c's unit half / REQ-E-070.
+    """AT-070c's unit half.
 
     The vector builders emit no score, by design: hybrid search ranks by reciprocal rank instead. The
     text builder emits ``searchScore``. Measured, the two ``$meta`` names are not interchangeable and
@@ -242,7 +241,7 @@ class TestTheScoreProjection:
 
 
 class TestTheCandidateCount:
-    """AT-072, AT-072a / REQ-E-072, REQ-E-072a.
+    """AT-072, AT-072a.
 
     Two bounds, measured separately because the server enforces them separately: the range
     ``[1..10000]`` at code 8, and ``limit <= numCandidates`` at code 8 with a different message.
@@ -300,7 +299,7 @@ class TestTheCandidateCount:
             _pipeline.candidate_count(limit, 10)
 
     def test_a_limit_above_the_candidate_count_is_rejected(self) -> None:
-        """AT-072a / REQ-E-072a. Unreachable through ``candidate_count``'s own arithmetic for any
+        """AT-072a. Unreachable through ``candidate_count``'s own arithmetic for any
         factor of 1 or more, which is why it is checked where the two numbers meet instead."""
         with pytest.raises(ValueError, match=r"numCandidates"):
             _pipeline.check_candidate_count(limit=5, num_candidates=4)
@@ -311,15 +310,15 @@ class TestTheCandidateCount:
         _pipeline.check_candidate_count(limit=5, num_candidates=5)
 
     def test_the_relationship_is_checked_at_the_point_the_stage_is_built(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """`REQ-E-072a` says *before sending the stage*, and that is a claim about wiring rather than
-        about arithmetic.
+        """The relationship is checked *before sending the stage*, and that is a claim about wiring rather
+        than about arithmetic.
 
         The two tests above prove ``check_candidate_count`` rejects the right numbers. Neither proves
         ``vector_stages`` calls it, and it cannot be proved by feeding in bad numbers, because the
         derivation cannot produce them: a positive limit times a factor of at least 1 is never below the
-        limit. Deleting the call left the whole suite green. So the derivation is
-        replaced with one that produces a bad pair, which is the only input that distinguishes a wired
-        guard from an absent one.
+        limit, so deleting the call would leave every other test green. The derivation is replaced with
+        one that produces a bad pair, which is the only input that distinguishes a wired guard from an
+        absent one.
         """
         monkeypatch.setattr(_pipeline, "candidate_count", lambda *_, **__: 1)
 
@@ -328,7 +327,7 @@ class TestTheCandidateCount:
 
 
 class TestTheFullTextStageOrder:
-    """AT-073a / REQ-E-073, REQ-E-073a — the assertion that has to be about order.
+    """AT-073a — the assertion that has to be about order.
 
     Every wrong ordering here contains exactly the same four stages. Asserting presence passes for all
     of them; asserting the sequence is the only thing that separates the pipeline returning 5 results
@@ -343,7 +342,7 @@ class TestTheFullTextStageOrder:
         assert _names(stages) == ["$search", "$match", "$set", "$limit"]
 
     def test_the_limit_is_the_last_stage(self) -> None:
-        """Stated on its own because it is the whole of `REQ-E-073a`: a ``$limit`` anywhere before the
+        """Stated on its own because it is the whole requirement: a ``$limit`` anywhere before the
         ``$match`` returns 0 of 5, measured."""
         stages = _pipeline.text_stages(query_text="q", index_name="i", limit=5, query_filter={"scope": "s"})
 
@@ -377,7 +376,7 @@ class TestTheFullTextStageOrder:
 
 
 class TestTheFilterReachesTheRightPlace:
-    """REQ-E-071's query half. The vector filter is a pre-filter inside the stage; the text filter is
+    """The query half of filtering. The vector filter is a pre-filter inside the stage; the text filter is
     a post-filter in its own ``$match``. Same caller input, two different destinations."""
 
     def test_the_vector_filter_goes_inside_the_stage(self) -> None:
@@ -404,9 +403,10 @@ class TestTheFilterReachesTheRightPlace:
 
 
 class TestTheHybridTierIsOneNativeStage:
-    """AT-144 / ``REQ-E-142`` — the assertion that gates a pull request on this feature.
+    """AT-144 — the assertion that gates a pull request on this feature.
 
-    The construction test that would prove the most, ``AT-143``, cannot run here: the input pipelines
+    The construction test that would prove the most, running the hybrid pipeline against a server,
+    cannot run here: the input pipelines
     contain ``$vectorSearch``, which needs mongot, so the CI container fails on the input rather than
     on the stage and proves nothing about either. What runs on every change is the emitted shape, and
     the two properties it pins are the two that a reasonable rewrite would break.
@@ -435,7 +435,7 @@ class TestTheHybridTierIsOneNativeStage:
         assert stages[1] == {"$set": {"score": {"$meta": "score"}}}
 
     def test_the_fused_list_is_capped_at_the_limit(self) -> None:
-        """AT-225 / ``REQ-E-217``. Each input pipeline returns up to ``limit`` documents and the fusion
+        """AT-225. Each input pipeline returns up to ``limit`` documents and the fusion
         returns their union, so without a final ``$limit`` two tiers that disagree return twice the limit."""
         stages = self._hybrid(limit=7)
 
@@ -466,7 +466,7 @@ class TestTheHybridTierIsOneNativeStage:
         assert not any("$set" in _names(branch) for branch in pipelines.values())
 
     def test_no_union_reaches_the_server_on_this_path(self) -> None:
-        """``REQ-E-142``'s prohibition, asserted on the serialized pipeline rather than on the top-level
+        """The hybrid tier never sends ``$unionWith``, asserted on the serialized pipeline rather than on the top-level
         stage names, because a ``$unionWith`` reintroduced by a rewrite would appear *inside* an input
         pipeline and the outer stage list would still read as one ``$rankFusion``."""
         assert "$unionWith" not in json.dumps(self._hybrid())
@@ -474,7 +474,7 @@ class TestTheHybridTierIsOneNativeStage:
     def test_neither_input_pipeline_carries_a_score_projection(self) -> None:
         """The one subtlety in the construction. ``$rankFusion`` ranks by position within each input
         pipeline, so a ``$set`` computing ``$meta`` there is read by nothing and lands in no output
-        document — and the server rejects the non-selection stage outright."""
+        document, and the server rejects the non-selection stage outright."""
         pipelines = self._hybrid()[0]["$rankFusion"]["input"]["pipelines"]
 
         for name, stages in pipelines.items():
@@ -510,7 +510,7 @@ class TestTheHybridTierIsOneNativeStage:
 
 
 class TestTheScoreKeywordIsTheOnlyDifference:
-    """AT-144's other half — the keyword ``REQ-E-142`` adds to the two existing builders.
+    """AT-144's other half — the ``score`` keyword the hybrid tier adds to the two existing builders.
 
     Default ``True``, so every existing caller emits what it emitted before; the hybrid builder is the
     only thing that passes ``False``. A default flipped the other way would have been a silent behaviour
@@ -547,10 +547,10 @@ class TestTheScoreKeywordIsTheOnlyDifference:
 
 
 class TestAQueryContradictingTheModeIsRejected:
-    """AT-074a / REQ-E-074a.
+    """AT-074a.
 
     One of the two directions is measured loud (``queryVector must be present``, code 8) and the other
-    cannot be measured anywhere CI reaches, because an ``autoEmbed`` index needs a registered model.
+    cannot be measured anywhere CI reaches, because an ``autoEmbed`` index needs a registered model..
     Both are rejected before the round trip rather than one guessed to behave like the other.
     """
 
@@ -581,11 +581,9 @@ class TestAQueryContradictingTheModeIsRejected:
         """Supplying both is not a shape the server has an interpretation for, and picking one for the
         caller means silently ignoring the other.
 
-        The message is asserted, and both modes are, because the first version of this test was passing
-        for the wrong reason. It used the manual mode and checked only that ``ValueError`` came out.
-        Deleting the both-set branch entirely left it green: with both fields set, the mode check fires
-        instead and raises about the wrong one of the two. Mutation testing is what
-        surfaced that.
+        The message is asserted, and both modes are, because checking only that ``ValueError`` came out
+        passes for the wrong reason: with both fields set and the both-set branch gone, the mode check
+        fires instead and raises about the wrong one of the two.
         """
         with pytest.raises(ValueError, match="both 'text' and 'vector'"):
             _pipeline.vector_stages(mode=mode, index_name="i", limit=5, query_text="q", query_vector=VECTOR)
@@ -593,19 +591,16 @@ class TestAQueryContradictingTheModeIsRejected:
 
 @pytest.mark.integration
 class TestTheBoundsThisPackageCopiesFromTheServer:
-    """AT-072b / REQ-E-072 — the server boundary, for a constant rather than for a call.
+    """AT-072b — the server's own bounds, checked against a server.
 
     ``MAX_NUM_CANDIDATES`` is a number read off a server and written into this package. That is the
     same kind of claim ``MAX_DIMENSIONS`` makes, and the same kind that goes stale silently.
 
-    **Re-marked from ``contract`` to ``integration``.** It needs no search *index*, which is
-    why both tests below name one that does not exist, and the original marker followed from that. It
-    does need search *support*. Measured against ``mongo:8``, reported version 8.3.8 with
-    ``modules: []``: both cases come back as ``OperationFailure`` code 31082, *Using $search and
+    **Marked ``integration``, not ``contract``.** It needs no search *index*, which is why both tests
+    below name one that does not exist, but it does need search *support*. Against ``mongo:8``
+    (8.3.8, ``modules: []``) both cases come back as ``OperationFailure`` code 31082, *Using $search and
     $vectorSearch aggregation stages requires additional configuration*, rather than as the bound and
-    the code asserted here. ``conftest.py``'s tier table has always said ``contract`` means any real
-    MongoDB including a plain ``mongod``, so this class was relying on ``MONGODB_URI`` happening to
-    point at a deployment with mongot.
+    the code asserted here. ``contract`` means any real MongoDB including a plain ``mongod``.
     """
 
     async def test_the_ceiling_is_the_ceiling_the_server_enforces(
@@ -617,9 +612,9 @@ class TestTheBoundsThisPackageCopiesFromTheServer:
 
         Both checks live in the search process, though, which is why the guard below is not decoration.
         Measured against a deployment whose ``mongotHost`` pointed at a closed port: the answer is
-        ``HostUnreachable`` naming that port, because there is nothing left to enforce the bound with
-        (`AT-168` / `REQ-E-162`). A test that catches its own failure has to ask -- the phase hooks in
-        ``conftest.py`` only see exceptions that escape.
+        ``HostUnreachable`` naming that port, because there is nothing left to enforce the bound with.
+        A test that catches its own failure has to ask, because the phase hooks in ``conftest.py`` only
+        see exceptions that escape.
         """
         collection = atlas_database[unique_collection_name]
         await collection.insert_one({"_id": "seed"})
@@ -649,7 +644,7 @@ class TestTheBoundsThisPackageCopiesFromTheServer:
         """The comment in ``candidate_count`` names the server's code for this, and a code in a comment
         is a claim like any other. The code changed between majors: 7912700 on 8.0, 65137 on 9.0.
 
-        Guarded like the test above (`AT-168`), though on the same crippled deployment this one still passes:
+        Guarded like the test above, though on the same deployment with search down this one still passes:
         ``mongod`` rejects a non-positive ``limit`` before it dispatches anything, so the outage never
         reaches it. That ordering is the server's business and not a thing this package asserts, which
         is the whole reason the guard is here rather than an assumption.
@@ -689,9 +684,9 @@ async def _seed_and_index(
 
     Every document matches the text query, and one in ``in_scope_every`` is in scope, which is the
     arrangement that makes the post-filter ordering observable: a filter that removes nothing proves
-    nothing about `REQ-E-073`.
+    nothing about the full-text stage order.
 
-    ``rank_in_scope_last`` is what makes `AT-073b` deterministic. With uniform text every document
+    ``rank_in_scope_last`` is what makes the over-fetch test deterministic. With uniform text every document
     scores within rounding distance of every other, so which documents land in a truncated prefix is
     not stable across index builds: the same 20x over-fetch measured 5, 5 and 3 results on three
     corpora built by identical code. Repeating the query terms in the out-of-scope documents and
@@ -738,13 +733,12 @@ async def _seed_and_index(
 SEARCHABLE_BUDGET: Final[float] = 90.0
 """How long a document is waited on before it counts as never having been indexed.
 
-The same figure ``AT-086`` and ``test_memory_store.py`` use, for the same reason. The corpus
-here is seeded before the index is created, so what it waits out is the initial sync rather than
-`REQ-E-091`'s embedding lag, and on every deployment measured so far that finishes as the index reports
-``READY``. The budget is generous anyway: it costs nothing when the premise holds, since every caller
-returns on the first non-empty result, and the 10-second version of this constant in
-``test_memory_store.py`` is what made six tests fail on 2026-09-02 the first time the suite met a cloud
-cluster. Two helpers waiting out one boundary should not disagree about how long it takes.
+The same figure ``test_memory_store.py`` uses for the same wait: a write becoming searchable. The
+corpus here is seeded before the index is created, so what it waits out is the initial sync rather than
+embedding lag, and on every deployment measured that finishes as the index reports ``READY``. The
+budget is generous anyway: it costs nothing when the premise holds, since every caller returns on the
+first non-empty result, and a 10-second budget is too short for a cloud cluster. Two helpers waiting
+out one boundary should not disagree about how long it takes.
 """
 
 
@@ -772,8 +766,9 @@ async def _until_answered(
         try:
             results = await (await collection.aggregate(pipeline)).to_list()
         except PyMongoError as error:
-            # `REQ-E-124`. This helper drives the driver directly, so the code is on the error itself
-            # rather than on a cause; the guard reads both, which is why one helper serves both files.
+            # Skip rather than fail when search is unreachable. This helper drives the driver directly, so
+            # the code is on the error itself rather than on a cause; the guard reads both, which is why
+            # one helper serves both files.
             skip_if_search_is_unreachable(error)
             raise
         if results or time.monotonic() >= deadline:
@@ -783,8 +778,8 @@ async def _until_answered(
 
 @pytest.mark.integration
 class TestTheOrderingAgainstMongot:
-    """AT-073, AT-073b, AT-073c / REQ-E-073, REQ-E-073a — ordering against mongot, and the numbers that
-    changed a requirement.
+    """AT-073, AT-073b, AT-073c — the full-text stage order against mongot, and why the ``$limit``
+    goes last.
 
     The three pipelines here contain the same stages and differ only in their order. One returns the
     requested count; the other two return fewer, and one of them returns nothing at all. Nothing in the
@@ -811,14 +806,14 @@ class TestTheOrderingAgainstMongot:
     async def test_no_pre_filter_bound_below_the_corpus_size_fills_the_limit(
         self, atlas_database: Any, unique_collection_name: str
     ) -> None:
-        """AT-073b. Asserting what the wrong implementations do, because `REQ-E-073` prescribed one of
-        them: an over-fetch ahead of the ``$match``.
+        """AT-073b. Asserting what the wrong implementations do, because an over-fetch ahead of the
+        ``$match`` is the obvious alternative.
 
         Six multipliers from 1x to 38x, on a corpus where BM25 ranks all 10 in-scope documents below all
         190 out-of-scope ones. Every one of them returns nothing. The smallest bound that fills the limit
         is 200, the corpus size, which is not a number available when the stage is built and stops being
-        a bound at all once it is. That is the finding `REQ-E-073a` records, and it is stronger than the
-        one the requirement was written against.
+        a bound at all once it is. That is why the emitted pipeline has no ``$limit`` before the
+        ``$match``.
         """
         collection = await _seed_and_index(
             atlas_database, unique_collection_name, count=200, in_scope_every=20, rank_in_scope_last=True
@@ -846,7 +841,7 @@ class TestTheOrderingAgainstMongot:
     async def test_the_cost_of_not_bounding_early_tracks_the_filter_and_not_the_limit(
         self, atlas_database: Any, unique_collection_name: str
     ) -> None:
-        """AT-073c / REQ-E-073a's cost claim, which is the objection to having no early ``$limit``.
+        """AT-073c — the cost of having no early ``$limit``, which is the objection to the emitted order.
 
         ``internalMongotBatchSizeHistory`` is what the aggregation actually requested from mongot rather
         than what it returned, so this asserts the pull protocol rather than trusting it. Measured: the
@@ -910,17 +905,18 @@ class TestTheOrderingAgainstMongot:
 
 @pytest.mark.integration
 class TestBothTiersAgainstMongot:
-    """AT-074, AT-070c / REQ-E-074 — mongot's ordering for the vector half.
+    """AT-074, AT-070c — the vector half against mongot.
 
     Manual-vector mode throughout, for the reason ``test_indexes.TestSearchIndexesAgainstAtlas`` gives:
     an ``autoEmbed`` definition fails at creation on a deployment with no registered model, so the
-    default path is unreachable here and ``AT-070i`` carries it.
+    default path is unreachable here and
+    ``TestTheAutoEmbeddingsQueryAgainstADeploymentThatCanAnswerIt`` carries it.
     """
 
     async def test_a_precomputed_embedding_returns_the_same_shape_as_the_text_path(
         self, atlas_database: Any, unique_collection_name: str
     ) -> None:
-        """AT-074 / REQ-E-074, asserted as *the same shape* rather than as "it works".
+        """AT-074, asserted as *the same shape* rather than as "it works".
 
         The requirement is about parity between the two paths, so the assertion compares them: same
         keys on the documents, same score field, same type. A test that only checked the vector path
@@ -1018,23 +1014,19 @@ class TestBothTiersAgainstMongot:
 @pytest.mark.integration
 @pytest.mark.autoembed
 class TestTheAutoEmbeddingsQueryAgainstADeploymentThatCanAnswerIt:
-    """AT-070i — the test that settled the query shape, and it took a cloud cluster to run it.
+    """AT-070i — the AutoEmbeddings query shape, accepted by a deployment that runs automated embedding.
 
-    Skips wherever ``MONGODB_AUTOEMBED_URI`` is unset, which was everywhere for the whole build: mongot
-    8.3.8 local reports zero registered models, so the ``autoEmbed`` index cannot be created and the
-    query shape could not be adjudicated. `AT-070` pins what we emit; only this test can say whether the
-    server agrees.
-
-    It first ran on 2026-09-01 against Atlas 8.0.30 and passed in 76.59s, most of which is the index
-    build: ``PENDING`` at t+0, ``BUILDING`` at t+60s, queryable at t+80s. The question is closed in favour of
-    the shape this package already emitted.
+    Skips wherever ``MONGODB_AUTOEMBED_URI`` is unset. Local mongot 8.3.8 reports zero registered models,
+    so the ``autoEmbed`` index cannot be created there. ``TestTheAutoEmbeddingsQueryShape`` pins what we
+    emit; only this test can say whether the server agrees. Atlas 8.0.30 accepts the shape this package
+    emits, and most of the run is the index build.
     """
 
     async def test_the_server_accepts_the_stage_we_emit(
         self, autoembed_uri: str, test_database_name: str, unique_collection_name: str
     ) -> None:
-        """If this fails with a query-shape error, the question reopens against ``pymongo_search_utils`` and the
-        fix is the ``query`` key in ``_pipeline.vector_stages``, plus its `AT-070` assertion."""
+        """If this fails with a query-shape error, the fix is the ``query`` key in
+        ``_pipeline.vector_stages``, plus its `AT-070` assertion in ``TestTheAutoEmbeddingsQueryShape``."""
         client: AsyncMongoClient[Any] = AsyncMongoClient(autoembed_uri)
         try:
             collection = client[test_database_name][unique_collection_name]

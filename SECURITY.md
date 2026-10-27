@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 **Do not open a public issue, a discussion or a pull request for a security vulnerability.** A public report
-is a disclosure. It reaches whoever is looking for one before it reaches anybody who can fix it.
+discloses the vulnerability before a fix exists.
 
 Report it privately to **mongodb-partners@mongodb.com** instead.
 
@@ -12,12 +12,11 @@ Include as much of this as you have. None of it is required, and the first two a
 - **What an attacker can do**, in one sentence. Impact is what decides how quickly a report moves.
 - **The smallest reproduction you have**, as a script or as a sequence of calls. A failing test written
   against this repository is the most useful form and the hardest to misread.
-- **Versions.** This package's, from `pip show strands-mongodb`, and the deployment it ran against — the
+- **Versions.** This package's, from `pip show strands-mongodb`, and the deployment it ran against: the
   output of `db.version()`, or that it was Atlas and which tier.
 - **Whether the finding is public anywhere already**, and any disclosure deadline you are working to.
 
-You do not need a working exploit and you do not need to be certain. A report that turns out to be a
-misreading costs an email; the alternative costs a release.
+You do not need a working exploit and you do not need to be certain. Report it anyway.
 
 ## What to expect
 
@@ -25,8 +24,8 @@ This is a pre-1.0 package maintained by a small group, so what follows is what t
 than a service-level agreement:
 
 - an acknowledgement that a person has read the report, rather than an automated receipt;
-- an answer on whether the behaviour is a vulnerability, and if it is, what the fix is and roughly when — a
-  reason if there is no date yet, rather than silence;
+- an answer on whether the behaviour is a vulnerability, and if it is, what the fix is and roughly when, or a
+  reason if there is no date yet;
 - credit in the release notes under whatever name you ask for, or none if you would rather have none;
 - a request to hold publication until a fixed release exists, with the timing agreed with you rather than
   set for you.

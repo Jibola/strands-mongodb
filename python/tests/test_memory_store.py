@@ -1,7 +1,6 @@
 """``MongoDBMemoryStore``'s ``MemoryStore`` surface: protocol shape, scope, dedup, search tiers.
 
-The memory store's acceptance set (``REQ-E-040``-``REQ-E-048``, ``REQ-E-052``-``REQ-E-059``), split across three
-tiers by what each claim has to be observed against:
+Split across three tiers by what each claim has to be observed against:
 
 * **unit** for what is decided before any round trip: the protocol shape, the limit chain, the
   reserved-key merge, the ``writable`` gate, the score-bound pair, and a source-level tripwire on the
@@ -9,8 +8,8 @@ tiers by what each claim has to be observed against:
 * **contract** for writes, ordinary indexes, the dedup constraint and the no-search-support path. A
   plain ``mongod`` runs all of those, and answers no query at all (see ``conftest.py``), so nothing in
   this tier searches.
-* **integration** for every read, because no search tier runs without mongot and one of
-  ``REQ-E-053a``'s three server error codes is what a query gets instead.
+* **integration** for every read, because no search tier runs without mongot and a query gets one of
+  three server error codes instead.
 
 **Most of what this file claims needs a server, unlike ``test_storage.py`` and ``test_indexes.py``.**
 Both of those hand-write a fake collection because their claims are about the pipeline or the command
@@ -18,19 +17,20 @@ this package emits, which a server would answer identically whether or not the e
 claims here are about what the server then *does*: one document instead of two, a scope predicate that
 excludes, a tier that answers. A fake asserting those would be asserting its own implementation.
 
-**The unit tier holds one fake collection anyway, and it is the ``test_storage.py``
-case rather than an exception to it.** What it records is the ``$match`` this package composes and the
-``MemoryEntry`` it builds back out of a document. Both are this package's own code, and a deployment
-makes neither more real: mongot answers a predicate that lost the store's configured filter with
-*results* rather than with an error, which is how that term went untested until a mutant removed it and
-nothing failed. The fake is fixed documents in, recorded stages out. It resolves nothing, matches
-nothing and ranks nothing, so every claim about matching or ranking is still on a tier below.
+**The unit tier holds one fake collection anyway, and it is the ``test_storage.py`` case rather than
+an exception to it.** What it records is the ``$match`` this package composes and the ``MemoryEntry``
+it builds back out of a document. Both are this package's own code, and a deployment makes neither
+more real: mongot answers a predicate that lost the store's configured filter with *results* rather
+than with an error, so only the recorded stage shows that the term is there. The fake is fixed
+documents in, recorded stages out. It resolves nothing, matches nothing and ranks nothing, so every
+claim about matching or ranking is still on a tier below.
 
-``AT-044a`` and ``AT-044b`` overlap ``test_construction.py``'s ``TestTheHooksThatMustStayAbsent``,
-which already pins ``not hasattr(store, "add_messages")`` and ``_has_method(...) is False``. The pair
-is completed here because its second half, ``_has_method(store, "add") is True``, is what makes the
-first half mean anything: a store missing *both* methods passes the absence check and routes nowhere.
-Same precedent as ``AT-055`` sitting beside ``AT-056d``.
+``TestAddMessagesStaysAbsentAndAddDoesNot`` overlaps ``test_construction.py``'s
+``TestTheHooksThatMustStayAbsent``, which already pins ``not hasattr(store, "add_messages")`` and
+``_has_method(...) is False``. The pair is completed here because its second half,
+``_has_method(store, "add") is True``, is what makes the first half mean anything: a store missing
+*both* methods passes the absence check and routes nowhere. ``TestNoRegexTierIsReachable`` sits beside
+``test_types.py``'s ``TestTheSearchTierVocabulary`` the same way.
 """
 
 from __future__ import annotations
@@ -76,7 +76,7 @@ if TYPE_CHECKING:
 # reason. The 50 ms selection timeout keeps that failure fast.
 UNREACHABLE = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=50"
 
-# A URI whose inline password must not appear anywhere, for AT-014's memory half. Deliberately not a
+# A URI whose inline password must not appear anywhere, for the memory store's credential tests. Deliberately not a
 # plausible-looking secret, so a grep over a failure report finds it.
 LEAKY_URI = "mongodb://u:SUPERSECRET@127.0.0.1:1/?serverSelectionTimeoutMS=50"
 SECRET = "SUPERSECRET"
@@ -87,7 +87,7 @@ def _clear_registry() -> Iterator[None]:
     """Isolate each test from the process-global connection registry.
 
     Same justification as the fixture of this name in ``test_client.py`` and
-    ``test_construction.py``: the registry is module-level by design (``REQ-E-012``), so a test that
+    ``test_construction.py``: the registry is module-level by design, so a test that
     constructs a store otherwise leaves a connection behind for the next one.
     """
     _client._REGISTRY.clear()
@@ -141,7 +141,7 @@ def _real_store(uri: str, database: str, collection: str, **overrides: Any) -> M
 
     Takes a URI rather than a fixture's client, following ``test_storage.py``'s ``contract_storage``:
     the package builds and owns the client, so ``close()`` is exercised on the path a user takes
-    rather than short-circuited by ``REQ-E-010``'s injected-client rule.
+    rather than short-circuited by the rule that a store never closes an injected client.
 
     Args:
         uri: Connection string for the deployment.
@@ -177,7 +177,8 @@ def _string_literals(source: str) -> list[str]:
     an operator name most legitimately appears is a docstring explaining why the module does not use
     it. ``storage.py`` has exactly that: ``{"_id": {"$regex": "^prefix"}}`` in prose, arguing for a
     range query instead. A raw ``in source`` scan reads that as the operator being emitted, which would
-    make ``AT-055`` fail on a comment and pass on a regression the day someone deleted the comment.
+    make ``TestNoRegexTierIsReachable`` fail on a comment and pass on a regression once the comment was
+    deleted.
 
     Args:
         source: Module source.
@@ -204,7 +205,7 @@ def _raised_names(source: str) -> set[str]:
     """Return the exception names a module raises.
 
     Read from ``ast.Raise`` nodes rather than from the text, so prose describing an exception this
-    package deliberately does not raise cannot trip ``AT-044d``. ``test_construction.py``'s own
+    package deliberately does not raise cannot trip ``TestNoMethodStandsInForAbsence``. ``test_construction.py``'s own
     docstring contains that exact sentence about ``NotImplementedError``.
 
     Args:
@@ -263,20 +264,19 @@ store: MemoryStoreSubset = MongoDBMemoryStore(
 
 @pytest.mark.compat
 class TestTheProtocolMembersTheSDKCalls:
-    """AT-052 / REQ-E-052 — asserted by assignment because ``isinstance`` is not available.
+    """AT-052 — the SDK's ``MemoryStore`` surface, asserted by assignment because ``isinstance`` is not available.
 
     ``MemoryStore`` is a plain ``Protocol``, not ``runtime_checkable``, so ``isinstance`` against it
-    raises ``TypeError`` rather than returning ``False``; and it declares ten members while
-    ``REQ-E-044`` requires one of them absent, so no SDK-authored check can pass. ``REQ-E-052``'s amendment
-    records why the original ``isinstance`` wording was replaced. What is left is the strongest check
-    available: a nine-member Protocol declared in this file, satisfied by assignment under mypy, plus
-    the SDK's own runtime detector on the four methods the manager dispatches through.
+    raises ``TypeError`` rather than returning ``False``; and it declares ten members while this store
+    deliberately omits ``add_messages``, so no SDK-authored check can pass. What is left is the strongest
+    check available: a nine-member Protocol declared in this file, satisfied by assignment under mypy,
+    plus the SDK's own runtime detector on the four methods the manager dispatches through.
 
     Marked ``compat`` and it still runs in an ordinary session. The marker selects it for the CI cron
-    that resolves the latest published ``strands-agents`` instead of the pinned one. That leaves this as the
-    only mitigation: a tenth member the manager starts calling shows up as a mypy failure here rather
-    than in a user's traceback. The gate in ``conftest.py`` covers the three tiers that need a backend,
-    and this needs none, so nothing skips it locally.
+    that resolves the latest published ``strands-agents`` instead of the pinned one, so a tenth member
+    the manager starts calling shows up as a mypy failure here rather than in a user's traceback. The
+    gate in ``conftest.py`` covers the three tiers that need a backend, and this needs none, so nothing
+    skips it locally.
     """
 
     def test_the_store_satisfies_a_nine_member_subset_protocol_under_mypy(self, run_mypy: Any) -> None:
@@ -292,7 +292,7 @@ class TestTheProtocolMembersTheSDKCalls:
         assert "error:" not in result.stdout, result.stdout
 
     def test_the_subset_omits_exactly_one_member_of_the_sdk_protocol(self) -> None:
-        """The subset is nine of ten, and the tenth is ``add_messages`` (``REQ-E-044``).
+        """The subset is nine of ten, and the tenth is ``add_messages``, which this store omits on purpose.
 
         Derived from the SDK's own annotations rather than hard-coded, so a member added upstream makes
         this fail on the pinned SDK too, not only on the compat cron. Without it the subset could drift
@@ -324,10 +324,10 @@ class TestTheProtocolMembersTheSDKCalls:
 
 
 class TestTheHookThatReturnsNothing:
-    """AT-052a / REQ-E-052a — ``get_tools`` is present and empty, and presence changes nothing.
+    """AT-052a — ``get_tools`` is present and empty, and presence changes nothing.
 
     None of the three vended stores defines ``get_tools``, so there is no precedent for the return
-    value, while ``REQ-E-052`` requires the detector above to report it present. Both hold at once
+    value, while the detector above has to report it present. Both hold at once
     because ``MemoryManager._build_tools`` reads
     ``if _has_method(store, "get_tools"): tools.extend(store.get_tools())``
     (``memory_manager.py:252-254``): a present method returning ``[]`` extends the list by nothing.
@@ -354,26 +354,26 @@ class TestTheHookThatReturnsNothing:
         store = _store(writable=True)
 
         # The store deliberately does not satisfy the ten-member `MemoryStore`, so the SDK's own
-        # annotation rejects it while `_has_method` accepts it at runtime. The ignore is `REQ-E-044`
-        # being visible at the call site rather than a wart to remove.
+        # annotation rejects it while `_has_method` accepts it at runtime. The ignore is the omitted
+        # `add_messages` being visible at the call site, and it stays.
         manager = MemoryManager(stores=[store], add_tool_config=True)  # type: ignore[list-item]
 
         assert [tool.tool_name for tool in manager.tools] == ["search_memory", "add_memory"]
 
 
 class TestAddMessagesStaysAbsentAndAddDoesNot:
-    """AT-044a, AT-044b / REQ-E-044 — the pair rather than the half.
+    """AT-044a, AT-044b — the SDK routes extraction through ``add``, the pair rather than the half.
 
     ``test_construction.py`` already asserts the absence. What it cannot assert on its own is that the
     absence routes anywhere: ``_has_method(store, "add_messages") is False`` also holds for a store with
     no write path at all, and the manager's fallback is ``ModelExtractor`` feeding ``add``. So the two
-    probes belong together, and the second one is new here.
+    probes belong together here.
     """
 
     def test_add_messages_is_absent_by_both_probes(self) -> None:
         """``hasattr`` and the SDK's detector agree, because this class inherits no Protocol.
 
-        Both are asserted because they would disagree the day this class started inheriting
+        Both are asserted because they would disagree if this class ever inherited
         ``MemoryStore``: the inherited stub satisfies ``hasattr`` while ``_has_method`` still reports it
         absent, and that divergence is what would silently reintroduce the raising-stub hazard.
         """
@@ -400,13 +400,14 @@ class TestAddMessagesStaysAbsentAndAddDoesNot:
 
 
 class TestNoMethodStandsInForAbsence:
-    """AT-044d / REQ-E-044 — a stub that raises is present, and presence is what the SDK reads.
+    """AT-044d — a stub that raises is present, and presence is what the SDK reads.
 
     ``_has_method`` and ``hasattr`` both report a ``raise NotImplementedError`` body as a member the
     caller may use, so the SDK routes to it and every call fails. That converts "the SDK picks another
     path" into "the SDK crashes", for ``add_messages`` on this class and for ``for_sandbox`` on
-    ``MongoDBStorage`` (``AT-044c``). Asserted over both public classes and then over the whole package,
-    because the hazard is the pattern rather than the two names.
+    ``MongoDBStorage`` (``test_storage.py``'s ``TestTheProtocolIsSatisfiedStructurally``). Asserted over
+    both public classes and then over the whole package, because the hazard is the pattern rather than
+    the two names.
     """
 
     @pytest.mark.parametrize("cls", [MongoDBMemoryStore, MongoDBStorage])
@@ -419,7 +420,7 @@ class TestNoMethodStandsInForAbsence:
 
         ``_client.resolve`` and ``_indexes.ensure`` are both places where "not supported here" is a real
         condition, and both already answer it with ``ValueError`` or ``StorageError`` carrying the
-        server's own message (``REQ-E-053a``). This fails the day one of them takes the shortcut.
+        server's own message. This fails if either one starts raising ``NotImplementedError`` instead.
         """
         sources = _package_sources()
         offenders = {
@@ -432,20 +433,18 @@ class TestNoMethodStandsInForAbsence:
 
 
 class TestTheResultLimit:
-    """AT-041 / REQ-E-041 — a four-link chain and a floor, both asserted where they are decided.
+    """AT-041 — a four-link chain and a floor, both asserted where they are decided.
 
-    The resolver is tested directly rather than through a result count, and the reason is a measurement
-    rather than convenience: the observable outcome of a limit is *how many documents come back*, which
-    needs a search-capable deployment, and on the only one CI reaches the count is also shaped by the
-    corpus and by the score bounds. So the chain is asserted here as arithmetic and the count is
-    asserted on the integration tier (``AT-040``, ``AT-059b``), which is the split the two tiers exist
-    for.
+    The resolver is tested directly rather than through a result count: the observable outcome of a
+    limit is *how many documents come back*, which needs a search-capable deployment, and there the
+    count is also shaped by the corpus and by the score bounds. So the chain is asserted here as
+    arithmetic and the count is asserted on the integration tier (``TestWhatASearchHandsBack``,
+    ``TestTheScoreBoundDropsResults``), which is the split the two tiers exist for.
 
     ``query["limit"]`` sits above ``options`` because a ``MongoDBSearchQuery`` can only arrive on a
     direct call: ``MemoryStore.search`` is declared ``query: str``, and both SDK call sites pass a
     ``str``. Below ``options`` the key would be unreachable rather than lower priority, since
     ``MemoryManager.search`` always passes ``options`` with ``max_search_results`` already resolved.
-    ``REQ-E-041``'s amendment carries the reasoning.
     """
 
     def test_a_query_limit_wins_over_everything_below_it(self) -> None:
@@ -484,21 +483,21 @@ class TestTheResultLimit:
             await _store().search("anything", {"max_search_results": 0})
 
     async def test_a_limit_below_one_in_a_query_is_rejected_before_any_round_trip(self) -> None:
-        """The fourth raise site, on the key a later amendment added to the chain."""
+        """The fourth raise site, on the query's own ``limit`` key."""
         with pytest.raises(ValueError, match="limit"):
             await _store().search({"text": "anything", "limit": 0})
 
 
 class TestReservedMetadataKeysWin:
-    """AT-057 / REQ-E-040, REQ-E-057 — the caller's key is dropped, and the drop is logged.
+    """AT-057 — the caller's key is dropped, and the drop is logged.
 
     Four reserved keys travel out with every result: ``_relevance_score``, ``_id``, ``_search_type`` and
     ``_scope``. A stored document whose ``metadata`` holds one of those names would otherwise decide the
-    value of a field the caller is meant to trust, and ``_scope`` is the one where that matters
-    most: a document claiming a scope it was not stored in reads as a leak.
+    value of a field the caller is meant to trust, and ``_scope`` is the one where that matters most: a
+    document claiming a scope it was not stored in reads as a cross-scope leak.
 
     Merged by a helper rather than inline, so this tier can assert the merge without a deployment. The
-    integration tier then asserts the four keys are populated at all (``AT-040``).
+    integration tier then asserts the four keys are populated at all (``TestWhatASearchHandsBack``).
     """
 
     def test_a_colliding_caller_key_keeps_the_reserved_value(self) -> None:
@@ -549,21 +548,22 @@ class TestReservedMetadataKeysWin:
 
 
 class TestNoRegexTierIsReachable:
-    """AT-055 / REQ-E-055 — a tripwire on a requirement that cannot be satisfied yet.
+    """AT-055 — a tripwire on a requirement that cannot be satisfied yet.
 
-    The requirement says ``re.escape`` applies *while the regex tier is active*, and no such tier exists:
+    Query text has to pass through ``re.escape`` *while a regex tier is active*, and no such tier exists:
     ``SearchType`` accepts ``auto``, ``vector``, ``text`` and ``hybrid``. So the clause is vacuously true,
     which is not the same as satisfied. A contract test of the escaping cannot exist without the tier, and
     a skipped placeholder asserts nothing while looking like coverage.
 
-    What is testable is the vacuity. ``AT-056d`` pins that neither ``SearchType`` nor
-    ``ResolvedSearchType`` admits ``regex``, so no config value and no result value selects the tier.
-    These two add that no module emits the operator either, so there is no unselectable back door.
-    ``REQ-E-050`` stops a caller from naming the operator through ``filter``, at any depth, and
-    ``REQ-E-174`` stops the other route to the same matching: a native ``re.Pattern`` or ``bson.Regex``
-    *value*, which ``$match`` dispatches on exactly as it would the operator.
+    What is testable is the vacuity. ``test_types.py``'s ``TestTheSearchTierVocabulary`` pins that neither
+    ``SearchType`` nor ``ResolvedSearchType`` admits ``regex``, so no config value and no result value
+    selects the tier. These tests add that no module emits the operator either, so there is no
+    unselectable back door. The filter validator stops a caller from naming the operator through
+    ``filter``, at any depth, and also stops the other route to the same matching: a native
+    ``re.Pattern`` or ``bson.Regex`` *value*, which ``$match`` dispatches on exactly as it would the
+    operator.
 
-    Both fail the day a regex tier is added, which is the day ``re.escape`` has to be there.
+    Both fail as soon as a regex tier is added, which is when ``re.escape`` has to be there.
     """
 
     def test_no_module_emits_a_regex_match_operator(self) -> None:
@@ -594,7 +594,7 @@ class TestNoRegexTierIsReachable:
         assert modules == {"storage.py"}
 
     def test_no_module_emits_a_text_search_operator(self) -> None:
-        """``$text`` is the other half of the tier v0.1.0 defers, so it is the other half of the wire.
+        """``$text`` is the other half of the deferred no-mongot tier, so it is the other half of the wire.
 
         Not a stylistic ban. A ``$text`` index would be a fourth index nobody provisioned and a fifth
         scoring scale ``_search_type`` has no value for.
@@ -610,7 +610,7 @@ class TestNoRegexTierIsReachable:
 
 
 class TestWritable:
-    """AT-058 / REQ-E-058 — defaults to ``False``, and ``add`` on a read-only store says which key.
+    """AT-058 — defaults to ``False``, and ``add`` on a read-only store says which key.
 
     Two precedents disagree: ``FileMemoryStore`` defaults it to ``True``,
     ``BedrockKnowledgeBaseStore`` and the official extension template both to ``False``. Two of three,
@@ -639,16 +639,15 @@ class TestWritable:
 
 
 class TestScoreBounds:
-    """AT-059a / REQ-E-059 — the mutually exclusive pair, rejected at construction.
+    """AT-059a — the mutually exclusive pair, rejected at construction.
 
-    ``MongoDBMemoryStoreConfig``'s ``max_score`` docstring already promises *"Mutually exclusive with
-    ``min_score``"*, which is a claim shipped in a public type with nothing behind it.
-    ``BedrockKnowledgeBaseStore`` raises for the same pair in ``__init__``. ``__init__`` rather than
-    ``search``, because the pair is store configuration and a constructor that accepts a contradiction
-    only defers the error to a query.
+    ``MongoDBMemoryStoreConfig``'s ``max_score`` docstring promises *"Mutually exclusive with
+    ``min_score``"*, and this is what holds the public type to it. ``BedrockKnowledgeBaseStore`` raises
+    for the same pair in ``__init__``. ``__init__`` rather than ``search``, because the pair is store
+    configuration and a constructor that accepts a contradiction only defers the error to a query.
 
-    What the bounds then *do* to a result set is ``AT-059b``, on the integration tier, against real
-    scores.
+    What the bounds then *do* to a result set is ``TestTheScoreBoundDropsResults``, on the integration
+    tier, against real scores.
     """
 
     def test_both_bounds_together_are_rejected_naming_both_keys(self) -> None:
@@ -668,22 +667,21 @@ class TestScoreBounds:
 
 
 class TestEveryCallerInputIsCheckedBeforeTheNetwork:
-    """AT-076 / REQ-E-049, REQ-E-050, REQ-E-074a — the query and filter guards, on a closed port.
+    """AT-076 — the query and filter guards, on a closed port.
 
-    Same premise and the same reserved port as ``TestTheLimitChain``'s last two tests: a check that
+    Same premise and the same reserved port as ``TestTheResultLimit``'s last two tests: a check that
     reached the network would time out instead of raising, so the ``ValueError`` is evidence of the
     ordering as well as of the check.
 
-    Which is the whole reason these are here rather than left where the guards live.
-    ``test_pipeline.py`` and ``test_filter.py`` already close both over their own functions. What was
-    unasserted is that the memory store *calls* them, and calls them first: a mutation pass
-    deleted the ``check_query_keys`` call from ``search``, the per-query ``_filter.validate``
-    call and the configured-filter one from ``__init__``, and the suite stayed green
-    for all three. A store with no guard on the wire path is not a hypothetical failure mode; it is
-    ``REQ-E-049``'s cross-scope read with the guard still passing its own unit tests.
+    ``test_pipeline.py`` and ``test_filter.py`` already close both guards over their own functions. What
+    these tests add is that the memory store *calls* them, and calls them first: the ``check_query_keys``
+    call in ``search``, the per-query ``_filter.validate`` call and the configured-filter one in
+    ``__init__``. Without those calls a guard can pass its own unit tests while the store sends an
+    undeclared filter path or an operator key to the server, which is how a cross-scope read happens.
 
-    The positive control for all four rejections is ``AT-077``'s first test, which puts a declared path in
-    both filter positions and asserts the predicate that comes out.
+    The positive control for all four rejections is the first test of
+    ``TestWhatTheStoreSendsAndWhatItMapsBack``, which puts a declared path in both filter positions and
+    asserts the predicate that comes out.
     """
 
     @pytest.mark.parametrize(
@@ -695,7 +693,7 @@ class TestEveryCallerInputIsCheckedBeforeTheNetwork:
         ids=["both-keys", "neither-key"],
     )
     async def test_a_query_setting_both_or_neither_vector_key_is_rejected(self, query: Any, expected: str) -> None:
-        """``REQ-E-074a`` at this surface, which is the only surface a caller reaches.
+        """The one-vector-key rule at this surface, which is the only surface a caller reaches.
 
         ``limit`` is set on the neither-key case so the limit chain is not what raises, and the message
         substrings are the two words that distinguish the pair.
@@ -711,7 +709,7 @@ class TestEveryCallerInputIsCheckedBeforeTheNetwork:
     async def test_a_per_query_filter_is_validated_before_the_query_runs(
         self, bad_filter: dict[str, Any], expected: str
     ) -> None:
-        """``REQ-E-049`` and ``REQ-E-050``, on the filter that arrives with a single query."""
+        """Declared paths only and no operator keys, on the filter that arrives with a single query."""
         with pytest.raises(ValueError, match=expected):
             await _store().search({"text": "dark mode", "filter": bad_filter})
 
@@ -741,7 +739,7 @@ class _RecordingCollection:
 
     Attributes:
         documents: What ``aggregate`` answers with.
-        failure: A driver error to raise instead of answering, for ``AT-080``.
+        failure: A driver error to raise instead of answering, for the driver-error tests.
         pipelines: Every pipeline handed to ``aggregate``, in call order.
         upserts: Every ``(selector, update)`` pair handed to ``update_one``.
         deletes: Every filter handed to ``delete_one`` or ``delete_many``, in call order.
@@ -780,7 +778,7 @@ class _RecordingCollection:
         """Record the upsert, then fail.
 
         There is no success path here on purpose. What ``add`` does with an ``UpdateResult`` is a document
-        count, which is ``AT-042`` and ``AT-043`` against a deployment; a hand-written result would be
+        count, which ``TestDedupAgainstTheUniqueIndex`` asserts against a deployment; a hand-written result would be
         this fake asserting its own return value.
 
         Args:
@@ -909,14 +907,14 @@ def _prepared(
     Three assignments, and each one stands for a round trip: ``_initialized`` for the probe and the index
     calls, ``_tiers`` for what came up, ``_collection`` for the collection itself. Reaching into private
     state rather than patching ``_indexes``, because what these tests are about begins after setup
-    finishes. ``AT-078`` is the one that patches setup instead and asserts what it did.
+    finishes. ``TestWhatInitializeDecides`` is the class that patches setup instead and asserts what it did.
 
     Args:
         store: The store to prepare. Modified in place.
         documents: What ``aggregate`` answers with. Defaults to one scoreless document, since half of
             these tests do not care what comes back.
-        tiers: The prepared tiers, in preference order. ``()`` is the state ``AT-078``'s query test needs
-            and the one ``initialize()`` refuses to leave a store in.
+        tiers: The prepared tiers, in preference order. ``()`` is the state the no-prepared-tier query
+            test needs and the one ``initialize()`` refuses to leave a store in.
         failure: A driver error for the collection to raise instead of answering.
 
     Returns:
@@ -931,24 +929,24 @@ def _prepared(
 
 
 class TestWhatTheStoreSendsAndWhatItMapsBack:
-    """AT-077 / REQ-E-040, REQ-E-046, REQ-E-051, REQ-E-057 — predicate out, entry back.
+    """AT-077 — predicate out, entry back, and no document can claim another scope.
 
-    ``AT-046`` and ``AT-051`` close the scope predicate against a real deployment by observing what a
-    second scope's documents do, which is the stronger claim and the reason they live on the integration
-    tier. What they cannot see is a term that narrows nothing they seeded: two of the four terms here are
-    the caller's own, and a query that silently dropped one still returns the documents the test wrote.
-    A mutant that dropped the store's configured filter failed nothing.
+    ``TestTheStoreStampsTheScopeItself`` and ``test_filter.py``'s ``TestScopeCannotBeWidenedByACallerFilter``
+    close the scope predicate by observing what a second scope's documents do, which is the stronger
+    claim. What they cannot see is a term that narrows nothing they seeded: two of the four terms here are
+    the caller's own, and a query that silently dropped one, such as the store's configured filter, still
+    returns the documents the test wrote.
 
     The mapping half is the same shape of gap. A document is whatever the collection holds, so the
-    reserved keys are decided here and a document that could influence them could report a scope it was
+    reserved keys are decided here, and a document that could influence them could report a scope it was
     not stored in.
     """
 
     async def test_the_predicate_carries_the_scope_the_store_and_both_caller_filters(self) -> None:
         """Four terms from four places, in the order ``_filter.compose`` documents.
 
-        Also the positive control for ``AT-076``'s four rejections: a declared path in both filter
-        positions, accepted, and this is where each one went.
+        Also the positive control for the four rejections in ``TestEveryCallerInputIsCheckedBeforeTheNetwork``:
+        a declared path in both filter positions, accepted, and this is where each one went.
         """
         store = _store(
             config=_connection_config(filter_fields=["metadata.tier", "metadata.region"]),
@@ -971,11 +969,11 @@ class TestWhatTheStoreSendsAndWhatItMapsBack:
     async def test_a_stored_scope_key_cannot_make_a_document_report_another_scope(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """The scope-leak read half: ``_scope`` is read off the store, whatever the document holds.
+        """The read half of scope isolation: ``_scope`` is read off the store, whatever the document holds.
 
-        ``AT-057`` closes the same rule over ``_merge_metadata`` directly, where the reserved dict is the
-        test's own argument. This is the store deciding what goes into that dict, which is the decision a
-        document could reach.
+        ``TestReservedMetadataKeysWin`` closes the same rule over ``_merge_metadata`` directly, where the
+        reserved dict is the test's own argument. This is the store deciding what goes into that dict,
+        which is the decision a document could reach.
         """
         store = _store(scope="tenant-a")
         _prepared(
@@ -1006,13 +1004,12 @@ class TestWhatTheStoreSendsAndWhatItMapsBack:
         ids=["no-score-field", "score-projected-null"],
     )
     async def test_an_unscored_document_maps_to_zero_rather_than_failing(self, document: dict[str, Any]) -> None:
-        """``REQ-E-059`` says no result arrives unscored, and the fallback is for when one does.
+        """Every pipeline projects a score, and the fallback is for a document that arrives without one.
 
         Both shapes, because they fail differently and neither is produced by any pipeline this package
         emits: an absent ``score`` is a ``KeyError`` without the fallback, a projected ``null`` is a
-        ``TypeError``. Two unreachable lines elsewhere died the same way, by handing the collaborator
-        something a deployment does not produce, and the alternative is a
-        defense-in-depth line that nothing but a mutant ever reaches.
+        ``TypeError``. Handing the store a document a deployment does not produce is the only way to
+        exercise a defensive line like this one.
         """
         store = _store()
         _prepared(store, documents=[document])
@@ -1022,10 +1019,10 @@ class TestWhatTheStoreSendsAndWhatItMapsBack:
         assert _metadata(entries[0])["_relevance_score"] == 0.0
 
     async def test_only_the_documents_own_metadata_reaches_the_entry(self) -> None:
-        """``REQ-E-040``'s shape: the caller's nested keys, this package's four, and nothing else.
+        """The entry's metadata shape: the caller's nested keys, this package's four, and nothing else.
 
         The document root holds every field ``add`` writes plus what the search stages add. Mapping from
-        the root instead of from ``metadata`` hands the caller ``content_hash`` and ``score`` as
+        the root instead of from ``metadata`` would hand the caller ``content_hash`` and ``score`` as
         if they had stored them, and hands them a ``scope`` key that sits beside the ``_scope`` this
         package reports and disagrees with it whenever a document was moved.
         """
@@ -1060,12 +1057,13 @@ class TestWhatTheStoreSendsAndWhatItMapsBack:
 
 
 class TestDeletingOneMemory:
-    """AT-082 / REQ-E-076, REQ-E-078 — one filter out, and the ids that never reach the wire.
+    """AT-082 — one filter out, and the ids that never reach the wire.
 
-    The filter is asserted whole rather than probed term by term, for the reason ``AT-077`` gives: a
-    dropped term narrows nothing a test seeded and so is invisible to a count. On this tier there is
-    nothing seeded at all, since the fake resolves no matching, so the emitted dict is the entire claim
-    here and ``AT-085`` is what watches another store's document survive.
+    The filter is asserted whole rather than probed term by term, for the reason
+    ``TestWhatTheStoreSendsAndWhatItMapsBack`` gives: a dropped term narrows nothing a test seeded and so
+    is invisible to a count. On this tier there is nothing seeded at all, since the fake resolves no
+    matching, so the emitted dict is the entire claim here and ``TestDeletionStaysInsideTheStoreThatIssuedIt``
+    is what watches another store's document survive.
     """
 
     async def test_the_filter_is_the_read_paths_predicate_with_the_id_added(self) -> None:
@@ -1117,8 +1115,8 @@ class TestDeletingOneMemory:
 
         ``None`` is the case worth having: measured on pymongo 4.17.0, ``ObjectId(None)`` returns a freshly
         generated id rather than failing, so an unchecked ``None`` composes into a well-formed filter that
-        matches nothing and returns ``0``, reporting "already gone" for a call that named nothing at all
-        (``REQ-E-076``). ``12`` is the other shape the annotation does not enforce: ``ObjectId(12)`` raises
+        matches nothing and returns ``0``, reporting "already gone" for a call that named nothing at all.
+        ``12`` is the other shape the annotation does not enforce: ``ObjectId(12)`` raises
         ``TypeError``, which is neither the driver error ``_reporting`` wraps nor the ``ValueError`` a
         caller mistake should be.
         """
@@ -1132,18 +1130,19 @@ class TestDeletingOneMemory:
 
 
 class TestDeletingEveryMemoryThisStoreCanSee:
-    """AT-083 / REQ-E-077, REQ-E-078 — the read path's predicate, with nothing added.
+    """AT-083 — the read path's predicate, with nothing added.
 
-    Which is also the scope of the method, and why it stays an open question: the predicate carries
-    ``store_name`` and the store's configured filter, so this empties one store's view rather than one
-    scope. Two stores in a scope are two calls, and the README says so.
+    Which is also the scope of the method: the predicate carries ``store_name`` and the store's
+    configured filter, so this empties one store's view rather than one scope. Two stores in a scope are
+    two calls, and the README says so.
     """
 
     async def test_the_filter_is_exactly_the_read_paths_predicate(self) -> None:
         """No ``_id``, no extra term, and the configured filter still in it.
 
-        The configured filter is the term a mutation can drop for free: `AT-083`'s own count comes from the
-        fake, and on a deployment a store with no configured filter deletes the same documents either way.
+        The configured filter is the term that could go missing unnoticed: this class's count comes from
+        the fake, and on a deployment a store with no configured filter deletes the same documents either
+        way.
         """
         store = _store(
             config=_connection_config(filter_fields=["metadata.tier"]),
@@ -1175,10 +1174,11 @@ class TestDeletingEveryMemoryThisStoreCanSee:
 
 
 class TestDeletionIsAWrite:
-    """AT-084 / REQ-E-079 — ``writable`` gates both deletes, and it gates them before setup runs.
+    """AT-084 — ``writable`` gates both deletes, and it gates them before setup runs.
 
-    The error half of ``AT-084`` is in ``AT-080``'s parametrize below, since a wrapped driver error is the
-    same claim for four methods and the class that owns it already builds a store on ``LEAKY_URI``.
+    The error half is in the parametrize of ``TestADriverErrorArrivesNamingTheNamespaceAndNothingElse``
+    below, since a wrapped driver error is the same claim for four methods and that class already builds
+    a store on ``LEAKY_URI``.
     """
 
     @pytest.mark.parametrize("call", ["delete", "delete_all"])
@@ -1188,7 +1188,7 @@ class TestDeletionIsAWrite:
         The store points at a reserved port with a 50 ms selection timeout, so a refusal that arrived after
         ``initialize()`` would be a ``StorageError`` rather than this. ``_initialized`` is asserted as well,
         because that is the claim rather than a symptom of it: a read-only store must turn a delete down
-        without having created an index to do it, exactly as ``add`` does (``REQ-E-058``).
+        without having created an index to do it, exactly as ``add`` does.
         """
         store = _store()
 
@@ -1202,15 +1202,15 @@ class TestDeletionIsAWrite:
 
 
 class TestTheScoreBoundOnScoresThisTestChose:
-    """AT-079 / REQ-E-059 — the inclusive boundary and the ceiling, which real scores cannot reach.
+    """AT-079 — the inclusive boundary and the ceiling, which real scores cannot reach.
 
-    ``AT-059b`` closes the floor on the integration tier against real BM25 scores, and it sets its bound to
-    the midpoint between two of them, which is the only bound a test can pick when it does not know what
-    the scores will be. Two things follow from that, and both were unasserted until a mutation pass
-    said so. A result scoring *exactly* the bound is never on either side of a midpoint, and it
-    is the ordinary case rather than a corner: a caller who read a bound off an earlier result's
-    ``_relevance_score`` lands on it every time. And ``max_score`` had no test applying it to a result set
-    at all, so the ceiling branch was three unreached lines.
+    ``TestTheScoreBoundDropsResults`` closes the floor on the integration tier against real BM25 scores,
+    and it sets its bound to the midpoint between two of them, which is the only bound a test can pick
+    when it does not know what the scores will be. Two things follow from that, and this class covers
+    both. A result scoring *exactly* the bound is never on either side of a midpoint, and it is the
+    ordinary case rather than a corner: a caller who read a bound off an earlier result's
+    ``_relevance_score`` lands on it every time. And the midpoint test never applies ``max_score`` to a
+    result set at all, so the ceiling branch needs a test of its own.
 
     Fixed scores cost nothing the live tier was providing. The bound is applied in Python over a list, so a
     deployment contributes the numbers and nothing else.
@@ -1255,7 +1255,7 @@ class TestTheScoreBoundOnScoresThisTestChose:
         assert [entry.content for entry in entries] == kept
 
 
-_PRETEND_REASON = "no embedding model is registered (a stand-in for the real failure, not a server message)"
+_PRETEND_REASON = "no embedding model is registered (a stand-in for that failure, not a server message)"
 """Reason a refused index build carries, worded so a failure report cannot be read as a real server error."""
 
 
@@ -1264,31 +1264,34 @@ class _SetupRecorder:
 
     Patched over the module attributes rather than driven from a collection, because what ``initialize()``
     decides is which specs it passes and in which order, and every one of those is settled before a command
-    is built. ``AT-060`` through ``AT-064`` are what test the real ``ensure`` against a deployment.
+    is built. ``test_indexes.py``'s ``TestOrdinaryIndexesAgainstARealDeployment`` is what tests the real
+    ``ensure`` against a deployment.
 
     Refusing by index name rather than by tier, so the refusal is expressed the way the deployment expresses
-    it: one index will not build, and which tier that removes is what the store decides.
+    it: a deployment with no registered embedding model has one index that will not build, and which tier
+    that removes is what the store decides.
 
     Attributes:
         probes: The collection name for each capability probe.
         ordinary: One entry per ordinary ``ensure`` call, holding the spec names it carried.
         search: The name of each search index that was created, in creation order.
         timeouts: The ``timeout`` keyword of every call, ordinary and search alike, in call order.
-            ``None`` for a call that passed none, which is the failure ``AT-126`` exists to catch.
+            ``None`` for a call that passed none, which is the failure
+            ``TestTheIndexReadyBudgetComesFromTheConfig`` exists to catch.
         failing: Index names to refuse.
         available: What the capability probe answers.
         rank_fusion: What the ``$rankFusion`` probe answers.
         fusion_probes: The collection name for each ``$rankFusion`` probe. Separate from ``probes``
-            because the count that matters is per probe, not per initialize: ``AT-146``'s zero case is
-            a deployment where ``probes`` has one entry and this one must have none.
-        collations: The collection name for each collation preflight, in call order (``AT-176``). Its own
-            list for the same reason ``fusion_probes`` is: what the requirement bounds is how many times
-            *this* call happens, and a count folded into ``probes`` could not tell the two apart.
+            because the count that matters is per probe, not per initialize: on a deployment with no
+            search, ``probes`` has one entry and this one must have none.
+        collations: The collection name for each collation preflight, in call order. Its own list for the
+            same reason ``fusion_probes`` is: what is bounded is how many times *this* call happens, and a
+            count folded into ``probes`` could not tell the two apart.
         refuse_collation: Whether the preflight should refuse, standing in for a collection created with
             a case-folding collation.
         absent_until_provisioned: Whether the first collation read should report a collection that is not
-            there yet (``REQ-E-186``), as an empty database does. Later reads report one that is, because
-            between them ``initialize()`` ensures the indexes and that creates it.
+            there yet, as an empty database does. Later reads report one that is, because between them
+            ``initialize()`` ensures the indexes and that creates it.
     """
 
     def __init__(
@@ -1313,7 +1316,7 @@ class _SetupRecorder:
         self.available = available
 
     async def require_binary_comparison(self, collection: Any) -> bool:
-        """Stand in for ``_indexes.require_binary_comparison``, the preflight ``AT-176`` added.
+        """Stand in for ``_indexes.require_binary_comparison``, the collation preflight.
 
         Suspends for the reason :meth:`probe` does. It is also the first thing ``initialize()`` calls, so a
         fake that returned without yielding would let two concurrent initializes interleave differently
@@ -1324,13 +1327,13 @@ class _SetupRecorder:
                 one preflight per collection, not per store.
 
         Returns:
-            Whether a collection was there to verify (``REQ-E-186``). ``True`` unless
-            :attr:`absent_until_provisioned` says the collection does not exist yet, in which case the
-            first call answers ``False`` and every later one answers ``True`` -- which is what a
-            deployment does, because the ``ensure`` between them creates it.
+            Whether a collection was there to verify. ``True`` unless :attr:`absent_until_provisioned`
+            says the collection does not exist yet, in which case the first call answers ``False`` and
+            every later one answers ``True``, which is what a deployment does, because the ``ensure``
+            between them creates it.
 
         Raises:
-            StorageError: If :attr:`refuse_collation`, in the shape the real function raises it -- the
+            StorageError: If :attr:`refuse_collation`, in the shape the real function raises it. The
                 word ``collation`` is in the message because callers of this fake assert on it.
         """
         self.collations.append(collection.name)
@@ -1354,8 +1357,8 @@ class _SetupRecorder:
 
         Returns the real ``SearchSupport`` rather than a two-field fake of its own, so the invariant the
         production code relies on holds here too: a code is present exactly when search is absent. The
-        code is 6047401, one of the three ``REQ-E-053a`` measured, chosen because it is *not* the one this
-        package spent 18 tasks treating as the only one.
+        code is 6047401, one of the three a deployment without Atlas Search can answer, chosen because it
+        is not 31082, the most familiar of them, so nothing here can pass by assuming that one.
 
         Args:
             collection: The collection being probed.
@@ -1387,11 +1390,11 @@ class _SetupRecorder:
         """Stand in for ``_indexes.ensure``, recording what it was asked for.
 
         Args:
-            collection: Ignored; the specs are the claim.
+            collection: Ignored; the index specs are the claim.
             ordinary: Ordinary index specs.
             search: Search index specs, one per call from ``_ensure_search_tiers``.
-            **kwargs: ``create``, ``timeout`` and ``interval``. ``timeout`` is recorded for
-                ``AT-126``; the other two are not asserted here.
+            **kwargs: ``create``, ``timeout`` and ``interval``. ``timeout`` is recorded for the
+                index-ready budget tests; the other two are not asserted here.
 
         Raises:
             StorageError: If a search spec's name is in :attr:`failing`, which is how the real function
@@ -1419,25 +1422,22 @@ def _patch_setup(
 
     Patched on the module rather than on the store, which is what makes the count meaningful:
     ``initialize()`` reaches all of them through ``_indexes`` deliberately, so one store doing the work
-    twice and ten stores doing it once each are both visible here (``AT-065``'s precedent).
+    twice and ten stores doing it once each are both visible here, as in ``TestTenStoresShareOneSetup``.
 
     Args:
         monkeypatch: The fixture, so both patches are undone with the test.
         available: What the capability probe answers.
         failing: Search index names to refuse.
-        refuse_collation: Whether the collation preflight refuses (``AT-176``). Defaults to ``False``,
-            which is what a collection created without a collation reports and therefore what every test
-            written before ``AT-176`` assumed without saying so.
+        refuse_collation: Whether the collation preflight refuses. Defaults to ``False``, which is what
+            a collection created without a collation reports.
         absent_until_provisioned: Whether the first collation read reports a collection that is not there
-            yet (``REQ-E-186``). Defaults to ``False``, which is the established deployment every test
-            written before ``AT-192`` assumed.
+            yet. Defaults to ``False``, which is an established deployment.
         rank_fusion: What the ``$rankFusion`` probe answers. Defaults to ``False``, which is the one
             place in this file a fake's default deliberately does not match the common deployment:
-            Atlas hands out 8.0.23 and would answer ``True``. It is ``False`` here because that is
-            the no-fusion condition, and the tests that predate the hybrid tier are its coverage —
-            they assert the vector-first resolution *of a deployment without fusion*, and rewriting them
-            to opt out would have made the invariant self-certifying. Every test about hybrid passes
-            ``True`` and says so in its name.
+            Atlas runs MongoDB 8.0 and would answer ``True``. It is ``False`` here because the tests that
+            leave it at the default assert the vector-first resolution *of a deployment without fusion*,
+            and that resolution has to stay covered on its own. Every test about hybrid passes ``True``
+            and says so in its name.
 
     Returns:
         The recorder, holding what was asked for once the test has run.
@@ -1457,7 +1457,7 @@ def _patch_setup(
 
 
 class TestTheIndexReadyBudgetComesFromTheConfig:
-    """AT-126 / ``REQ-E-122`` — the memory store's half of one config key, at both call sites.
+    """AT-126 — the memory store's half of one config key, at both call sites.
 
     ``initialize()`` calls ``_indexes.ensure`` once for the ordinary specs and once per search tier, and
     only the search calls wait on anything. That asymmetry is the trap: a change that threads the key
@@ -1465,9 +1465,9 @@ class TestTheIndexReadyBudgetComesFromTheConfig:
     observable differs until somebody raises the budget and finds half of it ignored. Both calls are
     asserted here, and ``test_indexes.py`` asserts that the set of call sites is the set checked.
 
-    The default case matters as much as the override. ``REQ-E-123`` raised the module constant to 300
-    seconds, and a store that read the key with a hard-coded fallback of its own would keep the old
-    number alive in a second place.
+    The default case matters as much as the override. The module constant is the one default, and a
+    store that read the key with a hard-coded fallback of its own would keep a second number alive in a
+    second place.
     """
 
     async def test_every_call_carries_the_configured_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1477,7 +1477,8 @@ class TestTheIndexReadyBudgetComesFromTheConfig:
         await store.initialize()
 
         # One ordinary call plus one per search tier, all of them carrying the caller's number rather
-        # than the module's. `set` rather than a positional check: which tiers run is `AT-078`'s claim.
+        # than the module's. `set` rather than a positional check: which tiers run is
+        # `TestWhatInitializeDecides`'s claim.
         assert len(recorder.timeouts) == 1 + len(recorder.search)
         assert set(recorder.timeouts) == {7}
 
@@ -1493,19 +1494,18 @@ class TestTheIndexReadyBudgetComesFromTheConfig:
 
 
 class TestWhatInitializeDecides:
-    """AT-078 / REQ-E-052, REQ-E-053, REQ-E-053a, REQ-E-053b, REQ-E-067 — which indexes, ordered, fatal when.
+    """AT-078 — which indexes, ordered, fatal when.
 
     What a deployment shows is the outcome: which indexes exist afterwards, and that a warning happened.
     The claims here are the decisions upstream of it. Which spec was asked for, in what order, which
     refusal was re-raised instead of logged, and whether the lock was taken at all are all invisible in
     that outcome, because ``_indexes.ensure`` is idempotent and a store that redoes its setup leaves the
-    same indexes behind as one that does not. Every claim below was carried by the code alone until Task
-    8's mutation pass changed it and watched the suite stay green.
+    same indexes behind as one that does not.
 
     One claim has no deployment at all. "Vector is preferred when both tiers are available" only decides an
     answer on the AutoEmbeddings path, where a plain string fits both tiers, and that is the index an Atlas
-    CLI local deployment cannot build. The manual path does build both indexes there, measured in
-    a demo run, but on it the query key picks the tier and the order never gets a vote.
+    CLI local deployment cannot build, because it registers no embedding model. The manual path does build
+    both indexes there, but on it the query key picks the tier and the order never gets a vote.
 
     Patching ``_indexes`` is what makes the AutoEmbeddings both-available case exist, and the same patch is
     what lets one named index be refused on demand. Everything asserted here is a decision this package
@@ -1518,7 +1518,7 @@ class TestWhatInitializeDecides:
         """The preference order, and why it is an order rather than a fallback.
 
         The tier that answers is the observable half. On the AutoEmbeddings path a plain string fits both
-        tiers, so reversing the pair leaves every query answered lexically by a store whose
+        tiers, so reversing the pair would leave every query answered lexically by a store whose
         vector index exists, was built, and is never queried. Nothing about the result set says so: the
         entries come back scored and ranked, on a different scale, from a different index.
         """
@@ -1532,7 +1532,7 @@ class TestWhatInitializeDecides:
         assert store._pick_tier(query_text="dark mode", query_vector=None) == "vector"
 
     async def test_a_named_search_type_creates_only_its_own_index(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """``REQ-E-053``'s narrowing: a text store never creates a vector index it will not query.
+        """A named ``search_type`` narrows setup: a text store never creates a vector index it will not query.
 
         A cost claim as much as a correctness one, and on the AutoEmbeddings path the cost is per write:
         an unqueried vector index still embeds every document that lands in the collection.
@@ -1548,10 +1548,10 @@ class TestWhatInitializeDecides:
     async def test_a_named_search_types_own_tier_failing_is_fatal_and_says_what_refused(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``REQ-E-053``'s other half: one tier by request means nothing to fall through to.
+        """The other half of a named ``search_type``: one tier by request means nothing to fall through to.
 
-        The assertion is on the message and not only on the type, because skipping the failure
-        falls through to the empty-tier floor two lines below, which raises ``StorageError`` as well. Same
+        The assertion is on the message and not only on the type, because skipping the failure would
+        fall through to the empty-tier floor two lines below, which raises ``StorageError`` as well. Same
         class, different information: one names the index the server refused and carries its reason, the
         other names ``auto``, which this store is not.
         """
@@ -1568,9 +1568,9 @@ class TestWhatInitializeDecides:
     async def test_auto_with_every_tier_refused_warns_per_tier_then_raises(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """``REQ-E-053b``'s floor, and *where* it is raised is the claim.
+        """The floor under ``auto``, and *where* it is raised is the claim.
 
-        Returning an empty tier tuple instead leaves ``initialize()`` succeeding on a store that
+        Returning an empty tier tuple instead would leave ``initialize()`` succeeding on a store that
         can never answer anything, and moves the first symptom to whichever query runs next, where the
         reason each tier failed is already several log lines behind.
         """
@@ -1587,14 +1587,12 @@ class TestWhatInitializeDecides:
     async def test_the_raise_carries_the_last_tiers_reason_rather_than_pointing_at_the_log(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``AT-166`` / ``REQ-E-160`` -- the reason travels on the exception, not only in a log line.
+        """``AT-166`` -- the reason travels on the exception, not only in a log line.
 
-        Measured on 2026-09-16 against a deployment whose mongot was gone: twelve cluster tests failed
-        here with *"Each tier's failure is logged above with the server's own reason"* and a traceback
-        that carried no reason and no server error code at all. The codes existed -- 125 on the index
-        management channel -- but they were spent on ``logger.warning`` and dropped, so the only caller
-        who could see why was one with logging configured at ``WARNING``. An exception that tells its
-        reader to go and look somewhere else is an exception with one job left undone.
+        Each tier's refusal carries the server's reason and error code, such as code 125 from the index
+        management channel when mongot is unreachable. Logging it at ``WARNING`` is not enough: a caller
+        without logging configured would see only that no tier could be prepared. So the last tier's
+        error is chained as the cause, and the traceback carries the reason itself.
         """
         _patch_setup(monkeypatch, failing=frozenset({"vector_index", "text_index"}))
         store = _store()
@@ -1605,19 +1603,20 @@ class TestWhatInitializeDecides:
         cause = caught.value.__cause__
         assert cause is not None, (
             "the raise names no cause, so a traceback of it says no tier could be prepared and nothing "
-            "about why -- which is the whole of what a reader needs"
+            "about why, which is the whole of what a reader needs"
         )
         assert _PRETEND_REASON in str(cause)
 
     async def test_auto_landing_on_text_warns_that_answers_became_lexical(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """``REQ-E-053``'s "warn when it lands below vector", which is a second warning and not the first.
+        """``auto`` warns when it lands below vector, and that is a second warning, not the first.
 
-        ``AT-053b`` asserts the per-tier line on a real deployment where the vector index cannot build,
-        and that line reports what failed. This one reports the consequence in the caller's
-        terms: a store still answering, semantically degraded, which is the half a reader acts on. Removing
-        it left the suite green, because the other warning was still there to be found.
+        ``TestTheShippedDefaultAgainstADeploymentWithNoModel`` asserts the per-tier line on a real
+        deployment where the vector index cannot build, and that line reports what failed. This one
+        reports the consequence in the caller's terms: a store still answering, semantically degraded,
+        which is the half a reader acts on. It is asserted on its own because the per-tier warning would
+        still be found without it.
         """
         _patch_setup(monkeypatch, failing=frozenset({"vector_index"}))
         store = _store()
@@ -1633,11 +1632,11 @@ class TestWhatInitializeDecides:
     async def test_a_deployment_that_cannot_search_warns_once_for_ten_stores(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """``REQ-E-053a``'s warning is per connection, which is the half ``AT-053a`` does not count.
+        """The no-search warning is per connection, which is the half ``AT-053a`` does not count.
 
         Ten stores built from one config share one ``_Connection``, so the probe runs once and the line
-        reporting its result belongs inside that branch. Ten copies of a six-sentence warning on
-        every process start is the difference between a log a reader scans and one they filter out, and the
+        reporting its result belongs inside that branch. Ten copies of a six-sentence warning on every
+        process start is the difference between a log a reader scans and one they filter out, and the
         filter they write is the one that hides it on the eleventh store too.
         """
         recorder = _patch_setup(monkeypatch, available=False)
@@ -1654,11 +1653,11 @@ class TestWhatInitializeDecides:
     async def test_the_second_initialize_neither_takes_the_lock_nor_redoes_the_setup(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``REQ-E-052``'s idempotency, counted rather than inferred from a collection's indexes.
+        """Idempotent setup, counted rather than inferred from a collection's indexes.
 
         An index count cannot see this. ``_indexes.ensure`` is idempotent by design, so a store that redid
-        the whole setup on every call leaves a collection indistinguishable from one that did it
-        once, and a store that only stopped taking the fast path leaves no trace at all. What is
+        the whole setup on every call leaves a collection indistinguishable from one that did it once,
+        and a store that only stopped taking the fast path leaves no trace at all. What is
         observable is the work: two calls, one probe, one ordinary ``ensure``, two search ``ensure``s, and
         the lock taken once. The lock is the reason the fast path is unlocked, and ``add`` and ``search``
         both call ``initialize()`` on every agent turn, so it is a lock every operation would queue on.
@@ -1686,10 +1685,10 @@ class TestWhatInitializeDecides:
     async def test_one_store_initializing_twice_at_once_does_the_work_once(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The flag re-read under the lock, which is the half of ``REQ-E-052`` ten stores cannot reach.
+        """The flag re-read under the lock, which is the half of idempotent setup ten stores cannot reach.
 
-        ``AT-065``'s ten stores contend on the connection lock and then each does its own index work,
-        because ``_initialized`` is per store. One store is the case that arrives on every agent turn:
+        ``TestTenStoresShareOneSetup``'s ten stores contend on the connection lock and then each does its
+        own index work, because ``_initialized`` is per store. One store is the case that arrives on every agent turn:
         ``add`` and ``search`` both call ``initialize()``, so two operations issued together are two
         coroutines inside one flag. The second re-reads it after waiting, and without that read it repeats
         setup the first has already finished, on a store that is already usable.
@@ -1704,7 +1703,7 @@ class TestWhatInitializeDecides:
         assert recorder.search == ["vector_index", "text_index"]
 
     async def test_a_query_with_no_prepared_tier_names_index_creation_not_a_missing_module(self) -> None:
-        """``_pick_tier``'s two messages for two remedies (``REQ-E-053a``, ``REQ-E-053b``).
+        """``_pick_tier``'s two messages for two remedies: no Atlas Search, or no prepared tier.
 
         This deployment can search, so the other message's advice about pointing ``connection_string`` at
         Atlas would send a reader to replace something that is not broken. Reached by preparing nothing
@@ -1719,13 +1718,13 @@ class TestWhatInitializeDecides:
             await store.search("dark mode")
 
         assert "no search tier could be prepared" in str(caught.value)
-        # The other message's own words rather than the server code it used to hard-code. Now
-        # that code is interpolated, so `"31082" not in ...` would pass on a message built entirely from
-        # the wrong template and prove nothing.
+        # The other message's own words rather than a server code. That code is interpolated from the
+        # probe, so `"31082" not in ...` would pass on a message built entirely from the wrong template
+        # and prove nothing.
         assert "does not run Atlas Search" not in str(caught.value)
 
     async def test_a_query_that_no_prepared_tier_fits_names_the_key_to_add(self) -> None:
-        """``REQ-E-074a`` where a manual-vector store meets ``MemoryManager`` (``AT-078``'s third message).
+        """The one-vector-key rule where a manual-vector store meets ``MemoryManager`` (``AT-078``'s third message).
 
         The shipped call site always sends a plain string, and a manual-vector store asking for
         ``search_type='vector'`` has nothing that can answer one: the deployment does not embed on that path
@@ -1744,10 +1743,10 @@ class TestWhatInitializeDecides:
 
 
 class TestTheMemoryStoreRefusesACollationThatFoldsCase:
-    """AT-176 / ``REQ-E-170`` — the second surface's half of one preflight, on the field it isolates by.
+    """AT-176 — the second surface's half of one preflight, on the field it isolates by.
 
-    ``test_storage.py`` carries the finding and the reasoning. What is different here is the field at
-    stake. The storage surface keeps its namespaces apart in ``_id``; this one keeps its scopes apart in
+    ``test_storage.py`` carries the full reasoning for the storage surface. What is different here is the
+    field at stake. The storage surface keeps its namespaces apart in ``_id``; this one keeps its scopes apart in
     ``scope``, because ``_filter.compose`` pins ``{"scope": self.scope, "store_name": self.name}`` on
     every read, update and delete. A collation that folds case therefore turns ``scope="tenant-b"`` into a
     filter that matches documents written under ``Tenant-B``, which is a cross-scope read
@@ -1755,7 +1754,7 @@ class TestTheMemoryStoreRefusesACollationThatFoldsCase:
     so past every check ``TestEveryCallerInputIsCheckedBeforeTheNetwork`` makes.
 
     ``initialize()`` is the only place the check needs to be, and that is a claim rather than a
-    convenience: ``search``, ``add`` and both deletes call it first (``AT-045b``), so there is no public
+    convenience: ``search``, ``add`` and both deletes call it first, so there is no public
     coroutine on this surface that reaches the collection without passing through here. The storage
     surface has no such funnel and needed seven call sites.
 
@@ -1765,7 +1764,7 @@ class TestTheMemoryStoreRefusesACollationThatFoldsCase:
     """
 
     async def test_initialize_refuses_and_says_collation(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The finding on this surface, and the type is ``StorageError`` because the remedy is the
+        """The refusal on this surface, and the type is ``StorageError`` because the remedy is the
         deployment's: no argument to this package can make a folded collection safe."""
         _patch_setup(monkeypatch, refuse_collation=True)
         store = _store()
@@ -1807,7 +1806,7 @@ class TestTheMemoryStoreRefusesACollationThatFoldsCase:
     ) -> None:
         """``_initialized`` stays ``False`` through a refusal, so the second call asks again.
 
-        The alternative -- a store that remembers it failed -- would make a fixed deployment need a
+        The alternative, a store that remembers it failed, would make a fixed deployment need a
         restarted process, and the flag is set at the end of ``initialize()`` for exactly this reason. The
         second half of the test is what makes it a claim about caching rather than about one call: the
         preflight stops refusing, and the same store initializes.
@@ -1839,11 +1838,11 @@ class TestTheMemoryStoreRefusesACollationThatFoldsCase:
 
 
 class TestAnAbsentCollectionIsNotAVerifiedOne:
-    """AT-192 / ``REQ-E-186`` — this surface's half of the finding ``test_storage.py`` carries.
+    """AT-192 — this surface's half of the absent-collection rule ``test_storage.py`` also covers.
 
     ``listCollections`` reports a collection with no collation and a collection that is not there at all
-    identically: nothing. ``AT-176``'s preflight read that nothing as a verification and the connection
-    cached it, so a namespace could enter ``binary_keys`` having never been checked -- and whoever created
+    identically: nothing. A preflight that read that nothing as a verification, and a connection that
+    cached it, would let a namespace enter ``binary_keys`` having never been checked, and whoever created
     the collection a moment later could give it any collation, with the cache guaranteeing nobody ever
     looked again.
 
@@ -1852,13 +1851,13 @@ class TestAnAbsentCollectionIsNotAVerifiedOne:
     would leave the window open for the life of the store rather than closing it on the next write. The
     close is the second read: ``ensure`` has created the collection by then, so there is something to
     verify, and verifying it is both the answer and the thing worth caching. A collation that appeared in
-    between is somebody else's, and it fails this call -- before ``add`` has written one memory under it.
+    between is somebody else's, and it fails this call, before ``add`` has written one memory under it.
     """
 
     async def test_an_absent_collection_is_read_again_once_the_indexes_have_created_it(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Two reads for the empty database, where ``AT-176`` did one and cached what it could not read."""
+        """Two reads for the empty database, where the ``AT-176`` preflight alone would cache what it could not read."""
         recorder = _patch_setup(monkeypatch, absent_until_provisioned=True)
         store = _store()
 
@@ -1871,7 +1870,7 @@ class TestAnAbsentCollectionIsNotAVerifiedOne:
         """The bound on the re-reading: it stops, rather than repeating per store for the connection's life.
 
         The second store shares the connection and therefore the ``binary_keys`` set, and it adds no third
-        read -- which is only true because the first store's *second* read is what went into the cache.
+        read, which is only true because the first store's *second* read is what went into the cache.
         """
         recorder = _patch_setup(monkeypatch, absent_until_provisioned=True)
 
@@ -1887,7 +1886,7 @@ class TestAnAbsentCollectionIsNotAVerifiedOne:
 
         Somebody else creates ``appdb.memory`` with a case-folding collation while this store is
         provisioning: the first read found nothing to object to and the second one finds it. The refusal
-        is the point, and so is *when* it arrives -- ``_initialized`` is still ``False``, so no caller ever
+        is the point, and so is *when* it arrives: ``_initialized`` is still ``False``, so no caller ever
         held a store over a collection that cannot keep the scopes apart.
         """
         recorder = _patch_setup(monkeypatch, absent_until_provisioned=True)
@@ -1909,27 +1908,28 @@ class TestAnAbsentCollectionIsNotAVerifiedOne:
 
 
 class TestTheHybridTierIsAStatementAboutTwoOthers:
-    """AT-146, AT-147 / ``REQ-E-143``, ``REQ-E-144`` — when fusion is offered and when it is withheld.
+    """AT-146, AT-147 — when fusion is offered and when it is withheld.
 
     Hybrid is not a third peer in the preference list. It is a claim that the other two both came up,
     which is why every test here is about the *conditions* rather than about a pipeline: the pipeline is
     ``test_pipeline.py``'s tier and is asserted there on the emitted stages.
 
     A ``$rankFusion`` with one input pipeline is a more expensive spelling of that one pipeline and would
-    be the likeliest shape of the bug. On a deployment that answers with code 8, the missing input
-    would be the vector one, so the "hybrid" result would be lexical ranking under a name that promises
-    semantic ranking — the metadata would say ``hybrid`` and the caller would have no way to tell.
+    be the likeliest shape of the bug. On a deployment with no registered embedding model, where the
+    vector index fails with code 8, the missing input would be the vector one, so the "hybrid" result
+    would be lexical ranking under a name that promises semantic ranking: the metadata would say
+    ``hybrid`` and the caller would have no way to tell.
     """
 
     async def test_auto_prefers_fusion_where_the_deployment_and_both_tiers_allow_it(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``REQ-E-145``'s rule, and the ordering it produces.
+        """``auto`` prefers fusion when it is available, and this is the ordering that produces.
 
-        Hybrid leads and the two single tiers stay behind it in their old order, rather than replacing
-        them: the fallback list is what answers a query whose shape only one tier fits, and collapsing it
-        to ``("hybrid",)`` would leave a manual-vector store unable to answer a text-only query it
-        answered before.
+        Hybrid leads and the two single tiers stay behind it in their usual order, rather than being
+        replaced: the fallback list is what answers a query whose shape only one tier fits, and
+        collapsing it to ``("hybrid",)`` would leave a manual-vector store unable to answer a text-only
+        query.
         """
         recorder = _patch_setup(monkeypatch, rank_fusion=True)
         store = _store()
@@ -1957,10 +1957,9 @@ class TestTheHybridTierIsAStatementAboutTwoOthers:
     ) -> None:
         """``AT-146``'s zero case, and the reason the short-circuit exists.
 
-        ``REQ-E-144`` makes hybrid need both search tiers, so on a deployment with no Atlas Search the
-        answer cannot be used whatever the version is. Asking anyway costs a round trip per connection
-        for a value nothing reads — and this is not a hypothetical deployment, it is the CI contract
-        tier: ``mongo:8`` reports 8.3.8 and has no mongot.
+        Hybrid needs both search tiers, so on a deployment with no Atlas Search the answer cannot be
+        used whatever the version is. Asking anyway costs a round trip per connection for a value nothing
+        reads, and this is the deployment the CI contract tier runs against: ``mongo:8`` has no mongot.
         """
         recorder = _patch_setup(monkeypatch, available=False, rank_fusion=True)
         store = _store()
@@ -2060,24 +2059,25 @@ class TestTheHybridTierIsAStatementAboutTwoOthers:
 
 
 class TestTheQueryShapeOnlyFusionCanRead:
-    """AT-157 / ``REQ-E-151`` — the rejection the hybrid tier had to narrow, and how far.
+    """AT-157 — the one configuration where a query may carry both vector keys, and no wider.
 
-    ``REQ-E-074a`` rejects a query setting both ``text`` and ``vector`` on the grounds that no tier reads
-    both. The hybrid tier on a manual-vector store reads both: ``text`` feeds its ``$search`` input
-    pipeline and ``vector`` feeds its ``$vectorSearch`` one. So the premise expired for exactly one
-    configuration, and the narrowing has to be exactly that wide or it gives back the bug the rejection
-    was written for.
+    A query setting both ``text`` and ``vector`` is rejected because no single tier reads both. The
+    hybrid tier on a manual-vector store reads both: ``text`` feeds its ``$search`` input pipeline and
+    ``vector`` feeds its ``$vectorSearch`` one. So the rejection does not apply to exactly one
+    configuration, and the exception has to be exactly that wide, or a query whose second key would be
+    silently ignored gets through.
 
     Two checks rather than one, in two places, because they can answer at two different times. Whether
     the *config* could use both keys is known at construction and is checked before the first round trip,
-    which is what ``AT-076`` asserts by running against a closed port. Whether the *deployment* delivered
+    which is what ``TestEveryCallerInputIsCheckedBeforeTheNetwork`` asserts by running against a closed
+    port. Whether the *deployment* delivered
     the fused tier is known only after the probe, and the answer there cannot be a fallback: every
     remaining tier reads one of the two keys and would drop the other silently.
     """
 
     async def test_the_autoembeddings_path_still_rejects_both_before_the_network(self) -> None:
-        """Unchanged, and this is the case ``AT-076`` covers: on this path the fused tier reads ``text``
-        in *both* of its input pipelines, so a ``vector`` beside it is as meaningless as it ever was."""
+        """Still rejected, and this is the case ``AT-076`` covers: on this path the fused tier reads ``text``
+        in *both* of its input pipelines, so a ``vector`` beside it means nothing."""
         with pytest.raises(ValueError, match="no interpretation"):
             await _store().search({"text": "dark mode", "vector": QUERY_VECTOR})
 
@@ -2114,7 +2114,7 @@ class TestTheQueryShapeOnlyFusionCanRead:
 
         Both tiers are up and only the server version is missing, so there is a tier here that would
         answer this query: the text one, reading ``text`` and ignoring the vector the caller computed. It
-        would return entries, ranked, stamped ``_search_type: "text"`` — a true report of a question
+        would return entries, ranked, stamped ``_search_type: "text"``: a true report of a question
         nobody asked, and indistinguishable from a fused answer unless the caller reads the metadata.
         """
         _patch_setup(monkeypatch, rank_fusion=False)
@@ -2130,12 +2130,11 @@ class TestTheQueryShapeOnlyFusionCanRead:
 
 
 class TestAScoreBoundDeclinesTheBetterTier:
-    """AT-148, AT-149 / ``REQ-E-145`` — the exception that is not a preference.
+    """AT-148, AT-149 — the exception that is not a preference.
 
-    The upgrade this protects has no code change in it. A caller who set ``min_score=0.7`` against the
-    vector tier, left ``search_type`` at its default, and upgraded this package would have had their
-    bound applied to fused scores that top out near 0.033 — an empty list, no error, no warning, and
-    indistinguishable from an empty collection.
+    A caller who set ``min_score=0.7`` with the vector tier's scores in mind and left ``search_type`` at
+    its default would otherwise have that bound applied to fused scores that top out near 0.033: an
+    empty list, no error, no warning, and indistinguishable from an empty collection.
 
     So the tier resolution reads a configuration key that has nothing to do with tiers, which is
     irregular enough to be worth the two tests. This package's line on silent wrong answers is that
@@ -2154,7 +2153,7 @@ class TestAScoreBoundDeclinesTheBetterTier:
         """``AT-148`` and ``AT-149`` in one reading, because they are one decision and its log line.
 
         Both bounds, not only the floor. ``max_score`` is a ceiling, so a fused score near 0.03 passes it
-        rather than failing it — the failure is quieter still, a result set that keeps everything and
+        rather than failing it, and the failure is quieter still: a result set that keeps everything and
         means nothing. The log names which bound was set because the remedy differs by one word and is
         not guessable from the result.
         """
@@ -2186,8 +2185,8 @@ class TestAScoreBoundDeclinesTheBetterTier:
         """Nothing was declined, so there is nothing to report.
 
         A warning here would describe a tier the deployment cannot run to an operator who cannot enable
-        it, on every store construction, forever — and the store it names resolves exactly as it always
-        has.
+        it, on every store construction, while the store it names resolves exactly as it would without a
+        bound.
         """
         _patch_setup(monkeypatch, rank_fusion=False)
         store = _store(min_score=0.7)
@@ -2201,11 +2200,11 @@ class TestAScoreBoundDeclinesTheBetterTier:
     async def test_an_explicit_hybrid_store_keeps_its_bound_and_its_tier(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """``REQ-E-146``: asked for by name, so it is not second-guessed.
+        """Hybrid asked for by name is not second-guessed, bound or no bound.
 
         The same line ``_ensure_search_tiers`` already draws between ``auto`` and a named tier. What the
-        caller is owed here is the number, which is why ``AT-151`` holds the README and the docstring to
-        stating the scale.
+        caller is owed here is the number, which is why ``test_readme.py`` holds the README and the
+        docstring to stating the fused scale.
         """
         _patch_setup(monkeypatch, rank_fusion=True)
         store = _store(min_score=0.7, config=_connection_config(search_type="hybrid"))
@@ -2222,7 +2221,7 @@ class TestAScoreBoundDeclinesTheBetterTier:
         The numbers are what a real fusion returns rather than what a cosine tier does: ``0.0328`` is a
         document ranked first by both branches, ``0.0164`` first by one, and ``0.0161`` third. A bound
         picked on the fused scale keeps the first two, and the same code path that applies it to a cosine
-        score applies it here — which is the claim, since the alternative implementations both look right
+        score applies it here, which is the claim, since the alternative implementations both look right
         from outside: dropping the bound on this tier, or comparing against a score field ``$rankFusion``
         never projected and that would therefore read ``0.0`` for every document.
         """
@@ -2241,20 +2240,21 @@ class TestAScoreBoundDeclinesTheBetterTier:
 
 
 class TestADriverErrorArrivesNamingTheNamespaceAndNothingElse:
-    """AT-080 / REQ-E-036a — the two driver calls ``AT-014``'s memory half never reaches.
+    """AT-080 — the driver calls ``AT-014``'s memory half never reaches.
 
-    ``AT-014`` asserts ``StorageError`` out of ``initialize``, ``search`` and ``add`` against a real
-    authentication failure, and it passed from its first run for a reason that hid a gap. An auth failure
-    surfaces inside ``_indexes.search_support`` or ``_indexes.ensure``, and both wrap their own driver
-    errors, so ``_reporting`` never sees a ``PyMongoError`` at all. The two calls that reach the driver
-    unwrapped are ``update_one`` on the write path and ``aggregate`` on the read path. Both were
-    unexercised: rendering the whole connection config into the message left the suite green,
-    and ``REQ-E-036a`` exists because the behavior was real, needed, and asserted by nothing.
+    ``TestNoMemoryMethodRendersThePassword`` asserts ``StorageError`` out of ``initialize``, ``search``
+    and ``add`` against a real authentication failure, and that leaves a gap. An auth failure surfaces
+    inside ``_indexes.search_support`` or ``_indexes.ensure``, and both wrap their own driver errors, so
+    ``_reporting`` never sees a ``PyMongoError`` at all. The calls that reach the driver unwrapped are
+    ``update_one`` on the write path, ``aggregate`` on the read path and the two deletes, and only a test
+    that fails one of them shows whether ``_reporting`` would render the connection config into the
+    message.
 
     Which is why the store is built on ``LEAKY_URI`` and the driver error carries no password. A real one
     does not, so the config this store is holding is the only route the password has into the message, and
     closing that route is the whole point of a decorator that renders a namespace and nothing else.
-    ``_assert_no_leak`` is defined with ``AT-014``'s own tests below and shared rather than repeated.
+    ``_assert_no_leak`` is defined with ``TestNoMemoryMethodRendersThePassword`` below and shared rather
+    than repeated.
     """
 
     @pytest.mark.parametrize("call", ["add", "search", "delete", "delete_all"])
@@ -2265,9 +2265,9 @@ class TestADriverErrorArrivesNamingTheNamespaceAndNothingElse:
         wraps every ``PyMongoError``, and a decorator that inspected the code would be the thing that
         decides some failures are not worth reporting.
 
-        The two delete calls are ``AT-084``'s error half, added here rather than given a class of
-        their own: ``delete_one`` and ``delete_many`` are the third and fourth driver calls this store
-        makes unwrapped, so they belong to the gap this class exists to close.
+        The two delete calls are the error half of ``TestDeletionIsAWrite``, kept here rather than given a
+        class of their own: ``delete_one`` and ``delete_many`` are the third and fourth driver calls this
+        store makes unwrapped, so they belong to the gap this class exists to close.
         """
         verbs = {
             "add": "adding a memory to",
@@ -2325,8 +2325,7 @@ async def _require_no_search_support(store: MongoDBMemoryStore) -> int:
 
     Returns the code so the callers can assert that the message names *this* deployment's code rather
     than a literal. Three codes mean this and they differ by server version and build, so a test that
-    hard-coded one passed on the deployment it was written against and nowhere else. That is the defect
-    this helper avoids, and asserting against a literal here would have hidden it.
+    hard-coded one would pass on the deployment it was written against and nowhere else.
 
     Args:
         store: The store whose collection to probe.
@@ -2336,14 +2335,14 @@ async def _require_no_search_support(store: MongoDBMemoryStore) -> int:
     """
     support = await _indexes.search_support(store._collection())
     if support.available:
-        pytest.skip("MONGODB_URI names a deployment with Atlas Search; REQ-E-053a is about one without")
+        pytest.skip("MONGODB_URI names a deployment with Atlas Search; this test is about one without")
     assert support.code is not None, "the probe reported no search support and no code, which it must not"
     return support.code
 
 
 @pytest.mark.contract
 class TestDedupAgainstTheUniqueIndex:
-    """AT-042, AT-043 / REQ-E-042, REQ-E-043 — the reason the index is unique.
+    """AT-042, AT-043 — a retried write stores one document, and the reason the index is unique.
 
     Extraction writes are at-least-once and the coordinator re-drives the **whole batch** on any single
     failure, so the same fact arrives repeatedly by design. Without the unique partial index over
@@ -2391,7 +2390,7 @@ class TestDedupAgainstTheUniqueIndex:
     async def test_a_concurrent_duplicate_key_error_is_reported_as_success(
         self, contract_store: MongoDBMemoryStore, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """``REQ-E-043``, injected rather than raced, because the race is not reproducible on demand.
+        """A lost insert race reads as a duplicate, injected rather than raced to make it reproducible.
 
         The window is real and narrow: two upserts both match nothing, both insert, and the loser gets
         ``DuplicateKeyError``. Injecting it is the only way to assert *which* answer the loser gets, and
@@ -2456,12 +2455,12 @@ class TestDedupAgainstTheUniqueIndex:
 
 @pytest.mark.contract
 class TestInitializeIsIdempotent:
-    """AT-045a / REQ-E-045 — twice is the same as once, on the ordinary index set.
+    """AT-045a — twice is the same as once, on the ordinary index set.
 
-    Called on every ``search`` and every ``add`` (``REQ-E-045``), so the warm path has to be cheap and
-    must not accumulate anything. ``_indexes.ensure``'s own idempotency is asserted elsewhere; what this adds
-    is that ``initialize()`` is the caller that keeps it, rather than passing a different spec set the
-    second time and creating a second index under another name.
+    Called on every ``search`` and every ``add``, so the warm path has to be cheap and must not
+    accumulate anything. ``_indexes.ensure``'s own idempotency is ``test_indexes.py``'s claim; what this
+    adds is that ``initialize()`` is the caller that keeps it, rather than passing a different spec set
+    the second time and creating a second index under another name.
     """
 
     async def test_initializing_twice_creates_one_index_set(
@@ -2483,14 +2482,14 @@ class TestInitializeIsIdempotent:
 
 @pytest.mark.contract
 class TestTheStoreStampsTheScopeItself:
-    """AT-046, AT-048a / REQ-E-046, REQ-E-048 — the scope stamp, on the write path.
+    """AT-046, AT-048a — scope isolation on the write path.
 
-    Isolation here is application-enforced, not database-enforced: there is no server-side
-    row filter, so a document lands in the right scope only because this package put it there. Every
-    assertion reads the stored document rather than the returned result, because the result is this
-    package's own report and the document is what the next query will match.
+    Isolation here is application-enforced, not database-enforced: there is no server-side row filter,
+    so a document lands in the right scope only because this package put it there. Every assertion reads
+    the stored document rather than the returned result, because the result is this package's own report
+    and the document is what the next query will match.
 
-    ``REQ-E-048``'s sentinel is the other half. An absent ``scope`` resolving to "no predicate" would make
+    The unscoped sentinel is the other half. An absent ``scope`` resolving to "no predicate" would make
     the *unconfigured* store the one that reads everything, which is the failure mode that looks like a
     relevance quirk instead of a leak.
     """
@@ -2540,7 +2539,7 @@ class TestTheStoreStampsTheScopeItself:
         """``filter`` is read-path narrowing and the write path does not consult it at all.
 
         ``scope`` is one of the two baked-in filterable fields (``_indexes.declared_filter_fields``), so
-        this filter passes ``REQ-E-049``'s declared-field check and would be accepted by a query. That is
+        this filter passes the declared-field check and would be accepted by a query. That is
         what makes it worth asserting on the write path: the value is valid, it just has no authority
         here.
         """
@@ -2595,9 +2594,10 @@ class TestTheStoreStampsTheScopeItself:
 
 @pytest.mark.contract
 class TestWritesStayInTheirScope:
-    """AT-047b / REQ-E-047 — two stores, one collection, and dedup that does not cross the boundary.
+    """AT-047b — two stores, one collection, and dedup that does not cross the boundary.
 
-    The read half is ``AT-047a`` on the integration tier, for the reason in the module docstring. This
+    The read half is ``TestNoSearchCrossesAScope`` on the integration tier, for the reason in the module
+    docstring. This
     half is the one a plain deployment can prove, and it carries a claim the read half cannot: the unique
     index leads with ``scope``, so the *same* fact in two scopes is two documents. An index over
     ``content_hash`` alone would collapse them into one and hand tenant B a document written by tenant A,
@@ -2633,10 +2633,10 @@ class TestWritesStayInTheirScope:
 
 @pytest.mark.contract
 class TestDeletionStaysInsideTheStoreThatIssuedIt:
-    """AT-085 / REQ-E-076–REQ-E-079 — real documents, no query.
+    """AT-085 — deletes stay inside the issuing store, on real documents, with no query.
 
-    Contract rather than integration, which is the tier rule rather than a shortcut: the
-    memory read path needs mongot and nothing here reads through ``search``. The id comes from
+    Contract rather than integration, by the same tier rule as the rest of this file: the memory read
+    path needs mongot and nothing here reads through ``search``. The id comes from
     ``MongoDBAddResult.ids[0]``, the same string ``search`` projects into ``_id`` metadata, so the round
     trip a caller makes is the round trip under test.
 
@@ -2650,7 +2650,7 @@ class TestDeletionStaysInsideTheStoreThatIssuedIt:
     ) -> None:
         """One of two documents goes, the other stays, and deleting the same id again returns ``0``.
 
-        The second call is ``REQ-E-078``'s "matched nothing is not an error" on the path a retry takes: an
+        The second call is "matched nothing is not an error" on the path a retry takes: an
         erasure job that runs twice must not fail the second time.
         """
         first = await contract_store.add("the user prefers dark mode")
@@ -2669,7 +2669,7 @@ class TestDeletionStaysInsideTheStoreThatIssuedIt:
         unique_collection_name: str,
         contract_database: Any,
     ) -> None:
-        """``REQ-E-078``'s oracle argument, as two return values that have to be equal.
+        """A delete is not an existence oracle: two return values that have to be equal.
 
         A well-formed id belonging to another store in the same scope, and an id belonging to nothing at
         all, both answer ``0``. If the first answered anything else, a loop over ids would tell a caller
@@ -2699,7 +2699,7 @@ class TestDeletionStaysInsideTheStoreThatIssuedIt:
         unique_collection_name: str,
         contract_database: Any,
     ) -> None:
-        """The open question as an assertion rather than a paragraph.
+        """``delete_all`` empties one store's view, not one scope, as an assertion rather than a paragraph.
 
         Two memories in one store, one in a sibling, all three in one scope and one collection. The count
         returned is exactly the two, and the sibling's document is still there afterwards, which is the
@@ -2728,28 +2728,26 @@ class TestDeletionStaysInsideTheStoreThatIssuedIt:
 
 @pytest.mark.contract
 class TestADeploymentWithNoSearchSupport:
-    """AT-053a, AT-053c / REQ-E-053, REQ-E-053a — measured rather than assumed.
+    """AT-053a, AT-053c — a deployment without Atlas Search, measured rather than assumed.
 
-    Measured 2026-09-01 against ``mongo:8``, reported version 8.3.8 with ``modules: []``: every search
-    surface fails identically, ``OperationFailure`` code **31082**, while ordinary index creation and
-    every CRUD path work normally. So this deployment can hold memories and cannot read them back.
+    On ``mongo:8`` (``modules: []``) every search surface fails identically, ``OperationFailure`` code
+    **31082**, while ordinary index creation and every CRUD path work normally. So this deployment can
+    hold memories and cannot read them back.
 
-    Measured again 2026-09-02 against three more deployments, which changed how these tests assert. Code
-    31082 is what ``mongo:8`` answers and not what ``mongo:6``, ``mongo:7`` or an enterprise ``mongod``
-    7.0.12 answer, so every assertion below reads the code from the deployment under test instead of
-    naming one. `REQ-E-053a` has the table. A suite pinned to one deployment's code passed here and
-    hid a probe that raised on the other three.
+    Code 31082 is what ``mongo:8`` answers and not what ``mongo:6``, ``mongo:7`` or an enterprise
+    ``mongod`` 7.0 answer, so every assertion below reads the code from the deployment under test instead
+    of naming one. A suite pinned to one deployment's code would pass there and miss a probe that raised
+    on the others.
 
-    ``initialize()`` degrades and ``search()`` raises, which is the line this package draws from the vended
-    precedent: capability probing may legitimately degrade, query paths log and re-raise. Failing
-    ``initialize()`` would take away the half that works; returning zero results from ``search()`` would
-    be an empty memory that reads as empty, since v0.1.0 has no tier that runs without mongot and there
-    is nothing for ``auto`` to resolve to.
+    ``initialize()`` degrades and ``search()`` raises, the line the SDK's own stores draw: capability
+    probing may legitimately degrade, query paths log and re-raise. Failing ``initialize()`` would take
+    away the half that works; returning zero results from ``search()`` would be a silent wrong answer,
+    since no search tier runs without mongot and there is nothing for ``auto`` to resolve to.
 
-    The message is not the missing-index one. A missing or ``NOT READY`` index on a deployment that *does*
-    support search is ``REQ-E-061``/``REQ-E-062``, and those quote ``createSearchIndexes``. Any of the
-    three codes means that command does not exist here, so quoting it would be advice the caller cannot
-    act on. Two conditions, two messages, asserted apart below.
+    The message is not the one for a missing index. A missing or ``NOT READY`` index on a deployment
+    that *does* support search gets a message quoting ``createSearchIndexes``. Any of the three codes
+    means that command does not exist here, so quoting it would be advice the caller cannot act on. Two
+    conditions, two messages, asserted apart below.
     """
 
     async def test_initialize_completes_with_the_ordinary_indexes_and_one_warning(
@@ -2808,10 +2806,10 @@ class TestADeploymentWithNoSearchSupport:
     async def test_search_type_vector_raises_about_the_deployment_not_about_an_index(
         self, contract_uri: str, test_database_name: str, unique_collection_name: str
     ) -> None:
-        """``AT-053a``. ``REQ-E-053`` already says a named tier raises; this pins *which* message.
+        """``AT-053a``. A named tier already raises; this pins *which* message.
 
         The absent strings are the assertion. A caller told to run ``createSearchIndexes`` on a
-        deployment where that command is unavailable spends the afternoon on it.
+        deployment where that command is unavailable is sent after a remedy that cannot work.
         """
         store = _real_store(
             contract_uri,
@@ -2867,24 +2865,24 @@ def _assert_no_leak(*subjects: Any) -> None:
 
 
 class TestExpiryIsStampedFromTheDocumentsOwnClock:
-    """AT-153 / AT-154 / ``REQ-E-147``, ``REQ-E-148`` -- the three outcomes ``ttl_seconds`` can have.
+    """AT-153 / AT-154 -- the three outcomes ``ttl_seconds`` can have.
 
-    Three cases rather than two, and that is the whole design of this test. ``0`` and ``None`` are the
-    same falsy value in Python and opposite instructions to MongoDB: ``expireAfterSeconds: 0`` on the
-    index means "delete once the stamped time passes", so ``ttl_seconds=0`` asks for expiry at the next
-    sweep, while absence asks for none at all. A ``if not self.ttl_seconds:`` guard satisfies a two-case
-    test and silently converts the first request into the second, where the only symptom is a collection
-    that fails to shrink -- indistinguishable, for weeks, from one whose documents have not aged out yet.
+    Three cases rather than two, and that is the whole design of this test. ``0`` and ``None`` are both
+    falsy in Python and opposite instructions to MongoDB: ``expireAfterSeconds: 0`` on the index means
+    "delete once the stamped time passes", so ``ttl_seconds=0`` asks for expiry at the next sweep, while
+    absence asks for none at all. A ``if not self.ttl_seconds:`` guard satisfies a two-case test and
+    silently converts the first request into the second, where the only symptom is a collection that
+    fails to shrink, indistinguishable for weeks from one whose documents have not aged out yet.
 
     The offset is asserted against the document's own ``created_at`` rather than against a clock this
-    test reads. That is the property ``REQ-E-147`` is about, and it is stronger than a tolerance window:
+    test reads. That is the property that matters, and it is stronger than a tolerance window:
     one clock read means the two fields are exactly ``ttl_seconds`` apart, and a second ``now()`` call in
     the implementation would fail this by microseconds no matter how generous the window.
     """
 
     @pytest.mark.parametrize("ttl", [0, 1, 3600, 86400], ids=["immediate", "one", "hour", "day"])
     async def test_a_configured_ttl_stamps_exactly_that_offset_from_created_at(self, ttl: int) -> None:
-        """AT-153, AT-154's positive cases -- including ``0``, which is the one that gets optimised away."""
+        """AT-153, AT-154's positive cases, including ``0``, which is the one a falsy check drops."""
         store = _store(config=_connection_config(), writable=True, ttl_seconds=ttl)
         collection = _prepared(store)
         with contextlib.suppress(NotImplementedError):
@@ -2894,7 +2892,7 @@ class TestExpiryIsStampedFromTheDocumentsOwnClock:
         assert insert[_indexes.EXPIRES_FIELD] - insert["created_at"] == datetime.timedelta(seconds=ttl)
 
     async def test_no_ttl_stamps_no_field_at_all(self) -> None:
-        """AT-154's negative case: absence writes the original shape, unchanged.
+        """AT-154's negative case: with no TTL, the document has exactly the shape it has without the feature.
 
         Asserted as the field's absence rather than as a ``None`` value, because a stamped ``None`` is
         indexed by the TTL index as a value that is not a date, which is a different behaviour from not
@@ -2927,9 +2925,9 @@ class TestExpiryIsStampedFromTheDocumentsOwnClock:
         assert _indexes.EXPIRES_FIELD not in stamps[1]
 
     async def test_the_stamp_is_set_on_insert_so_a_duplicate_does_not_extend_it(self) -> None:
-        """``REQ-E-147`` -- expiry lives beside ``created_at`` in ``$setOnInsert`` and moves with it.
+        """Expiry lives beside ``created_at`` in ``$setOnInsert`` and moves with it.
 
-        A re-extracted fact is the fact this store already holds (``REQ-E-042``), and ``$set`` here would
+        A re-extracted fact is the fact this store already holds, and ``$set`` here would
         turn a TTL into a last-seen window: a memory the extractor keeps rediscovering would never
         expire, which is the opposite of what an operator configuring a retention period asked for.
         """
@@ -2944,21 +2942,19 @@ class TestExpiryIsStampedFromTheDocumentsOwnClock:
 
 
 class TestTheTtlIndexIsUnconditionalAndThatIsLoadBearing:
-    """AT-155 / AT-156 / ``REQ-E-149``, ``REQ-E-150`` -- the index, and the twenty bytes beside it.
+    """AT-155 / AT-156 -- the index, and the twenty bytes beside it.
 
-    ``memory_specs()`` returns the TTL index whether or not a TTL is configured, and until this store
-    gained a ``ttl_seconds`` that was an argument about a situation which could not arise, since
-    nothing on this surface wrote ``expires_at``. It is now the reason ``REQ-E-149`` can promise no
-    migration: a store that gains a ``ttl_seconds`` expires the documents it already holds on the next
-    sweep, because a TTL index acts on documents that predate it and this one has been there all along.
+    ``memory_specs()`` returns the TTL index whether or not a TTL is configured, and that is why turning
+    on ``ttl_seconds`` needs no migration: the index already exists, and a TTL index acts on every
+    document carrying the field it covers.
 
-    That promise stops being true the moment someone makes the spec conditional, which is an easy and
-    well-intentioned change to make -- it saves an index on stores that do not use it. This is the test
-    that fails when they do.
+    That stops being true as soon as the spec is made conditional, which is an easy and well-intentioned
+    change to make, since it saves an index on stores that do not use it. This is the test that fails
+    when it is made.
     """
 
     def test_the_memory_specs_carry_the_ttl_index_with_no_config_to_ask(self) -> None:
-        """AT-155 -- ``memory_specs()`` takes no arguments, which is itself the guarantee."""
+        """AT-155: ``memory_specs()`` takes no arguments, which is itself the guarantee."""
         names = [spec.name for spec in _indexes.memory_specs()]
 
         assert "strands_expires_at_ttl" in names
@@ -2972,8 +2968,8 @@ class TestTheTtlIndexIsUnconditionalAndThatIsLoadBearing:
         assert ttl.keys == ((_indexes.EXPIRES_FIELD, 1),), "the index has to cover the field add() stamps"
 
     def test_the_two_surfaces_expire_on_the_same_field_and_the_same_index(self) -> None:
-        """AT-155 -- a memory and a storage record are different documents in different collections, and
-        an operator reading `REQ-E-061`'s provisioning block sees one field name and one index name."""
+        """AT-155: a memory and a storage record are different documents in different collections, and
+        an operator reading the README's provisioning commands sees one field name and one index name."""
         memory = {spec.name: spec for spec in _indexes.memory_specs()}["strands_expires_at_ttl"]
         storage = {spec.name: spec for spec in _indexes.storage_specs()}["strands_expires_at_ttl"]
 
@@ -2981,13 +2977,12 @@ class TestTheTtlIndexIsUnconditionalAndThatIsLoadBearing:
         assert memory.options == storage.options
 
     def test_the_size_overhead_of_the_expiry_field_has_one_definition(self) -> None:
-        """AT-156 / ``REQ-E-150`` -- the constant a preflight on this surface would have to use.
+        """AT-156: the constant a size preflight on this surface would have to use.
 
-        There is no preflight here to test, because oversized-snapshot handling is deferred and the
-        one that shipped is ``MongoDBStorage``'s. What can be tested now is that the number has a single
-        home and says out loud that it is about the field rather than about that class, so a preflight
-        added to the memory store later is written by someone who finds it rather than by someone who
-        reconstructs twenty bytes from first principles.
+        There is no size preflight on the memory store to test; the one that exists is ``MongoDBStorage``'s.
+        What can be tested is that the number has a single home and says that it is about the field
+        rather than about that class, so a preflight added to the memory store later reuses it rather
+        than reconstructing twenty bytes from first principles.
         """
         overhead = storage_module._EXPIRES_OVERHEAD_BYTES
         assert overhead > 0
@@ -3002,7 +2997,7 @@ class TestTheTtlIndexIsUnconditionalAndThatIsLoadBearing:
 
 
 _TTL_SWEEP_BUDGET: Final[float] = 150.0
-"""How long a document may take to disappear before the expiry is judged not to work (``AT-152``).
+"""How long a document may take to disappear before the expiry is judged not to work.
 
 MongoDB's TTL monitor runs every 60 seconds by default and is not synchronous with anything: a document
 whose deadline passed a moment after a sweep waits most of a cycle for the next one, and the deletion
@@ -3016,7 +3011,7 @@ deployment whose monitor has been turned down finishes in seconds.
 
 @pytest.mark.contract
 class TestAMemoryWithATtlActuallyDisappears:
-    """AT-152 / ``REQ-E-147``, ``REQ-E-149`` -- the server's TTL monitor, asserted as a disappearance.
+    """AT-152 -- the server's TTL monitor, asserted as a disappearance.
 
     Everything else about expiry is a field in a document this package wrote, and a test of that is a
     test of this package agreeing with itself. What nobody can check without a server is the part that
@@ -3024,10 +3019,10 @@ class TestAMemoryWithATtlActuallyDisappears:
     ``expireAfterSeconds`` that makes the deadline the document's own. Get any of the three wrong and
     every unit test above still passes while nothing is ever deleted.
 
-    **No ``ensure_indexes()`` call, and that absence is the test** (``REQ-E-149``). The store
-    is constructed, ``add`` is called, and the document goes away. A caller of ``MongoDBStorage`` has to
-    provision the index themselves; a caller here does not, and the difference is worth pinning because
-    it is the kind of asymmetry a later refactor "tidies up".
+    **No ``ensure_indexes()`` call, and that absence is the test.** The store is constructed, ``add`` is
+    called, and the document goes away. A caller of ``MongoDBStorage`` has to provision the index
+    themselves; a caller here does not, and the difference is worth pinning because it is the kind of
+    asymmetry a later refactor "tidies up".
 
     Runs on the contract tier: a TTL index is ordinary and needs no mongot, so this is checked on every
     pull request rather than weekly.
@@ -3036,7 +3031,7 @@ class TestAMemoryWithATtlActuallyDisappears:
     async def test_a_document_written_with_a_ttl_is_gone_after_the_sweep(
         self, contract_uri: str, test_database_name: str, unique_collection_name: str, contract_database: Any
     ) -> None:
-        """AT-152 -- one store, one ``add``, and then the collection is empty."""
+        """AT-152: one store, one ``add``, and then the collection is empty."""
         collection = contract_database[unique_collection_name]
         with contextlib.suppress(OperationFailure):
             # Turns a 60-second monitor cycle into a 1-second one, where the deployment allows it. Atlas
@@ -3072,10 +3067,10 @@ class TestAMemoryWithATtlActuallyDisappears:
 
 @pytest.mark.contract
 class TestNoMemoryMethodRendersThePassword:
-    """AT-014's memory half / REQ-E-014 — the credential sweep, completed in two parts.
+    """AT-014's memory half — no memory method renders a password from the connection string.
 
-    ``test_client.py`` closed construction and the registry; ``test_storage.py`` closed the five storage
-    methods. The four memory methods are what was left, and they are the ones that fail in production: a
+    ``test_client.py`` covers construction and the registry; ``test_storage.py`` covers the five storage
+    methods. The four memory methods are covered here, and they are the ones that fail in production: a
     store built once at start-up, then a driver error on every call, each one rendered into a log line
     or a traceback that reaches a ticket.
 
@@ -3084,11 +3079,11 @@ class TestNoMemoryMethodRendersThePassword:
     ``OperationFailure`` code 18: an authentication failure is the error most likely to echo what it
     authenticated with. The succeeding path supplies an injected client alongside a password-bearing
     ``connection_string``, so every call reaches a live deployment while the config still holds a
-    secret. That combination is constructed rather than typical, and it is the shape ``REQ-E-014``
+    secret. That combination is constructed rather than typical, and it is the shape this guarantee
     exists for: ``_Connection`` stores no URI precisely because a dataclass ``__repr__`` would print it.
 
     The config is not a subject. It holds the password by construction, which is the premise; the
-    requirement is that nothing this package writes copies it out.
+    guarantee is that nothing this package writes copies it out.
     """
 
     @pytest.mark.parametrize("call", ["initialize", "search", "add"])
@@ -3153,8 +3148,8 @@ class TestNoMemoryMethodRendersThePassword:
                 store.get_tools()
         finally:
             await store.close()
-            # Closed here rather than by `store.close()`, which never closes an injected client
-            # (`REQ-E-010`). That asymmetry is the reason this path can hold a secret at all.
+            # Closed here rather than by `store.close()`, which never closes an injected client. That
+            # asymmetry is the reason this path can hold a secret at all.
             await client.close()
 
         _assert_no_leak(*[record.getMessage() for record in caplog.records], store, store._connection)
@@ -3173,7 +3168,7 @@ class TestNoMemoryMethodRendersThePassword:
 
 @pytest.mark.contract
 class TestTheFusionProbeAgreesWithTheServerItProbed:
-    """AT-145's real-deployment half / ``REQ-E-143`` -- the version read, against versions we did not write.
+    """AT-145's real-deployment half -- the version read, against versions this package did not write.
 
     ``test_indexes.py`` closes this probe against a fake, which is where the malformed and missing
     ``versionArray`` cases live because no real server sends them. What a fake cannot check is the one
@@ -3182,16 +3177,15 @@ class TestTheFusionProbeAgreesWithTheServerItProbed:
     wire format, so it is asserted against MongoDB.
 
     Runs on the contract tier because ``buildInfo`` is a ``mongod`` command and needs no mongot, which
-    also makes this the half that runs on every pull request. The three deployments ``AT-145`` names --
-    7.0.12, 8.0.23 and 8.3.8 -- are the ones CI supplies over time rather than in one run, so the
-    assertion is written as an agreement between two things the server said rather than as an expected
-    boolean this test would have to keep in step with the matrix.
+    also makes this the half that runs on every pull request. CI supplies 7.0, 8.0 and later majors over
+    time rather than in one run, so the assertion is written as an agreement between two things the
+    server said rather than as an expected boolean this test would have to keep in step with the matrix.
     """
 
     async def test_the_probe_answers_what_the_deployments_own_version_string_says(
         self, contract_uri: str, test_database_name: str, unique_collection_name: str, contract_database: Any
     ) -> None:
-        """AT-145 -- ``rank_fusion`` is ``True`` exactly where the server calls itself 8 or later."""
+        """AT-145: ``rank_fusion`` is ``True`` exactly where the server calls itself 8 or later."""
         build_info = await contract_database.command("buildInfo")
         major = int(str(build_info["version"]).split(".", 1)[0])
 
@@ -3208,11 +3202,11 @@ class TestTheFusionProbeAgreesWithTheServerItProbed:
     async def test_a_store_on_this_deployment_reports_the_same_answer_in_its_capabilities(
         self, contract_uri: str, test_database_name: str, unique_collection_name: str, contract_database: Any
     ) -> None:
-        """AT-145 -- and the capability a caller reads is the probe's answer, not a second opinion.
+        """AT-145: the capability a caller reads is the probe's answer, not a second opinion.
 
         Subject to the short-circuit: where search is unavailable the store never probes and reports
-        ``False`` regardless of version (``AT-146``), which is the one case the two answers may differ
-        and is asserted here rather than left as a surprise.
+        ``False`` regardless of version (see ``TestTheHybridTierIsAStatementAboutTwoOthers``), which is
+        the one case the two answers may differ and is asserted here rather than left as a surprise.
         """
         store = _real_store(contract_uri, test_database_name, unique_collection_name)
         try:
@@ -3234,38 +3228,36 @@ class TestTheFusionProbeAgreesWithTheServerItProbed:
 
 @pytest.mark.contract
 class TestTheTierSetIsTheOneTheDeploymentImplies:
-    """``AT-185`` / ``REQ-E-180`` -- tier resolution, graded by a tier that runs on every change.
+    """``AT-185`` -- tier resolution, graded by a tier that runs on every change.
 
-    Which tier a store resolves was asserted in two places before this class: against monkeypatched
-    capabilities in the unit tier, and against real search results in the Atlas tier. The Atlas tier runs
-    on the cron and on a dispatch and on no change trigger, so its verdict on a pull request arrives after
-    the merge. That is not hypothetical -- a change widening the tier set from two to three merged with
-    four Atlas tests still asserting the two-tier world, and the dispatch that found them ran afterwards.
+    Which tier a store resolves is also asserted against monkeypatched capabilities in the unit tier,
+    and against real search results in the Atlas tier. The Atlas tier runs on the cron and on a dispatch
+    and on no change trigger, so its verdict on a pull request arrives after the merge. This class puts
+    the claim on the tier gated on any deployment at all, so a change to the tier set is graded before it
+    merges. What it covers is only the resolution: whether the store decides to use fusion. How well
+    fusion ranks is a different claim, it needs a search process to produce the results it ranks, and it
+    stays on the Atlas tier.
 
-    So the claim moves down to the tier gated on any deployment at all. What moves is only the resolution:
-    whether the store decides to use fusion. How well fusion ranks is a different claim, it needs a search
-    process to produce the results it ranks, and it stays where it is.
+    **Implications rather than a lookup table.** A table keyed on the two capabilities is wrong: a local
+    Atlas container reports ``search=True`` and ``rank_fusion=True`` and resolves ``("text",)``, because
+    the default store's vector index needs a registered embedding model, that deployment has an empty
+    registry (code 8), and the tier set therefore depends on a third input neither capability describes.
+    What is true of every deployment is a set of one-directional implications, and each one is written
+    here as one.
 
-    **Implications rather than a lookup table, and the table was tried first.** A table keyed on the two
-    capabilities is wrong, measured on 2026-09-17 against a local Atlas container that reports
-    ``search=True`` and ``rank_fusion=True`` and resolves ``("text",)``: the default store's vector index
-    needs a registered embedding model, that deployment has an empty registry (server code 8), and the
-    tier set therefore depends on a third input neither capability describes. What is true of every
-    deployment is a set of one-directional implications, and each one is written here as one.
-
-    Written to hold wherever it runs rather than on the deployment it runs against today. On a deployment
-    with no search process only the first implication has content, which is why the same class is run twice
-    over two deployments -- see the second job in the contract tier.
+    Written to hold wherever it runs rather than on one deployment. On a deployment with no search process
+    only the first implication has content, which is why the same class is run over two deployments: see
+    the second job in the contract tier.
     """
 
     async def test_the_tier_set_agrees_with_what_this_deployment_can_do(
         self, contract_uri: str, test_database_name: str, unique_collection_name: str
     ) -> None:
-        """``AT-185`` -- four implications, each one a rule that holds on any deployment.
+        """``AT-185``: four implications, each one a rule that holds on any deployment.
 
         The pair itself is checked first. ``(search=False, rank_fusion=True)`` is unreachable, because
-        ``initialize()`` does not probe the version where search is missing (``AT-146``), and a deployment
-        reporting it would mean that short-circuit had been removed rather than that this table is stale.
+        ``initialize()`` does not probe the version where search is missing, and a deployment reporting it
+        would mean that short-circuit had been removed rather than that this table is stale.
         """
         store = _real_store(contract_uri, test_database_name, unique_collection_name)
         try:
@@ -3302,18 +3294,18 @@ class TestTheTierSetIsTheOneTheDeploymentImplies:
     async def test_a_store_needing_no_embedding_model_resolves_the_fusion_wherever_it_can(
         self, contract_uri: str, test_database_name: str, unique_collection_name: str
     ) -> None:
-        """``AT-185`` -- the positive rule, on the one store shape a container can build both indexes for.
+        """``AT-185``: the positive rule, on the one store shape a container can build both indexes for.
 
         The default store embeds on the deployment, so its vector index needs a model in the registry and
         a container has an empty one. The manual-vector path takes the caller's own vectors, so its index
         is an ordinary ``vector`` field and comes up wherever there is a search process at all. That makes
-        this the test that grades the rule rather than its necessary conditions -- the one that would have
-        gone red when the tier set widened from two to three, on a pull request rather than on a cron.
+        this the test that grades the rule rather than its necessary conditions, and the one that fails on
+        a pull request, rather than on a cron, when the tier set changes.
 
         The three ``_pick_tier`` reads are the fallback order, which is a claim about query *shapes* and
         not a preference: a manual-vector store's fused tier needs the caller's vector, so a text-only
-        query has to fall past both hybrid and vector and be answered lexically. Measured that way on a
-        local Atlas container on 2026-09-17.
+        query has to fall past both hybrid and vector and be answered lexically, as it is on a local
+        Atlas container.
 
         ``MANUAL_VECTOR``, ``QUERY_TEXT`` and ``QUERY_VECTOR`` are defined further down this module with
         the vector-tier corpus they were written for; module globals resolve when the test runs.
@@ -3346,7 +3338,7 @@ class TestTheTierSetIsTheOneTheDeploymentImplies:
     async def test_hybrid_leads_the_set_or_is_absent_from_it(
         self, contract_uri: str, test_database_name: str, unique_collection_name: str
     ) -> None:
-        """``AT-185`` -- the ordering claim on its own, because the table would hide a subtle version.
+        """``AT-185``: the ordering claim on its own, because the table would hide a subtle version.
 
         ``hybrid`` in the middle of the list is the one wrong answer a table comparison catches only by
         accident: it would still contain all three names. It is also the one a plausible edit produces,
@@ -3369,7 +3361,7 @@ class TestTheTierSetIsTheOneTheDeploymentImplies:
     async def test_a_text_query_resolves_to_hybrid_where_hybrid_is_on_offer(
         self, contract_uri: str, test_database_name: str, unique_collection_name: str
     ) -> None:
-        """``AT-185`` -- resolution is the tier set read against a query shape, so read it.
+        """``AT-185``: resolution is the tier set read against a query shape, so read it.
 
         A plain string, not both keys: on the AutoEmbeddings path the fused tier reads ``text`` in both
         of its input pipelines, so one string fits it whole, and a test supplying a ``vector`` beside it
@@ -3404,7 +3396,7 @@ class TestTheTierSetIsTheOneTheDeploymentImplies:
     async def test_an_explicit_hybrid_store_gets_the_tier_or_an_error_and_never_a_substitute(
         self, contract_uri: str, test_database_name: str, unique_collection_name: str
     ) -> None:
-        """``AT-185`` -- a named ``search_type`` has nothing to fall through to, on a real deployment.
+        """``AT-185``: a named ``search_type`` has nothing to fall through to, on a real deployment.
 
         The unit tier asserts this against patched capabilities in both directions. Here the deployment
         supplies the direction, and the assertion is that there is no third outcome: the tier, or an
@@ -3432,9 +3424,8 @@ class TestTheTierSetIsTheOneTheDeploymentImplies:
                 # Search, and something about this deployment still keeps the fusion from being built:
                 # the stage is too old, or one of the two indexes it fuses would not come up. Fatal
                 # either way, because a named tier has nothing to fall through to, and the message
-                # carries the server's own reason rather than a guess at which of the two it was --
-                # measured on a local Atlas container, where it is `voyage-4-lite not registered yet`
-                # and not the version at all.
+                # carries the server's own reason rather than a guess at which of the two it was. On a
+                # local Atlas container it is `voyage-4-lite not registered yet`, not the version.
                 with pytest.raises(StorageError) as caught:
                     await store.initialize()
                 assert "hybrid" in str(caught.value) or "index" in str(caught.value), (
@@ -3460,28 +3451,28 @@ class TestTheTierSetIsTheOneTheDeploymentImplies:
 
 @pytest.mark.contract
 class TestTheStageIsHereWhereTheProcessIsNot:
-    """``AT-186`` / ``REQ-E-181`` -- why this deployment refuses hybrid, and not merely that it does.
+    """``AT-186`` -- why this deployment refuses hybrid, and not merely that it does.
 
     Two independent facts have to hold before a store offers fusion: ``mongod`` new enough for the
     ``$rankFusion`` stage, and a search process to build the two indexes the stage fuses. On the
     deployment CI runs this tier against, exactly one of them fails. A test that observed only "no hybrid
     here" would therefore pass just as happily on a deployment where the stage was missing, where the
-    probe was broken, and where the resolution logic had been deleted -- so ``AT-185``'s negative case is
-    worth about as much as the reason behind it is pinned down.
+    probe was broken, and where the resolution logic had been deleted, so the negative case of
+    ``TestTheTierSetIsTheOneTheDeploymentImplies`` is only as strong as the reason behind it.
 
-    Measured on 2026-09-17 against a single-node ``mongo:8`` replica set reporting 8.3.8 with
-    ``modules: []``: the stage runs and returns fused documents, and ``search_support()`` on the same
-    deployment answers ``available=False, code=31082``. The stage lives in ``mongod`` and it is there.
+    On a single-node ``mongo:8`` replica set with ``modules: []`` the stage runs and returns fused
+    documents, and ``search_support()`` on the same deployment answers ``available=False, code=31082``.
+    The stage lives in ``mongod`` and it is there.
 
     The stage is run directly rather than through a store on purpose. ``initialize()`` skips the version
-    probe where search is absent, so the package's own ``rank_fusion`` is ``False`` here by design
-    (``AT-146``), and what this class asks about is the deployment rather than the package.
+    probe where search is absent, so the package's own ``rank_fusion`` is ``False`` here by design, and
+    what this class asks about is the deployment rather than the package.
     """
 
     async def test_this_deployment_can_run_rank_fusion_over_ordinary_pipelines(
         self, contract_uri: str, test_database_name: str, unique_collection_name: str, contract_database: Any
     ) -> None:
-        """``AT-186`` -- the stage, with two input pipelines that need no search index.
+        """``AT-186``: the stage, with two input pipelines that need no search index.
 
         ``$sort`` rather than ``$vectorSearch`` and ``$search``, which is what makes this runnable
         without mongot. The stage's own contract is the part being read: an input pipeline may be any
@@ -3518,10 +3509,10 @@ class TestTheStageIsHereWhereTheProcessIsNot:
     async def test_the_hybrid_tier_is_refused_here_for_the_process_and_not_for_the_stage(
         self, contract_uri: str, test_database_name: str, unique_collection_name: str, contract_database: Any
     ) -> None:
-        """``AT-186`` -- the attribution, as the two answers disagreeing in the direction they should.
+        """``AT-186``: the attribution, as the two answers disagreeing in the direction they should.
 
-        Skips on a deployment that has search, where there is no refusal to attribute and ``AT-185``'s
-        positive case is the assertion instead.
+        Skips on a deployment that has search, where there is no refusal to attribute and the positive
+        case of ``TestTheTierSetIsTheOneTheDeploymentImplies`` is the assertion instead.
         """
         store = _real_store(contract_uri, test_database_name, unique_collection_name)
         try:
@@ -3537,11 +3528,11 @@ class TestTheStageIsHereWhereTheProcessIsNot:
             assert stage_is_available is True, (
                 "the deployment this tier runs against is expected to carry the stage, so that the "
                 "absent search process is the only reason hybrid is unavailable. It answered False, "
-                "which makes AT-185's negative case ambiguous rather than wrong"
+                "which makes the tier-set test's negative case ambiguous rather than wrong"
             )
             assert capabilities.rank_fusion is False, (
-                "the store must not have probed the version on a deployment where it cannot matter "
-                "(AT-146), even though the answer would have been True"
+                "the store must not have probed the version on a deployment where it cannot matter, "
+                "even though the answer would have been True"
             )
         finally:
             await store.close()
@@ -3549,20 +3540,20 @@ class TestTheStageIsHereWhereTheProcessIsNot:
 
 @pytest.mark.contract
 class TestTenStoresShareOneSetup:
-    """AT-065's ``initialize()`` half / REQ-E-012, REQ-E-045 — the client, the probe and the indexes.
+    """AT-065's ``initialize()`` half — the client, the probe and the indexes.
 
-    ``test_indexes.py`` closes the index half against ``_indexes.ensure`` directly, with no lock, because ten
-    concurrent identical ``create_indexes`` calls were measured to produce zero failures and one index.
-    What ``initialize()`` adds is two more counts that only exist once there is a store: one client for
-    ten stores built from one config (``REQ-E-012``), and one capability probe rather than ten.
+    ``test_indexes.py`` covers the index half against ``_indexes.ensure`` directly, with no lock, because
+    ten concurrent identical ``create_indexes`` calls produce zero failures and one index. What
+    ``initialize()`` adds is two more counts that only exist once there is a store: one client for ten
+    stores built from one config, and one capability probe rather than ten.
 
     The probe count is a spy, and it is the one assertion here that cannot be an outcome. The result of
     a probe is a boolean every store would compute identically, so a per-store probe is invisible in
     behavior and visible only as ten round trips on every process start.
 
-    The second count is there for the same reason and a stronger one: ``AT-146``'s claim is that the
-    ``$rankFusion`` probe is skipped entirely where search is unavailable, and this tier is the
-    deployment where that is true of a real server rather than of a fake.
+    The ``$rankFusion`` probe is counted for the same reason and a stronger one: it is skipped entirely
+    where search is unavailable, and this tier is the deployment where that is true of a real server
+    rather than of a fake.
     """
 
     async def test_ten_stores_initializing_concurrently_share_one_client_probe_and_index_set(
@@ -3604,7 +3595,7 @@ class TestTenStoresShareOneSetup:
             assert probed == [unique_collection_name]
             assert len(await contract_database[unique_collection_name].index_information()) == 4
 
-            # AT-146, both halves, and which one applies is the deployment's to decide: MONGODB_URI
+            # The fusion probe count, both halves, and which one applies is the deployment's to decide: MONGODB_URI
             # may name a bare `mongod` or a cluster with mongot, and the contract marker deliberately
             # accepts either. Ten stores must never mean ten `buildInfo` calls; zero is additionally
             # required where search is absent, because a tier list of two impossible entries cannot
@@ -3621,11 +3612,11 @@ class TestTenStoresShareOneSetup:
             await stores[0].close()
 
 
-# --- AT-188: what the three vector metrics return, which is measurable on a container ---------------
+# --- what the three vector metrics return, which is measurable on a container ------------------------
 #
 # The manual-vector path takes the caller's own vectors, so an index on any of the three metrics needs
 # nothing from the deployment's embedding-model registry and a plain Atlas container can build all three.
-# That is the same discovery the tier-resolution tests rest on, applied to scores, and it is why these
+# That is the same fact the tier-resolution tests above rely on, applied to scores, and it is why these
 # tests are `contract` rather than `integration`.
 #
 # `MANUAL_VECTOR`, `_seed_vectors` and `_answered` are defined further down this module with the
@@ -3648,8 +3639,8 @@ Lengths differ deliberately. ``cosine`` normalises, so the second and third are 
 third is first under ``dotProduct``, which does not normalise; and it is **last** under ``euclidean``,
 because a vector ten times too long is ten times too far away. One corpus, one query, three orders.
 
-Each metric has a unique nearest and a unique furthest document here, checked by ``AT-188``'s first test
-computing both rather than naming them, so a tie can never make that assertion vacuous.
+Each metric has a unique nearest and a unique furthest document here, and the first metric test computes
+both rather than naming them, so a tie can never make that assertion vacuous.
 """
 
 
@@ -3681,9 +3672,9 @@ def _metric_similarity(metric: str, vector: list[float]) -> float:
 def _metric_score(metric: str, vector: list[float]) -> float:
     """Return the score this deployment was measured to compute for one vector on one metric.
 
-    Measured on ``mongodb/mongodb-atlas-local:8``, mongod 8.3.11, on 2026-09-17: ``(1 + cosine) / 2``,
-    ``(1 + dot) / 2``, and ``1 / (1 + squared distance)``. Written as arithmetic rather than as a table
-    of expected numbers so that the corpus above can change without a transcription step.
+    Measured on ``mongodb/mongodb-atlas-local:8``: ``(1 + cosine) / 2``, ``(1 + dot) / 2``, and
+    ``1 / (1 + squared distance)``. Written as arithmetic rather than as a table of expected numbers so
+    that the corpus above can change without a transcription step.
 
     All three are similarities, and the third is the interesting one: ``euclidean`` is a distance metric
     and the server has already inverted it. This package has no distance to invert and must not invert
@@ -3706,8 +3697,8 @@ async def _seeded_metric_store(metric: str, uri: str, database: str, collection:
     """Build a manual-vector store on one metric, seed :data:`_METRIC_CORPUS`, and hand it back open.
 
     Skips where the deployment has no search process, which is one of the two legs this tier runs on:
-    there is no vector index there and so no score to read, and ``AT-185`` is the test that asserts the
-    consequence for tier resolution.
+    there is no vector index there and so no score to read, and ``TestTheTierSetIsTheOneTheDeploymentImplies``
+    asserts the consequence for tier resolution.
 
     Args:
         metric: The ``similarity`` to build the index on.
@@ -3754,17 +3745,16 @@ async def _metric_scores(store: MongoDBMemoryStore) -> list[tuple[str, float]]:
 
 @pytest.mark.contract
 class TestEveryMetricReturnsASimilarityAndNeverADistance:
-    """``AT-188`` / ``REQ-E-183`` -- what a score is, measured rather than argued from documentation.
+    """``AT-188`` -- every vector metric scores as a similarity, measured on a real index.
 
-    This package's release criteria ask for "similarity-ordered results with ``score`` populated and
-    monotonically decreasing; distance inverted", and the last clause was the unmeasured one: nothing in
-    this suite had ever observed a score from a ``dotProduct`` or a ``euclidean`` index. The documented
-    answer -- that Atlas returns a similarity for all three, so there is nothing left here to invert -- is
-    the right one, and was, until this class, a citation rather than a measurement.
+    Results are similarity-ordered, with ``score`` populated and decreasing, and no distance reaches the
+    caller. Atlas returns a similarity for all three metrics, so there is nothing left for this package
+    to invert, and this class observes that on ``cosine``, ``dotProduct`` and ``euclidean`` indexes
+    rather than taking it from documentation.
 
     The direction is the claim a caller depends on and it is asserted per metric, because a score that
-    *was* a distance would order results the other way and ``min_score`` -- a floor on the reported number
-    (``REQ-E-059``) -- would then keep the worst matches and drop the best, with no error on either side.
+    *was* a distance would order results the other way and ``min_score``, a floor on the reported
+    number, would then keep the worst matches and drop the best, with no error on either side.
     """
 
     @pytest.mark.parametrize("metric", ["cosine", "dotProduct", "euclidean"])
@@ -3810,8 +3800,8 @@ class TestEveryMetricReturnsASimilarityAndNeverADistance:
 
         The tolerance is relative and loose enough for ``float32``, which is the precision a vector field
         has: the worst disagreement measured over eighteen scores was ``2.4e-08``. A formula that changes
-        in a future mongot fails here, which is the arrangement ``MAX_NUM_CANDIDATES`` and ``AT-072b``
-        already have for a bound this repository writes down after reading it off a server.
+        in a future mongot fails here, which is the arrangement ``MAX_NUM_CANDIDATES`` already has in
+        ``test_pipeline.py``'s ``TestTheBoundsThisPackageCopiesFromTheServer``.
         """
         store = await _seeded_metric_store(metric, contract_uri, test_database_name, unique_collection_name)
         try:
@@ -3869,11 +3859,11 @@ class TestEveryMetricReturnsASimilarityAndNeverADistance:
     async def test_a_dot_product_score_is_not_bounded_above_by_one(
         self, contract_uri: str, test_database_name: str, unique_collection_name: str
     ) -> None:
-        """``AT-188`` -- the range this package's prose does not describe, measured rather than warned about.
+        """``AT-188`` -- the range a cosine-sized ``max_score`` would cut into, measured rather than warned about.
 
         Four places in this repository say a cosine score lands in roughly 0 to 1, and all four are about
         cosine. ``dotProduct`` is ``(1 + dot) / 2`` with no normalisation of its own, so a stored vector
-        longer than the query's scores above one -- ``2.0`` for the corpus vector five times too long.
+        longer than the query's scores above one: ``2.0`` for the corpus vector five times too long.
         A ``max_score`` ceiling carried over from the cosine range is therefore a filter that removes the
         strongest matches on such a store, silently, which is worth one test rather than one sentence.
         """
@@ -3891,7 +3881,7 @@ class TestEveryMetricReturnsASimilarityAndNeverADistance:
             await store.close()
 
 
-# --- integration tier: mongot, because no v0.1.0 search tier runs without it -----------------------
+# --- integration tier: mongot, because no search tier runs without it ---------------------------------
 
 MANUAL_VECTOR: dict[str, Any] = {"embedding_dimensions": 4, "similarity": "cosine"}
 """Connection keys selecting the manual-vector path, matching ``test_pipeline.py``'s corpus width.
@@ -3911,7 +3901,7 @@ def _metadata(entry: MemoryEntry) -> dict[str, Any]:
     """Return an entry's metadata, failing the test if it has none.
 
     ``MemoryEntry.metadata`` is ``Metadata | None`` because the SDK allows a store to omit it, and this
-    package never does (`REQ-E-040`). Asserting that once here keeps every caller reading as the claim
+    package never does. Asserting that once here keeps every caller reading as the claim
     it is making rather than as a chain of optional-narrowing, and mypy checks these tests
     (``pyproject.toml`` ``files``), so the narrowing is not optional.
 
@@ -3921,29 +3911,22 @@ def _metadata(entry: MemoryEntry) -> dict[str, Any]:
     Returns:
         The entry's metadata.
     """
-    assert entry.metadata is not None, f"REQ-E-040 requires metadata on every entry; {entry.content!r} has none"
+    assert entry.metadata is not None, f"every entry carries metadata; {entry.content!r} has none"
     return dict(entry.metadata)
 
 
 _SEARCHABLE_BUDGET: Final[float] = 180.0
-"""How long a write is waited on before it counts as never having arrived (`REQ-E-091`).
+"""How long a write is waited on before it counts as never having arrived.
 
-Measured on `strands-dev`: a document written after both search indexes read ``READY`` first answered a
-query **31 seconds later**, and a later run measured 15.5 seconds for the same thing on the same cluster.
-
-It was 10 seconds until 2026-09-02, calibrated against an Atlas CLI local deployment, where the
-shipped default cannot build its vector index, degrades to full text, and has a document
-searchable in under a second. Six integration tests failed on it the first time the suite met a cluster
-with a registered embedding model, every one with an empty result rather than a wrong one. It was then 90
-seconds, ``AT-086``'s figure for the same boundary, until the all-tiers run of 01:45:57 on 2026-09-02 spent
-the whole 90 twice and came back empty: ``AT-045b`` and ``AT-059b``, both of which then passed against the
-same cluster minutes later with nothing else running, in **109.5 seconds each**, nearly all of it the two
-index builds inside their first ``add()`` and **under 5 seconds** of it this wait. The lag is not a constant.
-It stretches while a run is driving several dozen search indexes through creation and initial sync on one
-cluster, and the failing runs never measured how far, because a budget that is exceeded stops timing.
+A document is not searchable the instant its write returns. On an Atlas cluster with a registered
+embedding model, a document written after both search indexes read ``READY`` takes tens of seconds to
+answer a query, and the lag stretches further while a run is driving several dozen search indexes
+through creation and initial sync on one cluster. An Atlas CLI local deployment, where the shipped
+default degrades to full text, answers in under a second, so a budget sized there fails on a cluster
+with an empty result rather than a wrong one.
 
 A budget is not a delay: every caller below polls twice a second and returns as soon as its premise is
-satisfied, so a quiet cluster runs exactly as fast at 180 as it did at 10.
+satisfied, so a quiet cluster is not slowed by the allowance.
 """
 
 
@@ -3955,13 +3938,13 @@ async def _answered(
     Same reason as ``test_pipeline.py``'s ``_until_answered``: ``READY`` means the index exists, not
     that every document has reached it, so a query issued straight after ``initialize()`` can
     legitimately return nothing. On the AutoEmbeddings path there is a second wait behind the first,
-    because Atlas generates the embedding after the write acknowledges (`REQ-E-091`). Polling rather
+    because Atlas generates the embedding after the write acknowledges. Polling rather
     than sleeping a fixed interval, because the wait is a property of the deployment.
 
     ``expected`` is what makes this wait for *the corpus* rather than for the first document to arrive.
     Documents reach mongot one at a time, so a caller whose premise is two documents and who waits only
-    for non-empty gets the first one and a failure that reads as a wrong result rather than as a race.
-    Measured: this is the flake ``AT-059b`` hit, where the corpus assertion saw one of two.
+    for non-empty gets the first one and a failure that reads as a wrong result rather than as a race,
+    such as a two-document corpus assertion seeing one of two.
 
     Returning the short list rather than failing here keeps the failure at the assertion that cares,
     where the message names what the test expected instead of naming this helper.
@@ -3983,9 +3966,10 @@ async def _answered(
         try:
             results = list(await store.search(query))
         except StorageError as error:
-            # `REQ-E-124`. Around the search call alone, and only for the one code that means mongot
-            # never answered. Every caller below reaches search through this helper, so this is the
-            # whole of the memory store's exposure; anything that fails elsewhere still fails.
+            # A skip, not a failure, when mongot is unreachable. Around the search call alone, and only
+            # for the one code that means mongot never answered. Every caller below reaches search through
+            # this helper, so this is the whole of the memory store's exposure; anything that fails
+            # elsewhere still fails.
             skip_if_search_is_unreachable(error)
             raise
         if len(results) >= expected or time.monotonic() >= deadline:
@@ -3996,15 +3980,16 @@ async def _answered(
 async def _seed_vectors(collection: Any, *, scope: str, store_name: str, facts: dict[str, list[float]]) -> None:
     """Write vector-bearing documents directly, bypassing ``add``.
 
-    Out of band on purpose: ``add`` takes content and metadata and no
-    vector, the manual path indexes an ``embedding`` field, and client-side embedding is a non-goal,
-    so no ``MemoryStore`` method can put a vector in a document. The read path under test
-    here is `REQ-E-074`'s, which ``test_pipeline.py`` already exercises one layer down. Writing these with
-    ``insert_many`` follows ``test_pipeline.py``'s integration corpus rather than inventing a write API
-    to make the test look tidier.
+    Out of band on purpose: ``add`` takes content and metadata and no vector, the manual path indexes
+    an ``embedding`` field, and this package does not embed on the client, so no ``MemoryStore`` method
+    can put a vector in a document. The read path under test here is the manual-vector query path,
+    which ``test_pipeline.py`` already exercises one layer down. Writing these with ``insert_many``
+    follows ``test_pipeline.py``'s integration corpus rather than inventing a write API to make the test
+    look tidier.
 
-    The document shape is the stored one, including the fields the scope pre-filter reads. A missing ``scope``
-    or ``store_name`` here would make `AT-047a` pass by returning nothing.
+    The document shape is the one ``add`` writes, including the fields the scope pre-filter reads. A
+    missing ``scope`` or ``store_name`` here would make ``TestNoSearchCrossesAScope`` pass by returning
+    nothing.
 
     Args:
         collection: Collection to write to.
@@ -4032,10 +4017,10 @@ async def _seed_vectors(collection: Any, *, scope: str, store_name: str, facts: 
 async def atlas_store(atlas_uri: str, test_database_name: str, unique_collection_name: str) -> Any:
     """A writable store scoped to ``tenant-a`` on a deployment with mongot, on the shipped default.
 
-    Default means `REQ-E-067`'s AutoEmbeddings path and ``search_type="auto"``, which is what a user
-    who configures nothing gets. On an Atlas CLI local deployment that path cannot build its index,
-    so this fixture is also the degraded-default fixture, and `AT-053b` is the test that
-    says so out loud.
+    Default means the AutoEmbeddings path and ``search_type="auto"``, which is what a user who
+    configures nothing gets. On an Atlas CLI local deployment that path cannot build its index, because
+    no embedding model is registered, so this fixture is also the degraded-default fixture, and
+    ``TestTheShippedDefaultAgainstADeploymentWithNoModel`` is the class that says so out loud.
     """
     store = _real_store(atlas_uri, test_database_name, unique_collection_name, writable=True, scope="tenant-a")
     try:
@@ -4046,14 +4031,14 @@ async def atlas_store(atlas_uri: str, test_database_name: str, unique_collection
 
 @pytest.mark.integration
 class TestWhatASearchHandsBack:
-    """AT-040 / REQ-E-040 — the retrieval boundary, closed end to end.
+    """AT-040 — the ``MemoryEntry`` a search hands back to the SDK.
 
     The whole round trip on one surface: ``add`` writes, mongot indexes, ``search`` reads, and what
     comes back is what the SDK's ``MemoryManager`` and ``search_memory`` tool will format. Every layer
     below this has its own test and none of them can see a ``MemoryEntry``.
 
     Queried with a plain string rather than a ``MongoDBSearchQuery``, because both SDK call sites pass a
-    ``str`` (`REQ-E-041`'s amendment measured this), so the string form is the production path and the
+    ``str``, so the string form is the production path and the
     widened form is the extension.
     """
 
@@ -4074,9 +4059,8 @@ class TestWhatASearchHandsBack:
         # instead of printing two sets for the reader to diff.
         assert metadata["_id"]
         assert metadata["_scope"] == "tenant-a"
-        # Every tier that can resolve, not every tier that could when this was written. The claim is that
-        # the key carries the tier that ran; which one that is depends on the deployment, and `auto`
-        # prefers fusion wherever both single tiers came up (`REQ-E-145`).
+        # Every tier that can resolve. The claim is that the key carries the tier that ran; which one that
+        # is depends on the deployment, and `auto` prefers fusion wherever both single tiers came up.
         assert metadata["_search_type"] in {"vector", "text", "hybrid"}
         assert isinstance(metadata["_relevance_score"], float)
         assert metadata["source"] == "chat"
@@ -4098,11 +4082,12 @@ class TestWhatASearchHandsBack:
 
 @pytest.mark.integration
 class TestTheFirstSearchSetsItselfUp:
-    """AT-045b / REQ-E-045 — the read half of "``initialize()`` is not the caller's responsibility".
+    """AT-045b — the read half of "``initialize()`` is not the caller's responsibility".
 
-    ``AT-047b`` covers the write half on the contract tier, incidentally rather than by design: its
-    second store is never initialized and its ``add`` lands anyway. ``AT-045a`` is the idempotency claim
-    and calls ``initialize()`` explicitly, so it is not that half. This half is the one that needs
+    ``TestWritesStayInTheirScope`` covers the write half on the contract tier, incidentally rather than
+    by design: its second store is never initialized and its ``add`` lands anyway.
+    ``TestInitializeIsIdempotent`` is the idempotency claim and calls ``initialize()`` explicitly, so it
+    is not that half. This half is the one that needs
     mongot, because a search index that does not exist is a query failure rather than a slow write.
 
     Worth its own class because the lazy path and the eager path differ in exactly one way that
@@ -4125,7 +4110,7 @@ class TestTheFirstSearchSetsItselfUp:
 
 @pytest.mark.integration
 class TestNoSearchCrossesAScope:
-    """AT-047a / REQ-E-047 — scope isolation, run once per search tier.
+    """AT-047a — no search crosses a scope, run once per search tier.
 
     The two tiers enforce scope by different mechanisms, and the tier is chosen by config rather than by
     test infrastructure, so both halves live here. Text uses a ``$match`` after ``$search``, which sees
@@ -4145,9 +4130,9 @@ class TestNoSearchCrossesAScope:
         """AT-047a, text tier. Two stores, one collection, the same fact in both, one result each.
 
         The tier is pinned rather than left at ``auto``, and that is the whole point of this half. On a
-        deployment with no registered model ``auto`` degrades to text and this ran the mechanism it
-        names; on a cluster that has one it resolves to ``vector``, and the run of 2026-09-02 was
-        exercising the pre-filter twice while the class docstring claimed both mechanisms were covered.
+        deployment with no registered model ``auto`` degrades to text; on a cluster that has one it
+        resolves to ``vector``, and an unpinned test would exercise the pre-filter twice and the
+        ``$match`` mechanism never.
         """
         stores = [
             _real_store(
@@ -4204,7 +4189,7 @@ class TestNoSearchCrossesAScope:
             await store.close()
 
 
-#: The hybrid corpus, shaped so that reciprocal rank fusion has something to say (``AT-143``).
+#: The hybrid corpus, shaped so that reciprocal rank fusion has something to say.
 #:
 #: Four documents, because three cannot produce the result this test is about. Reciprocal rank fusion
 #: with the penalty at 60 is a sum of ``1/(60 + rank)``, and ``1/x`` is convex, so a document ranked
@@ -4214,17 +4199,17 @@ class TestNoSearchCrossesAScope:
 #: reason the corpus is the size it is rather than the smallest one that runs.
 #:
 #: The vectors set the vector ranks exactly, since cosine against ``QUERY_VECTOR`` is readable off the
-#: first component. The text ranks are BM25's and are *not* predicted here -- the test measures them.
-#: They are, however, what the *arrangement* is built around, so the first version of this corpus is
-#: worth recording: it gave the vector rank in descending keyword density, which is roughly the order
-#: BM25 produces too, and two tiers that agree cannot demonstrate fusion. On the deployment the fused
-#: winner came back as the vector tier's own winner and the test said so.
+#: first component. The text ranks are BM25's and are *not* predicted here; the test measures them.
+#: They are, however, what the *arrangement* is built around. A vector rank in descending keyword
+#: density is roughly the order BM25 produces too, and two tiers that agree cannot demonstrate fusion:
+#: the fused winner would simply be the vector tier's own winner.
 #:
-#: So the tiers are now deliberately opposed, which is also the case hybrid search exists for. The
+#: So the tiers are deliberately opposed, which is also the case hybrid search exists for. The
 #: paraphrase carries the query vector exactly and none of the query's words, so it leads the vector
 #: tier and the text tier never returns it at all. The keyword-stuffed line is the reverse: BM25's
-#: winner, and last by cosine. Neither can win the fusion -- each scores from one tier only -- and the
-#: document ranked second by both takes it, which is the property ``AT-143`` asserts.
+#: winner, and last by cosine. Neither can win the fusion, since each scores from one tier only, and the
+#: document ranked second by both takes it, which is the property ``TestFusionRanksWhatNeitherTierRanksFirst``
+#: asserts.
 _FUSION_CORPUS: Final[dict[str, list[float]]] = {
     "the user prefers a dim interface at night": [1.0, 0.0, 0.0, 0.0],
     "dark mode": [0.9, 0.44, 0.0, 0.0],
@@ -4270,7 +4255,7 @@ def _fuse(*orders: list[str]) -> list[str]:
 
 @pytest.mark.integration
 class TestFusionRanksWhatNeitherTierRanksFirst:
-    """AT-143 / ``REQ-E-142``, ``REQ-E-145`` -- real ``mongot`` scoring for the fourth tier.
+    """AT-143 -- real ``mongot`` scoring for the fourth tier.
 
     The unit tests assert that this package builds one ``$rankFusion`` with two named input pipelines.
     They cannot assert that the server fuses, because the stage is the server's. This is the test that
@@ -4283,14 +4268,13 @@ class TestFusionRanksWhatNeitherTierRanksFirst:
     would have made this a test of mongot's scoring rather than of this package's fusion.
 
     Skips rather than fails below MongoDB 8.0: ``$rankFusion`` is not there, ``initialize()`` says so
-    by design (``REQ-E-144``), and a deployment lacking a server feature is the marker's problem and
-    not this test's.
+    by design, and a deployment lacking a server feature is the marker's problem and not this test's.
     """
 
     async def test_the_fused_order_is_rrf_of_the_two_tiers_it_composed(
         self, atlas_uri: str, test_database_name: str, unique_collection_name: str, atlas_database: Any
     ) -> None:
-        """AT-143 -- the fused order, the winner neither tier picked, and the scale it arrives on."""
+        """AT-143: the fused order, the winner neither tier picked, and the scale it arrives on."""
         await _seed_vectors(
             atlas_database[unique_collection_name], scope="tenant-a", store_name="facts", facts=_FUSION_CORPUS
         )
@@ -4341,10 +4325,10 @@ class TestFusionRanksWhatNeitherTierRanksFirst:
                 f"pass against a pipeline that just picked a tier. vector {vector_order}, text {text_order}"
             )
 
-            # ``REQ-E-145``'s premise, measured rather than asserted from the pipeline shape: a cosine
-            # score would be near 1 and would clear any bound a caller carried over from the vector
-            # tier. The fused ceiling is two reciprocal ranks, which is why that requirement declines
-            # fusion under `auto` when a bound is set.
+            # The fused scale, measured rather than asserted from the pipeline shape: a cosine score
+            # would be near 1 and would clear any bound a caller carried over from the vector tier. The
+            # fused ceiling is two reciprocal ranks, which is why `auto` declines fusion when a bound is
+            # set.
             best = 2 / (_pipeline.RANK_FUSION_PENALTY + 1)
             score = _metadata(fused[0])["_relevance_score"]
             assert 0 < score <= best, f"a fused score cannot exceed {best}, and this one is {score}"
@@ -4355,13 +4339,14 @@ class TestFusionRanksWhatNeitherTierRanksFirst:
 
 @pytest.mark.integration
 class TestTheSentinelScopeIsAScopeLikeAnyOther:
-    """AT-048b / REQ-E-048 — the read half of the unscoped store's isolation.
+    """AT-048b — the read half of the unscoped store's isolation.
 
-    ``AT-048a`` proves the sentinel is *written*. This proves it is also *filtered on*, which is the
-    half that matters: a store with no ``scope`` configured is the shape a single-tenant application
-    has, and the two failures available to it are opposite. Filtering on nothing returns every tenant's
-    documents. Filtering on ``None`` returns nothing, because no document carries ``None``. The sentinel
-    exists so that neither is reachable, and only a query can tell them apart.
+    ``TestTheStoreStampsTheScopeItself`` proves the sentinel is *written*. This proves it is also
+    *filtered on*, which is the half that matters: a store with no ``scope`` configured is the shape a
+    single-tenant application has, and the two failures available to it are opposite. Filtering on
+    nothing returns every tenant's documents. Filtering on ``None`` returns nothing, because no document
+    carries ``None``. The sentinel exists so that neither is reachable, and only a query can tell them
+    apart.
     """
 
     async def test_an_unscoped_store_reads_the_sentinel_scope_and_nothing_else(
@@ -4385,7 +4370,7 @@ class TestTheSentinelScopeIsAScopeLikeAnyOther:
 
 @pytest.mark.integration
 class TestTheShippedDefaultAgainstADeploymentWithNoModel:
-    """AT-053b / REQ-E-053b — the degradation the package's own default runs into, on purpose.
+    """AT-053b — the degradation the package's own default runs into, on purpose.
 
     Not a contrived config. ``embedding_model`` unset means AutoEmbeddings with the default model, and
     an Atlas CLI local deployment registers no models at all, so ``createSearchIndexes`` for the vector
@@ -4410,7 +4395,9 @@ class TestTheShippedDefaultAgainstADeploymentWithNoModel:
 
         warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
         if not warnings:
-            pytest.skip("MONGODB_ATLAS_URI names a deployment with a registered embedding model; nothing is degraded")
+            pytest.skip(
+                "MONGODB_ATLAS_URI names a deployment with a registered embedding model, so this case cannot arise"
+            )
         message = " ".join(record.getMessage() for record in warnings)
         assert "vector" in message.lower(), "the warning has to say which half of the index set is missing"
         # The server's phrasing, not ours. Measured on mongot 8.3.8 as `voyage-4-lite is not registered`.
@@ -4425,17 +4412,19 @@ class TestTheShippedDefaultAgainstADeploymentWithNoModel:
 
         assert [entry.content for entry in results] == ["the user prefers dark mode"]
         # `hybrid` beside `vector`, because this guard is detecting one thing: whether the vector half of
-        # the index set came up. Both answers mean it did -- `auto` resolves to fusion only where both
-        # single tiers exist (`REQ-E-144`, `REQ-E-145`), so on a deployment with a registered model the
-        # tier that runs is `hybrid`, where before the fused tier existed it was `vector`.
+        # the index set came up. Both answers mean it did: `auto` resolves to fusion only where both
+        # single tiers exist, so on a deployment with a registered model and `$rankFusion` the tier that
+        # runs is `hybrid`, and without the stage it is `vector`.
         if _metadata(results[0])["_search_type"] in {"vector", "hybrid"}:
-            pytest.skip("MONGODB_ATLAS_URI names a deployment with a registered embedding model; nothing is degraded")
+            pytest.skip(
+                "MONGODB_ATLAS_URI names a deployment with a registered embedding model, so this case cannot arise"
+            )
         assert _metadata(results[0])["_search_type"] == "text"
 
 
 @pytest.mark.integration
 class TestSearchTypeReportsTheTierThatRan:
-    """AT-054 / REQ-E-054 — the key that makes `REQ-E-053b`'s degradation visible instead of silent.
+    """AT-054 — the key that makes a degraded ``auto`` store visible instead of silent.
 
     ``_search_type`` is the only way a caller can tell a semantic answer from a lexical one, and the two
     look identical otherwise: same shape, same score field, same ordering by descending relevance. A
@@ -4451,11 +4440,13 @@ class TestSearchTypeReportsTheTierThatRan:
 
         assert results
         # `hybrid` beside `vector`, because this guard is detecting one thing: whether the vector half of
-        # the index set came up. Both answers mean it did -- `auto` resolves to fusion only where both
-        # single tiers exist (`REQ-E-144`, `REQ-E-145`), so on a deployment with a registered model the
-        # tier that runs is `hybrid`, where before the fused tier existed it was `vector`.
+        # the index set came up. Both answers mean it did: `auto` resolves to fusion only where both
+        # single tiers exist, so on a deployment with a registered model and `$rankFusion` the tier that
+        # runs is `hybrid`, and without the stage it is `vector`.
         if _metadata(results[0])["_search_type"] in {"vector", "hybrid"}:
-            pytest.skip("MONGODB_ATLAS_URI names a deployment with a registered embedding model; nothing is degraded")
+            pytest.skip(
+                "MONGODB_ATLAS_URI names a deployment with a registered embedding model, so this case cannot arise"
+            )
         assert _metadata(results[0])["_search_type"] == "text"
 
     async def test_the_vector_tier_reports_vector(
@@ -4484,26 +4475,24 @@ class TestSearchTypeReportsTheTierThatRan:
 
 
 _SCORE_DRIFT: Final[float] = 1e-3
-"""How far the same document's score may move between two identical queries (`REQ-E-059`).
+"""How far the same document's score may move between two identical queries.
 
-Measured on `strands-dev` on 2026-09-02: the test below read 0.8866585493087769 for its top document and
-got **0.8867274522781372** back for the same document about a minute later, on the ``vector`` tier. A drift
-of 6.9e-5. Nothing in the package touches the number, which arrives in ``$meta`` and is copied into
+On the ``vector`` tier the same document can score about 7e-5 differently on two identical queries a
+minute apart. Nothing in the package touches the number, which arrives in ``$meta`` and is copied into
 ``_relevance_score`` unchanged; a query given as text is embedded again for the second call, and an
 approximate nearest-neighbour search need not traverse the same nodes twice.
 
-1e-3 is about 14 times that drift and 100 times smaller than the 0.115 gap the test asserts between its two
-documents before it bounds anything, so the tolerance cannot let one of them pass for the other. The
-identity claim is carried by content anyway; this constant only keeps the score assertion from being a
-promise Atlas never made.
+1e-3 is over ten times that drift and about a hundred times smaller than the gap between the test's two
+documents, so the tolerance cannot let one of them pass for the other. The identity claim is carried by
+content anyway; this constant only keeps the score assertion from being a promise Atlas never made.
 """
 
 
 @pytest.mark.integration
 class TestTheScoreBoundDropsResults:
-    """AT-059b / REQ-E-059 — the bound applied after the query, and the comparison this test refuses.
+    """AT-059b — the bound applied after the query, and the comparison this test refuses.
 
-    `REQ-E-059` puts the bound in Python rather than in a `$match` on `$meta`, so what it filters is what
+    The bound is applied in Python rather than in a ``$match`` on ``$meta``, so what it filters is what
     mongot already returned and paid for. The test is calibrated against a first unbounded query instead
     of against a literal, because a fixed threshold is a different claim on each tier: BM25's
     ``searchScore`` is unbounded and depends on corpus statistics, while cosine ``vectorSearchScore`` is
@@ -4511,15 +4500,15 @@ class TestTheScoreBoundDropsResults:
     single number that "works on both" would be a number that happens to sit below every score in this
     particular corpus, which is a fact about the corpus and not about the bound.
 
-    The second comparison it refuses was found the hard way, on 2026-09-02, by making it: the surviving
-    result's score is checked to :data:`_SCORE_DRIFT` and not for equality, because the same document on the
-    same query text scored 6.9e-5 differently a minute apart. Which document survived is asserted by its
-    content, which is the claim the requirement actually makes.
+    The second comparison it refuses is exact score equality: the surviving result's score is checked to
+    :data:`_SCORE_DRIFT`, because the same document on the same query text can score slightly
+    differently a minute apart. Which document survived is asserted by its content, which is the claim
+    that matters.
 
-    The third was found the same way on 2026-09-16, and is the same mistake one level up: calibrating
-    against an unbounded query is only safe while the unbounded query runs the same tier as the bounded
-    one. Adding the fused tier broke that silently, because setting a bound is itself what decides the
-    tier (`REQ-E-146`). The measuring store now declares a bound of its own for that reason alone.
+    The third is the same mistake one level up: calibrating against an unbounded query is only safe
+    while the unbounded query runs the same tier as the bounded one, and setting a bound is itself what
+    decides whether ``auto`` uses the fused tier. The measuring store declares a bound of its own for
+    that reason alone.
     """
 
     async def test_a_bound_above_the_lowest_score_drops_exactly_that_result(
@@ -4527,16 +4516,15 @@ class TestTheScoreBoundDropsResults:
     ) -> None:
         """AT-059b. Measure first, then bound just above the measurement's floor."""
         # `min_score=0.0` on the measuring store, which is not a bound so much as a declaration that one
-        # exists. Tier resolution reads whether a bound is set and never its value (`REQ-E-146`), so this
-        # puts the writer on exactly the path the bounded store below will take -- whichever path that is
-        # on this deployment -- while dropping nothing, because every tier's score is non-negative.
+        # exists. Tier resolution reads whether a bound is set and never its value, so this puts the
+        # writer on exactly the path the bounded store below will take, whichever path that is on this
+        # deployment, while dropping nothing, because every tier's score is non-negative.
         #
-        # Without it the two stores resolve differently and the test measures one scale to bound another.
-        # Found on 2026-09-16 by `Atlas tiers` on `eb9ac2d`: the writer got fusion and measured RRF scores
-        # of 0.016 to 0.033, the bounded store declined fusion for vector and scored 0.771 and 0.887, and
-        # a bound of 0.0163 dropped neither. Pinning a literal `search_type` instead would not work here:
-        # this test has to pass against a deployment with a registered embedding model and against one
-        # without, and those resolve to different tiers.
+        # Without it the two stores can resolve differently and the test measures one scale to bound
+        # another: a writer on fusion measures RRF scores near 0.03, a bounded store on vector scores
+        # near 0.8, and a bound between the first two drops neither. Pinning a literal `search_type`
+        # instead would not work here: this test has to pass against a deployment with a registered
+        # embedding model and against one without, and those resolve to different tiers.
         writer = _real_store(
             atlas_uri, test_database_name, unique_collection_name, writable=True, scope="tenant-a", min_score=0.0
         )
@@ -4584,7 +4572,7 @@ class TestTheScoreBoundDropsResults:
 
 
 class TestASkippedTierIsTriedAgain:
-    """AT-227 / ``REQ-E-219``. Under ``auto`` a tier that failed at startup is retried with backoff.
+    """AT-227. Under ``auto`` a tier that failed at startup is retried with backoff.
 
     The retry reads index status without waiting for a build, so it never holds a request for
     ``index_ready_timeout``, and a retry that fails keeps the tiers the store already answers from.

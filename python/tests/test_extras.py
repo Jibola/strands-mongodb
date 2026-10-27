@@ -1,14 +1,11 @@
 """Characterization tests for ``_extras.missing_extra``.
 
-Covers ``CH-003`` and ``AT-008a``/``AT-008b`` (``REQ-E-008``). The message is the whole
-feature: a bare ``ModuleNotFoundError: No module named 'pymongo'`` tells a user nothing about extras,
-so the value here is entirely in what the string says and what it chains from.
+The message is the whole feature: a bare ``ModuleNotFoundError: No module named 'pymongo'`` tells a
+user nothing about extras, so these tests pin what the string says and what it chains from.
 
-The ``module`` argument arrived later. The scaffold derived the module path from the extra
-name, which held only while ``strands_mongodb.memory`` was the import path. Once the module became
-``memory_store.py``, that derivation started printing a path no install provides, so the caller now
-passes its own ``__name__``. The characterization tests below were updated with the signature, and
-that is the record of a contract changed on purpose.
+The caller passes its own ``__name__`` as ``module``. The module path cannot be derived from the extra
+name: the ``memory`` extra serves ``strands_mongodb.memory_store``, and a derived path would name a module
+no install provides.
 """
 
 from __future__ import annotations
@@ -50,7 +47,7 @@ else:
 
 
 class TestMissingExtra:
-    """CH-003 — the actionable import error."""
+    """The actionable import error raised when an optional extra is missing."""
 
     def test_raises_import_error_naming_the_pip_command(self) -> None:
         """The message contains the exact command that fixes the failure.
@@ -96,7 +93,7 @@ class TestMissingExtra:
         [("storage", "strands_mongodb.storage"), ("memory", "strands_mongodb.memory_store")],
     )
     def test_message_names_both_the_extra_and_the_module(self, extra: str, module: str) -> None:
-        """Both are interpolated, not hardcoded per call site, and they are no longer the same word."""
+        """Both are interpolated, not hardcoded per call site, and they are different words."""
         with pytest.raises(ImportError) as caught:
             missing_extra(extra, ImportError("boom", name="pymongo"), module=module)
 
@@ -120,15 +117,14 @@ class TestMissingExtra:
 
 
 class TestMessageNamesAModulePeopleCanActuallyImport:
-    """AT-008a / REQ-E-008 — the module path stopped being derivable from the extra name."""
+    """AT-008a — the message names the real module path, which the extra name does not determine."""
 
     def test_the_retired_import_path_is_not_advertised(self) -> None:
-        """``strands_mongodb.memory`` must not appear, because nothing installs it any more.
+        """``strands_mongodb.memory`` must not appear, because no install provides it.
 
-        The scaffold built the message as ``strands_mongodb.{extra}``. Reading it after the layout
-        move, a user would run ``pip install 'strands-mongodb[memory]'``, succeed, retry
-        ``import strands_mongodb.memory``, and hit a second ``ModuleNotFoundError`` from the message
-        that was supposed to unblock them.
+        A message built as ``strands_mongodb.{extra}`` would send a user to run
+        ``pip install 'strands-mongodb[memory]'``, succeed, retry ``import strands_mongodb.memory``, and hit
+        a second ``ModuleNotFoundError`` from the message that was supposed to unblock them.
         """
         with pytest.raises(ImportError) as caught:
             missing_extra(
@@ -143,11 +139,11 @@ class TestMessageNamesAModulePeopleCanActuallyImport:
 
 
 class TestARealFailedImportProducesTheActionableMessage:
-    """AT-008b / CH-003 — end to end, through the import system.
+    """AT-008b — end to end, through the import system.
 
     Every other test in this file calls ``missing_extra`` directly, which leaves the wiring
     untested: a surface module that forgot the ``try``/``except``, caught the wrong exception type,
-    or passed a stale module string would pass all of them. These three run the real import with one
+    or passed a stale module string would pass all of them. These cases run the real import with one
     dependency made unimportable, which is the situation the feature exists for.
 
     ``types.py`` and ``_client.py`` are the odd ones out and belong here anyway. Neither is a surface a

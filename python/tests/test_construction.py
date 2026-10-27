@@ -1,11 +1,10 @@
 """Constructing the two public classes: signature, connection sharing, ownership, teardown.
 
-``REQ-E-010``–``REQ-E-017`` are about connections, and ``test_client.py``
-asserts them against ``_client.resolve`` directly. This file asserts the same contract through the
-constructors a user actually calls, which is where three of the acceptance tests are worded:
-``AT-012`` says *100 stores* yield one client, ``AT-015`` says the rejection happens *at construction
-time*, and ``AT-017`` says *two ``asyncio.run`` calls sharing one config*. A registry that behaves
-perfectly while ``MongoDBStorage.__init__`` forgets to consult it satisfies none of them.
+``test_client.py`` asserts the connection contract against ``_client.resolve`` directly. This file
+asserts the same contract through the constructors a user actually calls: *100 stores* yield one client,
+a bad config is rejected *at construction time*, and *two ``asyncio.run`` calls sharing one config* both
+succeed. A registry that behaves perfectly while ``MongoDBStorage.__init__`` forgets to consult it
+satisfies none of them.
 
 Nothing here reaches the network. ``AsyncMongoClient`` construction performs no I/O, so a URI
 pointing at a closed port is enough to build and register a client, and every test below runs in the
@@ -34,10 +33,10 @@ if TYPE_CHECKING:
 # Port 1 is reserved and never listening, so anything that reaches the network here fails loudly
 # instead of finding a stray local mongod and passing for the wrong reason.
 #
-# The timeout is not decoration. `_is_closed` distinguishes a closed client from a live one by
-# probing both, and a live client against a dead port takes `serverSelectionTimeoutMS` to give up:
-# at pymongo's 30-second default, the two tests that probe a live injected client took 60 of this
-# file's 61 seconds. Setting it in the URI covers the clients this package constructs as well.
+# The timeout keeps the file fast. `_is_closed` distinguishes a closed client from a live one by
+# probing both, and a live client against a dead port takes `serverSelectionTimeoutMS` to give up,
+# which is 30 seconds at pymongo's default. Setting it in the URI covers the clients this package
+# constructs as well.
 UNREACHABLE = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=50"
 
 
@@ -46,7 +45,7 @@ def _clear_registry() -> Any:
     """Isolate each test from the process-global connection registry.
 
     Same justification as the fixture of the same name in ``test_client.py``: the registry is
-    module-level by design (``REQ-E-012``), so without this a test that constructs a store leaves a
+    module-level by design (one pool per connection identity), so without this a test that constructs a store leaves a
     connection behind for the next one, and ``len(_REGISTRY) == 1`` assertions become order
     dependent.
     """
@@ -84,11 +83,11 @@ def _store_config(**overrides: Any) -> MongoDBMemoryStoreConfig:
     return store  # type: ignore[return-value]
 
 
-class TestTheSignaturesTheApiFixes:
-    """One calling convention per SDK surface.
+class TestTheConstructorSignatures:
+    """One calling convention per SDK surface, each matching the SDK class it sits beside.
 
-    The asymmetry is deliberate and it is the part most likely to be "tidied" by a
-    later reader into a single convention, which would be a breaking change on whichever surface lost.
+    The asymmetry is deliberate, and it is the part most likely to be "tidied" by a later reader into a
+    single convention, which would be a breaking change on whichever surface lost.
     Asserted against ``inspect.signature`` rather than by calling, so the test describes the promise
     and not one call that happens to work.
     """
@@ -136,9 +135,9 @@ class TestTheSignaturesTheApiFixes:
 
 
 class TestOneClientPerConfigAcrossBothSurfaces:
-    """AT-012 / REQ-E-012 — N instances from one config, one connection pool.
+    """AT-012 — N instances from one config, one connection pool.
 
-    The count in ``AT-012`` is not decoration. A multi-tenant application builds one store per user
+    The count of 100 matters. A multi-tenant application builds one store per user
     per request, and each ``AsyncMongoClient`` opens its own pool with its own monitoring threads, so
     the failure mode is not "slightly wasteful": it is a connection count that grows with traffic
     until the deployment refuses new connections.
@@ -165,7 +164,7 @@ class TestOneClientPerConfigAcrossBothSurfaces:
         assert len(_client._REGISTRY) == 1
 
     def test_a_storage_and_a_memory_store_sharing_a_config_share_one_client(self) -> None:
-        """``REQ-E-012`` says "stores or storages", and the two surfaces are separate modules.
+        """Stores and storages share one registry, and the two surfaces are separate modules.
 
         The likely way to fail this is per-module state: a registry defined in ``storage.py`` and
         another in ``memory_store.py`` would pass both tests above and still open two pools for an
@@ -196,9 +195,9 @@ class TestOneClientPerConfigAcrossBothSurfaces:
 
 
 class TestABadConfigIsRejectedAtConstruction:
-    """AT-015 / REQ-E-015 — the failure happens where the caller can see it.
+    """AT-015 — the failure happens where the caller can see it.
 
-    ``REQ-E-015`` says "at construction time" and the reason is upstream behavior, not tidiness.
+    The check runs at construction time because of upstream behavior.
     pymongo validates nothing about a connection string: ``AsyncMongoClient("not-a-uri")`` succeeds,
     reading the string as a hostname. Deferring the check to first use would turn a missing setting
     into a 30-second server-selection timeout against ``localhost``, raised from inside whichever SDK
@@ -284,12 +283,11 @@ async def _is_closed(client: AsyncMongoClient[Any]) -> bool:
 
 
 class TestOwnershipSurvivesTheStoreBoundary:
-    """AT-010, AT-011 / REQ-E-010, REQ-E-011 — who built the client decides who may close it.
+    """AT-010, AT-011 — who built the client decides who may close it.
 
-    Worth asserting again at this level even though ``test_client.py`` covers ``_client.close``. The
-    reference implementation this package was reviewed against calls ``self.client.close()`` from the store
-    unconditionally, so the defect this guards against lives in the store's ``close()``, not in the
-    connection module.
+    Asserted again at this level even though ``test_client.py`` covers ``_client.close``, because the
+    defect this guards against, a store that calls ``self.client.close()`` unconditionally, lives in the
+    store's ``close()``, not in the connection module.
     """
 
     async def test_a_storage_closes_the_client_it_built(self) -> None:
@@ -347,17 +345,15 @@ class TestOwnershipSurvivesTheStoreBoundary:
         await storage.close()
 
     async def test_closing_one_instance_releases_the_connection_the_others_share(self) -> None:
-        """The scope of ``REQ-E-012``, asserted rather than left to be discovered.
+        """The scope of connection sharing, asserted rather than left to be discovered.
 
         One registry entry per connection identity means ``close()`` is per-config, not per-instance:
         the pool the second storage was using is gone once the first one closes. That is why ``close()``
         belongs at process shutdown rather than in a per-request ``finally`` around one store of several.
 
-        What the sibling sees afterwards changed late. Until ``REQ-E-017b`` it held the closed
-        client on an attribute and its next operation raised ``InvalidOperation``; now it resolves per
-        operation, finds the entry gone, and opens a new pool. So this asserts the pool was released and
-        the sibling is not bricked, which is strictly the better half of the trade. The half
-        still open is the reverse: that new pool has no owner who will close it.
+        The sibling resolves its connection per operation, finds the entry gone, and opens a new pool.
+        So this asserts the pool was released and the sibling still works. The new pool has no owner who
+        will close it, which is a known limit of per-config ownership.
         """
         connection = _storage_config()
         first = MongoDBStorage(connection, collection="sessions")
@@ -377,7 +373,7 @@ class TestOwnershipSurvivesTheStoreBoundary:
 
 
 class TestTheCollectionAndOptionsTheCallerAsksFor:
-    """The per-instance settings are recorded as given, with the defaults the requirements fix.
+    """The per-instance settings are recorded as given, with the documented defaults.
 
     Two collection defaults rather than one, because the two surfaces hold unrelated data in the same
     database: ``"storage"`` for the ``Storage`` contract's opaque bytes and
@@ -387,7 +383,7 @@ class TestTheCollectionAndOptionsTheCallerAsksFor:
     """
 
     def test_a_storage_defaults_to_the_storage_collection(self) -> None:
-        """The documented default for the ``Storage`` surface."""
+        """The default collection name is ``"storage"``."""
         assert MongoDBStorage(_storage_config())._collection_name == "storage"
 
     def test_a_memory_store_defaults_to_the_memory_collection(self) -> None:
@@ -403,12 +399,12 @@ class TestTheCollectionAndOptionsTheCallerAsksFor:
         assert storage._ttl_seconds == 3600
 
     def test_a_storage_without_a_ttl_records_no_expiry_rather_than_zero(self) -> None:
-        """``REQ-E-035``: documents written without ``ttl_seconds`` never expire.
+        """Documents written without ``ttl_seconds`` never expire.
 
         ``None`` and ``0`` are opposites here and both are falsy. A MongoDB TTL index with
         ``expireAfterSeconds: 0`` expires documents the moment ``expires_at`` passes, so collapsing
-        the default to ``0`` somewhere between here and the storage layer deletes data instead of keeping it
-        forever.
+        the default to ``0`` anywhere between here and the write path deletes data instead of keeping
+        it forever.
         """
         assert MongoDBStorage(_storage_config())._ttl_seconds is None
 
@@ -416,7 +412,7 @@ class TestTheCollectionAndOptionsTheCallerAsksFor:
         """One client serves many databases, so the name has to be kept per instance.
 
         It is deliberately not part of the connection identity: two storages on different databases of
-        one deployment share a pool (``REQ-E-012``), which only works if each remembers its own
+        one deployment share a pool, which only works if each remembers its own
         database rather than reading it back off the shared connection.
         """
         storage = MongoDBStorage(_storage_config(database="tenant_a"))
@@ -427,9 +423,9 @@ class TestTheCollectionAndOptionsTheCallerAsksFor:
 
 
 class TestOneConfigAcrossTwoEventLoops:
-    """AT-017 / REQ-E-017, the event-loop boundary — a synchronous ``Agent`` runs each invocation on a new loop.
+    """AT-017 — a synchronous ``Agent`` runs each invocation on a new loop.
 
-    Two real ``asyncio.run`` calls, as the acceptance test requires: one loop with two tasks does not
+    Two real ``asyncio.run`` calls, because one loop with two tasks does not
     reproduce the failure. Neither does an uncontended lock. ``asyncio.Lock`` has bound lazily since
     3.10, so ``acquire()`` on an unlocked lock returns without ever asking which loop it is on, and a
     test that merely crosses loops passes against an implementation that never rebinds.
@@ -442,12 +438,9 @@ class TestOneConfigAcrossTwoEventLoops:
     def test_two_asyncio_run_calls_sharing_one_config_both_succeed(self) -> None:
         """The second invocation must not inherit a lock bound to the first one's closed loop.
 
-        This test asserted the opposite of its closing line until late: it required the second run to
-        reuse the first run's *client*, on the reading of ``REQ-E-012`` that one identity means one pool
-        for the life of the process. ``REQ-E-017a`` bounds that per loop, because pymongo binds a client
-        to the loop of its first operation and refuses it everywhere else. Reuse across a closed loop is
-        the defect, not the requirement. The lock claim above it is unchanged and is still the reason the
-        contention exists here.
+        Connection sharing is bounded per event loop, because pymongo binds a client to the loop of its
+        first operation and refuses it everywhere else, so the second run gets its own client. The lock
+        contention is what proves the lock is not inherited from the first run's closed loop.
         """
         config = _storage_config()
 
@@ -468,12 +461,12 @@ class TestOneConfigAcrossTwoEventLoops:
 
 
 class TestOneStoreInstanceAcrossTwoEventLoops:
-    """AT-091c / REQ-E-017b — the event-loop boundary, with the store built once instead of once per loop.
+    """AT-091c — one store across successive event loops, built once instead of once per loop.
 
     The class above builds a fresh ``MongoDBStorage`` inside each ``asyncio.run``, so a per-loop registry
-    is enough to satisfy it. That is what let the first version of ``REQ-E-017a`` look complete while the
-    contract tier still raised: both constructors cached the resolved connection on the instance, so a
-    store that *outlives* its first loop never asked the registry again.
+    is enough to satisfy it. A constructor that cached the resolved connection on the instance would pass
+    that class and still fail here: a store that *outlives* its first loop would never ask the registry
+    again.
 
     Nothing here connects. ``resolve`` builds an ``AsyncMongoClient`` without I/O, and identity of the
     client object is the whole assertion, so an unreachable address is the right target: it keeps the
@@ -513,7 +506,7 @@ class TestOneStoreInstanceAcrossTwoEventLoops:
         """``_collection()`` is the only path the operations take, so it is the one that has to move.
 
         A ``_connection`` property with a collection still captured at construction would pass the two
-        tests above and fail every write, which is exactly the shape of the defect this started from.
+        tests above and fail every write.
         """
         storage = MongoDBStorage(_storage_config())
 
@@ -523,7 +516,7 @@ class TestOneStoreInstanceAcrossTwoEventLoops:
         assert first is not second
 
     def test_construction_still_refuses_a_config_it_cannot_resolve(self) -> None:
-        """The eager resolution ``__init__`` throws away is what keeps ``REQ-E-015`` at construction.
+        """The eager resolution ``__init__`` throws away is what keeps config rejection at construction.
 
         Dropping the call and letting the property do all the work would move this ``ValueError`` to the
         first ``write``, which is a worse place to learn that a config was never usable.
@@ -542,7 +535,7 @@ class TestOneStoreInstanceAcrossTwoEventLoops:
 
 
 class TestTheHooksThatMustStayAbsent:
-    """Two optional SDK hooks, where a raising stub is worse than nothing.
+    """Two optional SDK hooks where a raising stub is worse than nothing.
 
     Both are feature-detected: ``_resolve_namespace`` calls ``for_sandbox`` only when the attribute is
     present, and ``MemoryManager`` routes extraction through ``add_messages`` only when
@@ -575,7 +568,7 @@ class TestTheHooksThatMustStayAbsent:
 
 
 class TestANegativeLifetimeIsRefused:
-    """AT-226 / ``REQ-E-218``. A negative ``ttl_seconds`` stamps an expiry in the past, so the TTL monitor
+    """AT-226. A negative ``ttl_seconds`` stamps an expiry in the past, so the TTL monitor
     would delete every write within a minute. ``0`` is a valid request and stays accepted."""
 
     def test_a_storage_refuses_a_negative_ttl(self) -> None:

@@ -1,15 +1,10 @@
-"""The thinnest live test that proves the harness reaches a real deployment.
+"""The thinnest live tests that prove the harness reaches a real deployment.
 
-Bootstrap phase requirement: one test that crosses the riskiest boundary for real before anything is
-built on top of the fixtures. The risk here is not the package, which does not exist yet. It is the
-harness: a ``contract_database`` fixture that silently yields a handle to nothing would let every
-contract test in the suite pass against a database that was never written to.
+A ``contract_database`` fixture that silently yielded a handle to nothing would let every contract test
+pass against a database that was never written to. These tests cross the process boundary to a real
+``mongod`` over the wire, with no mock involved, before anything else relies on the fixtures.
 
-Crosses two boundaries: in-process to ``mongod`` over the wire, and mock to real (in
-the trivial direction where no mock is involved yet).
-
-These tests assert the harness, not the package. They stay small on purpose and are not part of any
-requirement's acceptance.
+They assert the harness, not the package, and stay small on purpose.
 """
 
 from __future__ import annotations
@@ -37,8 +32,7 @@ class TestContractFixtureReachesARealServer:
         """A write is durable and readable, and the bytes survive.
 
         ``Binary`` is used rather than a plain string because the storage collection stores payloads
-        as BSON ``Binary``, and the round trip that matters is the one the package will
-        actually perform.
+        as BSON ``Binary``, and the round trip that matters is the one the package performs.
         """
         from bson import Binary
 
@@ -56,10 +50,9 @@ class TestContractFixtureReachesARealServer:
     ) -> None:
         """The fixture writes to the throwaway database, not to a real one.
 
-        The failure this prevents is not subtle in effect and is very subtle in appearance: a
-        misconfigured fixture writing to whatever database the connection string names, then dropping
-        it on teardown. A test suite that deletes the developer's data passes every assertion while
-        doing it.
+        This guards against a misconfigured fixture writing to whatever database the connection string
+        names and then dropping it on teardown, which would delete the developer's data while every
+        assertion passed.
         """
         collection = contract_database[unique_collection_name]
         await collection.insert_one({"_id": "harness/where-am-i"})
@@ -81,7 +74,7 @@ class TestIntegrationFixtureReachesSearch:
         This is the assertion that separates the integration tier from the contract tier. Without
         it, pointing ``MONGODB_ATLAS_URI`` at a plain ``mongod`` would run the whole integration
         suite against a deployment with no search support, and the vector tests would return empty
-        results rather than errors, observed live while the tiers were being built.
+        results rather than errors.
         """
         collection = atlas_database[unique_collection_name]
         await collection.insert_one({"_id": "harness/search-probe", "content": "hello"})

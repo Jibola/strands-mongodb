@@ -1,12 +1,8 @@
 """The migration guide, checked against three packages, only one of which is in this repository.
 
-The acceptance set ``AT-098`` through ``AT-102``. The requirements carry the reasoning;
-this file carries the checks.
-
-``python/MIGRATION.md`` is the only document in this repository whose subject is somebody else's code.
-That makes it the only one where a test cannot prove the claims are current, and pretending otherwise
-would be worse than admitting it. So the mechanism is deliberately uneven, and the unevenness is visible
-in the class names below:
+``python/MIGRATION.md`` is the only document in this repository whose subject is somebody else's code,
+which makes it the only one where a test cannot prove every claim is current. So the mechanism is
+deliberately uneven, and the unevenness is visible in the class names below:
 
 * The archived ``strands-tools`` plugin lives in this workspace, so its settings and document fields are
   extracted from the module text and compared against the guide. When the workspace is not present, the
@@ -14,11 +10,11 @@ in the class names below:
   still runs a meaningful test.
 * The two community packages are not vendored and are not fetched at test time. Their inventories are
   transcribed here, with the URL and the date they were read. These tests catch the guide drifting from
-  the transcript. Nothing here can catch the transcript drifting from upstream, which is ``REQ-E-102``'s
-  reason for existing and is stated in the guide rather than hidden in this docstring.
+  the transcript. Nothing here can catch the transcript drifting from upstream, which is why the guide
+  says where and when each source was read, and states that limit itself.
 
-What the guide *runs* is ``test_readme.py``'s subject: the guide joined that file's block sweep, so every
-fenced snippet in it carries a run directive or a skip reason (``REQ-E-097``).
+What the guide *runs* is ``test_readme.py``'s subject: the guide is part of that file's block sweep, so
+every fenced snippet in it carries a run directive or a skip reason.
 """
 
 from __future__ import annotations
@@ -63,7 +59,7 @@ _workspace_only = pytest.mark.skipif(
     reason=f"the archived strands-tools plugin is not at {_ARCHIVED_TOOL}; the transcript tests still run",
 )
 
-#: Opt-in gate for the sdist build, shared in spirit with ``test_packaging.py``'s ``AT-002``/``AT-003``.
+#: Opt-in gate for the sdist build, the same variable ``test_packaging.py``'s build tests use.
 #: Building a distribution costs seconds and needs a build backend, so the cheap manifest assertion runs
 #: every time and the artifact assertion runs behind this.
 BUILD_TIER_VARIABLE = "STRANDS_MONGODB_BUILD_TIER"
@@ -99,7 +95,7 @@ class Source:
 
 
 #: The archived plugin. ``vector_index_name`` is in the settings list and has no environment variable,
-#: which is the row a reader most needs and the one an env-var sweep alone would miss (`:778`).
+#: which is the row a reader most needs and the one an env-var sweep alone would miss.
 _ARCHIVED = Source(
     slug="tools-memory",
     distribution="strands-tools",
@@ -224,11 +220,10 @@ def _manifest() -> dict[str, Any]:
 
 
 class TestTheGuideReachesThePeopleWhoNeedIt:
-    """``AT-098`` / ``REQ-E-098`` — a guide only on GitHub misses everybody who installed from PyPI.
+    """``AT-098`` — the guide ships in the sdist, so readers who installed from PyPI have it too.
 
-    Which is exactly the population with old data. The manifest assertion is the one that fails while
-    somebody is editing ``pyproject.toml``; the sdist assertion is the one that matches what the
-    requirement actually says, so both are here.
+    Those readers are the ones with existing data. The manifest assertion fails while somebody is
+    editing ``pyproject.toml``; the sdist assertion checks the outcome itself, so both are here.
     """
 
     def test_the_guide_exists(self) -> None:
@@ -251,7 +246,7 @@ class TestTheGuideReachesThePeopleWhoNeedIt:
         A build backend can honour an include list and still drop a file, and the include list is a proxy
         either way. So this one builds the artifact and looks inside it.
 
-        Through a throwaway venv with ``build`` installed, for the same reason ``test_packaging.py``
+        Through a temporary venv with ``build`` installed, for the same reason ``test_packaging.py``
         reaches for ``pip wheel``: neither ``build`` nor ``hatchling`` is in the development venv, and
         adding either to make a test pass would make the test dependent on a tool the package does not
         otherwise need. ``pip`` has no sdist verb, so a wheel cannot stand in here either. The wheel does
@@ -290,7 +285,7 @@ class TestTheGuideReachesThePeopleWhoNeedIt:
 
 
 class TestBothReadmesPointAtTheGuide:
-    """``AT-102`` / ``REQ-E-098`` — a migration guide nobody is linked to is a file in a repository.
+    """``AT-102`` — both READMEs link to the migration guide, so readers can find it.
 
     Both files, because they have different readers: the root README is what GitHub renders for somebody
     evaluating the package, and ``python/README.md`` is what ships and what a reader with old data is
@@ -307,10 +302,10 @@ class TestBothReadmesPointAtTheGuide:
 
 
 class TestTheGuideSaysWhereItsClaimsCameFrom:
-    """``AT-102`` / ``REQ-E-102`` — two of the three sources can change without this repository noticing.
+    """``AT-102`` — the guide names each source and when it was read.
 
-    The guide cannot be made to notice. It can be made to say when it last looked, which is the
-    difference between a reader who can check a claim in a minute and a reader who cannot check it at all.
+    Two of the three sources can change without this repository noticing. The guide says where and when
+    it last looked, so a reader can check any claim against the source in a minute.
     """
 
     @pytest.mark.parametrize("source", _SOURCES, ids=[source.slug for source in _SOURCES])
@@ -332,18 +327,18 @@ class TestTheGuideSaysWhereItsClaimsCameFrom:
         """AT-102 -- the limit is stated in the document, not only in this file's docstring.
 
         Asserted by phrase rather than by structure because there is nothing structural to assert: the
-        claim is that the guide is honest about its own staleness, and the only mechanical proxy is that
-        it says so where a reader will see it.
+        claim is that the guide states how current it can be, and the only mechanical proxy is that it
+        says so where a reader will see it.
         """
         guide = _guide().lower()
         assert "not vendored" in guide or "not fetched" in guide, (
             "MIGRATION.md does not tell the reader that the two community packages are read from "
-            "upstream and not checked by this suite (REQ-E-102)"
+            "upstream and not checked by this suite"
         )
 
 
 class TestEverySourcesSurfaceIsMapped:
-    """``AT-099`` and ``AT-100`` / ``REQ-E-099`` — completeness measured in the *source's* direction.
+    """``AT-099`` and ``AT-100`` — completeness measured in the *source's* direction.
 
     A mapping table that lists the settings with an obvious equivalent and quietly omits the rest is how
     a reader loses ``MONGODB_NAMESPACE``: it has no counterpart here, which is precisely why it needs a
@@ -374,7 +369,7 @@ class TestEverySourcesSurfaceIsMapped:
 
 @_workspace_only
 class TestTheArchivedToolsTranscriptIsCurrent:
-    """``AT-099`` / ``REQ-E-102`` — the one source that can be checked against code rather than a memo.
+    """``AT-099`` — the one source that can be checked against its code rather than a transcript.
 
     The module is read as text, not imported: it needs ``boto3`` and the ``mongodb-memory`` extra, and
     this package depends on neither, so importing it would make the test's own dependencies wider than
@@ -396,7 +391,7 @@ class TestTheArchivedToolsTranscriptIsCurrent:
 
         Values shorter than five characters are excluded: the plugin's ``DEFAULT_MAX_RESULTS = 10`` and
         ``DEFAULT_EMBEDDING_DIMS = 1024`` would match any table containing any number, and an assertion
-        that cannot fail is worse than no assertion. Both are covered by
+        that always passes. Both are covered by
         :meth:`TestTheGuideStatesTheBehaviourDifferences.test_the_guide_states_the_titan_dimension_count`.
         """
         text = _ARCHIVED_TOOL.read_text()
@@ -413,7 +408,7 @@ class TestTheArchivedToolsTranscriptIsCurrent:
 
 
 class TestTheGuideSaysWhichMigrationsMoveData:
-    """``AT-100`` / ``REQ-E-100`` — three sources, and the answer is not the same for all three.
+    """``AT-100`` — three sources, and the answer is not the same for all three.
 
     Storage migrates by pointing the new configuration at the existing collection: the two packages agree
     on ``_id`` and on ``data``, and both normalise keys with the SDK's own function, so each reads the
@@ -430,7 +425,7 @@ class TestTheGuideSaysWhichMigrationsMoveData:
         )
 
     def test_the_verdicts_are_not_all_the_same(self) -> None:
-        """AT-100 -- the split is the finding, so a table answering "yes" three times has lost it."""
+        """AT-100 -- the answers differ by source, so a table answering "yes" three times is wrong."""
         table = _table("verdict").lower()
         assert "no" in table and "yes" in table, (
             "the verdict table does not distinguish the storage migration, which moves nothing, from the "
@@ -439,11 +434,10 @@ class TestTheGuideSaysWhichMigrationsMoveData:
 
 
 class TestTheGuideStatesTheBehaviourDifferences:
-    """``AT-100`` / ``REQ-E-099`` — the four gaps that make a memory migration a copy, plus two more.
+    """``AT-100`` — the four gaps that make a memory migration a copy, plus two more.
 
-    Each of these was measured against source rather than reasoned about, and each changes what a reader
-    has to do. They are asserted individually because a hazards section that drops one of them still
-    looks complete.
+    Each of these is checked against the source packages, and each changes what a reader has to do.
+    They are asserted individually because a hazards section that drops one of them still looks complete.
     """
 
     @pytest.mark.parametrize(
@@ -465,8 +459,8 @@ class TestTheGuideStatesTheBehaviourDifferences:
 
         Aggregation has no SHA-256 operator, so a ``$merge`` cannot fill ``content_hash`` in. Migrated
         memories therefore do not deduplicate against newly added identical content until something
-        rewrites them from a client. A guide that omitted this would be recommending a path whose
-        consequence the reader discovers later.
+        rewrites them from a client. The guide states this so a reader choosing that path knows the
+        consequence up front.
         """
         guide = _guide()
         assert "content_hash" in guide and re.search(r"sha[- ]?256", guide, re.IGNORECASE), (
@@ -496,8 +490,8 @@ class TestTheGuideStatesTheBehaviourDifferences:
 
 #: The archived plugin's search-index definition, transcribed from ``mongodb_memory.py:207-222``. A
 #: legacy ``search``-type index with a ``knnVector`` field, under the name all three packages default to.
-#: Atlas 8.0.30 accepts it and echoes it back in ``latestDefinition`` unchanged, measured 2026-09-01,
-#: which is what makes it usable as the foreign index in the test below.
+#: Atlas 8.0.30 accepts it and echoes it back in ``latestDefinition`` unchanged, which is what makes it
+#: usable as the foreign index in the test below.
 _LEGACY_INDEX = {
     "name": _indexes.DEFAULT_VECTOR_INDEX_NAME,
     "definition": {
@@ -557,10 +551,11 @@ _FOREIGN_INDEXES_ONLY = (
 #: Manual-vector mode: the specs *under test* need no registered embedding model, and the collision is
 #: about the index *name*, which is the same either way. That is why the class sits on ``integration``.
 #:
-#: It is not the whole tier story, and reading it as such was a bug (``AT-132``). A tier has to cover the
-#: setup as well as the assertion, and one of the two foreign indexes these tests plant *first* is itself
-#: an ``autoEmbed`` definition naming a model. Planting it needs that model registered however little the
-#: assertion afterwards cares, so that parameter carries ``autoembed`` on top of the class marker.
+#: That is not the whole tier story (``TestEveryForeignIndexIsGatedByWhatPlantingItNeeds`` checks it). A
+#: tier has to cover the setup as well as the assertion, and one of the two foreign indexes these tests
+#: plant *first* is itself an ``autoEmbed`` definition naming a model. Planting it needs that model
+#: registered however little the assertion afterwards cares, so that parameter carries ``autoembed`` on top
+#: of the class marker.
 _MANUAL_VECTOR_CONFIG: MongoDBConfig = {
     "database": "unused",
     "embedding_dimensions": 4,
@@ -570,13 +565,13 @@ _MANUAL_VECTOR_CONFIG: MongoDBConfig = {
 
 @pytest.mark.integration
 class TestTheIndexNameCollisionFailsLoudly:
-    """``AT-101`` / ``REQ-E-101``, ``REQ-E-069`` — the sharpest hazard, measured rather than reasoned.
+    """``AT-101`` — an index of the same name and the wrong shape fails loudly, checked on a deployment.
 
     All three source packages default their vector index to ``vector_index``, and so does this one. Two of
     them also default their collection to a name this package defaults to. So the ordinary migration is a
     reader pointing this package at a collection that already holds a ``vector_index`` of the wrong shape,
-    and what happens next is the claim in the guide a reader is most likely to disbelieve: every other
-    tool in this space treats a matching name as a matching index.
+    and this package refuses it with an error, where the source packages treat a matching name as a
+    matching index.
 
     Against a deployment, because the whole point is that a real ``mongot`` accepts the foreign definition
     first. A fake that accepts it proves nothing about the one that matters.
@@ -613,8 +608,8 @@ class TestTheIndexNameCollisionFailsLoudly:
     ) -> None:
         """AT-101 -- the half that makes the guide's advice safe to follow against live data.
 
-        A migration attempt that discarded somebody's built index before reporting the conflict would be
-        worse than a silent wrong answer. The foreign index is still there afterwards, and the text index
+        A migration attempt must never discard an existing built index before reporting the conflict.
+        The foreign index is still there afterwards, and the text index
         this package would otherwise have created is not, because the conflict is raised while the specs
         are being checked and before anything is issued.
         """
@@ -634,18 +629,17 @@ class TestTheIndexNameCollisionFailsLoudly:
 
 
 class TestEveryForeignIndexIsGatedByWhatPlantingItNeeds:
-    """``AT-132`` / ``REQ-E-129`` — a tier covers the setup, not only the assertion.
+    """``AT-132`` — a tier covers the setup, not only the assertion.
 
-    Found by running the integration tier against an Atlas CLI local deployment, which ``conftest.py``
-    names as a supported target for ``MONGODB_ATLAS_URI``. Both ``[community-memory]`` parameters of
-    ``TestTheIndexNameCollisionFailsLoudly`` failed there with ``CanonicalModel: voyage-4-lite not
-    registered yet, supported models are: []`` — raised by ``create_search_index`` while planting the
-    foreign index, long before the assertion the tier had been chosen for.
+    An Atlas CLI local deployment, which ``conftest.py`` names as a supported target for
+    ``MONGODB_ATLAS_URI``, has no registered embedding model. Planting an ``autoEmbed`` index there fails in
+    ``create_search_index`` with ``CanonicalModel: voyage-4-lite not registered yet, supported models are:
+    []``, before any assertion runs. So the ``[community-memory]`` parameters of
+    ``TestTheIndexNameCollisionFailsLoudly`` need ``autoembed`` for the integration tier to run clean on
+    that deployment.
 
-    The reasoning that put them on ``integration`` was sound about the specs under test and silent about
-    the fixture, so the whole integration tier could not be run clean on its own documented deployment.
-    This grades the wiring instead of the reasoning: a parameter whose index embeds server-side is gated
-    on ``autoembed``, and one that does not is not. Needs no deployment, so it runs everywhere.
+    This checks the wiring directly: a parameter whose index embeds server-side is gated on ``autoembed``,
+    and one that does not is not. Needs no deployment, so it runs everywhere.
     """
 
     @staticmethod
@@ -679,7 +673,7 @@ class TestEveryForeignIndexIsGatedByWhatPlantingItNeeds:
 
 @pytest.mark.autoembed
 class TestTheNearMissNamesTheMissingFilters:
-    """``AT-101`` / ``REQ-E-101`` — the collision a reader of ``strands-mongodb-store`` will actually hit.
+    """``AT-101`` — the collision a reader of ``strands-mongodb-store`` will actually hit.
 
     Its index and this package's default index agree on the one field it declares: ``autoEmbed`` over
     ``content``, same model string. So on this path the comparator gets past the vector field and reports

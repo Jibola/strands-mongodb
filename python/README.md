@@ -27,11 +27,13 @@ memory module and never needs `pymongo-search-utils`. The one exception is
 `from strands_mongodb import *`, which walks `__all__` and therefore loads every module, the memory one
 included.
 
-The `Storage` protocol is the leverage point: the SDK accepts a single top-level `storage` on
+The `Storage` protocol is what makes this possible: the SDK accepts a single top-level `storage` on
 `Agent`, and five subsystems inherit it. One `MongoDBStorage` is therefore the backend for session
 management and context offloading. Each is still turned on with the SDK's own objects
 (`SnapshotSessionManager`, and `ContextOffloader` or `context_manager="auto"`), and neither needs a
 MongoDB-specific class.
+
+![strands-mongodb in a Strands agent: the SDK's session manager, context offloader and memory manager use MongoDBStorage and MongoDBMemoryStore, which store to MongoDB](https://raw.githubusercontent.com/mongodb/strands-mongodb/main/docs/images/architecture.png)
 
 **Already using another MongoDB backend for Strands?** Three exist: the archived `mongodb_memory` tool
 in `strands-agents-tools`, and the community `strands-mongodb-store` and `strands-mongodb-storage`
@@ -61,7 +63,7 @@ backend. It is metadata only. The extra you choose is what selects the dependenc
 ### Before the package reaches PyPI
 
 Nothing is published yet, so the commands above resolve to nothing. Until they do, install from this
-repository. The obvious URL fails twice over, and neither failure explains the other.
+repository. The plain `https://` URL fails for two separate reasons.
 
 The repository is private and MongoDB enforces SAML single sign-on, so an unauthenticated `https://`
 clone stops before pip ever sees a package:
@@ -89,10 +91,9 @@ This needs a GitHub account in the `mongodb` organization holding an SSH key aut
 sign-on. A CI runner needs a deploy key for the same reason. There is no anonymous path to this
 package until it is published.
 
-What you get is not a release. No release tag exists yet, so the version is derived from the distance
-since the first commit and moves every time `main` does -- an install from `main` reported
-`0.0.1.dev69+g20b0ea579` when this was written. Pin a commit for anything that has to resolve the same
-way twice, after the `.git` and before the fragment:
+What you get is not a release. No release tag exists yet, so the version is a development version of
+the form `0.0.1.devN+g<sha>`, counted from the first commit, and it changes every time `main` does. Pin
+a commit for anything that has to resolve the same way twice, after the `.git` and before the fragment:
 
 <!-- skip: the same private clone as above, against a commit this document does not pin for you -->
 ```bash
@@ -101,8 +102,7 @@ pip install 'strands-mongodb[all] @ git+ssh://git@github.com/mongodb/strands-mon
 
 ## Quickstart
 
-Both snippets below are run by the test suite from this file, so they are the versions that work rather
-than the versions that were written. Each reads its connection string from `MONGODB_URI` and its
+The test suite runs both snippets below directly from this file. Each reads its connection string from `MONGODB_URI` and its
 database from `MONGODB_DATABASE`, defaulting to `agents`.
 
 ### Storage
@@ -163,8 +163,8 @@ async def main() -> None:
         await store.initialize()  # creates the indexes; every other operation calls it too
         await store.add("Prefers metric units and a 24-hour clock.")
 
-        # Atlas embeds a new document after the write is acknowledged, around 15 seconds on the cluster
-        # this was measured against, so a search that runs immediately finds nothing rather than failing.
+        # Atlas embeds a new document asynchronously, after the write is acknowledged, so a search that
+        # runs immediately finds nothing rather than failing.
         for _ in range(30):
             found = await store.search("how should times be displayed for this person?")
             if found:
@@ -273,13 +273,14 @@ An injected client also carries its own event loop affinity, which matters if yo
 your connection string, so TLS settings, timeouts and read preferences all reach the driver without an
 injected client.
 
-<!-- app-name -->
-A client this package builds announces itself to the server with `appName`, which server logs,
-`$currentOp` and the profiler all show. With no `appName` set, the value is `strands-mongodb`. If you
-set one, in the connection string or in `client_args`, you get `<yours>-strands-mongodb`, so your own
-name stays first. A value that already ends in the suffix is sent unchanged. pymongo limits `appName` to 128 bytes, so a
-value that would not fit with the suffix is shortened until it does. An injected `client` keeps whatever
-`appName` you gave it, unchanged: the driver fixes the value when the client is built.
+<!-- driver-info -->
+Every client this package uses identifies the package in its connection handshake, the way MongoDB's
+handshake specification asks a library that wraps the driver to: it adds `Strands-MongoDB` and the installed
+version to the driver name and version the server records, so `PyMongo|c|async|Strands-MongoDB` and
+`4.17.0|0.1.0`. Server logs and `$currentOp` show this as `clientMetadata.driver`. A client this package
+builds gets it at construction; an injected `client` gets it through pymongo's `append_metadata`, once.
+`appName` stays yours: the package never sets, defaults or changes it, whether you give it in the
+connection string, in `client_args` or on an injected client.
 
 ### Authentication mechanisms
 
@@ -339,7 +340,7 @@ and behave as they do for any store, with one exception noted below.
 | `filter` | `dict[str, Any]` | no | | Extra search predicate, composed as a narrowing conjunction. It cannot widen what this store can read. Paths must appear in `filter_fields`. |
 | `min_score` | `float` | no | | Relevance floor. Applied after the search, so it drops results without changing their order. |
 | `max_score` | `float` | no | | Relevance ceiling. Mutually exclusive with `min_score`. |
-| `ttl_seconds` | `int` | no | | How long a memory lives, measured from its own `created_at`. Absent means it never expires and stamps no field; `0` means "at the next sweep" and is a real value, not a disabled one; a negative value raises `ValueError`. Set on insert, so re-remembering a fact does not extend it. Needs no `ensure_indexes()` call here — `initialize()` already creates the TTL index. |
+| `ttl_seconds` | `int` | no | | How long a memory lives, measured from its own `created_at`. Absent means it never expires and stamps no field; `0` means "at the next sweep" and is a real value, not a disabled one; a negative value raises `ValueError`. Set on insert, so re-remembering a fact does not extend it. Needs no `ensure_indexes()` call here: `initialize()` already creates the TTL index. |
 
 ### `MongoDBSearchQuery`
 
@@ -421,6 +422,8 @@ registered embedding model rejects the `autoEmbed` index at creation, and a stor
 falls back to the text tier and says so in a warning. Both of those are visible only in your logs, which
 is worth knowing before you conclude that recall is bad.
 
+![How search_type auto picks a tier: hybrid if it is ready, then vector, then text, otherwise StorageError](https://raw.githubusercontent.com/mongodb/strands-mongodb/main/docs/images/search-tiers.png)
+
 `regex` is not here. `SearchType` is a `Literal` of the values that actually run, so a type checker
 rejects it today rather than a runtime raising on it later.
 
@@ -439,7 +442,7 @@ equally, a document ranked first by both scores about `0.033`; one ranked first 
 about `0.016`; everything else is smaller. So a `min_score` of `0.7`, a perfectly ordinary cosine floor,
 removes every result.
 
-Because that failure is silent — an empty list is what "no matches" looks like too — a store on `"auto"`
+Because that failure is silent (an empty list is also what "no matches" looks like), a store on `"auto"`
 with either bound configured stays on the vector tier and logs that it did. Asking for `search_type="hybrid"`
 by name overrides that: the bound is applied to the fused score, on the scale above, because you asked
 for this tier specifically.
@@ -465,9 +468,8 @@ await collection.update_one(
 ```
 
 So in `0.1.0` the manual path is only half of a `MongoDBMemoryStore` configuration: the read half works
-and the write half is the caller's. The
-AutoEmbeddings default is unaffected, and is the supported memory configuration — there mongot embeds the
-indexed `content` field and the document carries no vector by design.
+and the write half is the caller's. The AutoEmbeddings default is unaffected, and is the supported memory
+configuration: there mongot embeds the indexed `content` field and the document carries no vector by design.
 
 ### Reserved metadata keys
 
@@ -500,8 +502,10 @@ server-side row filter, so a memory lands in the right scope because `add` put i
 because `search` asked for it. The package holds that line in four places: it stamps `scope` itself and a
 caller cannot set it through `filter` or `metadata`; an absent scope resolves to a distinct sentinel
 rather than to no predicate; a caller `filter` composes as a narrowing conjunction and cannot widen the
-read; and `delete()` reaches exactly as far as `search()` does. Those are `REQ-E-046` through
-`REQ-E-051`, and the tests for them run two stores in one collection and check both directions.
+read; and `delete()` reaches exactly as far as `search()` does. The tests for these run two stores in
+one collection and check isolation in both directions.
+
+![What every memory write and read goes through: a write is stamped with scope and store name and deduplicated by content hash; a read passes the filter guard and is limited to the store's scope](https://raw.githubusercontent.com/mongodb/strands-mongodb/main/docs/images/memory-guards.png)
 
 If a tenant boundary is a compliance boundary, use one of the first two rows.
 
@@ -545,8 +549,7 @@ store's name, narrowed by any configured `filter`. A store cannot delete what it
 consequences are worth stating rather than leaving to be discovered:
 
 - **Erasing a scope takes one call per store in it.** `delete_all()` empties one store's view, not the
-  whole scope, because `store_name` is part of the predicate. Whether a scope-wide erasure should be a
-  single call is still open.
+  whole scope, because `store_name` is part of the predicate. There is no single call that erases a whole scope.
 - **`0` does not mean "no such memory."** A well-formed id gets `0` whether it names a memory already
   deleted, one in another scope, or one in another store in this scope. Telling those apart would
   answer whether an id exists somewhere the caller cannot read.
@@ -633,9 +636,9 @@ wait for a build, so it never holds up the operation that triggers it.
 
 ### Privileges
 
-Measured on Atlas 8.0.30 against the built-in roles. It was assumed that a `readWrite` user cannot create
-indexes; that was wrong on this server, and a test rechecks the table against whatever deployment you
-point the contract tier at, because role definitions belong to the server and can change.
+The table shows MongoDB's built-in `read` and `readWrite` roles as Atlas 8.0.30 defines them. Role
+definitions belong to the server and can change, so a test rechecks the table against whatever deployment
+the contract tier points at.
 
 <!-- privileges -->
 | Action | This package needs it for | `read` | `readWrite` |
@@ -664,13 +667,11 @@ collation before anything else, because a collection that folds case cannot keep
 later, which is the intended direction: the alternative is a store that runs and compares strings by rules
 nothing declared.
 
-Self-managed MongoDB reads the same. Measured on 6.0.28, 7.0.40 and 8.3.8 started with `--auth`, none of
-them running a search process: all nine rows that existed then are identical to Atlas, `createSearchIndexes`
-included. `listCollections` arrived afterwards and is measured on 8.0.32 only — though every row is read out
-of the deployment's own `rolesInfo` by the contract tier, so a version that grants any of them differently
-fails a test rather than misleading a reader.
-A role says what the server would authorize, not what it can do, so `readWrite` carries that action on a
-deployment with no search at all.
+Self-managed MongoDB grants the same. On 6.0.28, 7.0.40 and 8.3.8, started with `--auth` and with no search
+process, every row other than `listCollections` matches Atlas, `createSearchIndexes` included, and
+`listCollections` matches on 8.0.32. The contract tier reads every row from the deployment's own `rolesInfo`,
+so a version that grants any of them differently fails a test. A role says what the server would authorize,
+not what it can do, so `readWrite` carries `createSearchIndexes` on a deployment with no search at all.
 
 Two notes for running as such a user. `rolesInfo`, which the test above uses to read the table back, needs
 `viewRole`, and no data-access role grants it, so that one test skips under a least-privilege credential
@@ -681,18 +682,17 @@ uses `remove`, which `readWrite` grants.
 ## Limits
 
 Everything a caller runs into that this package does not remove. Each row says what you can do about it,
-and the last column names the requirement or the id where the detail lives. Where it names a
-constant instead, the constant may be private to the package: it is named so the value can be traced,
-not so it can be imported.
+and the last column names the method, class or constant it concerns. A constant named there may be private
+to the package: it is named so the value can be traced, not so it can be imported.
 
 <!-- limits -->
 | Limit | Where it bites, and what you can do | Source |
 |---|---|---|
-| One client per event loop | A new loop means a new connection and a new handshake. A synchronous `Agent` calling `invoke()` in a loop pays that per call. Drive the package from one loop, through the SDK's `invoke_async`. | `REQ-E-017a` |
-| The connection resolves per operation | An operation after `close()` opens a fresh pool rather than raising, so a mistaken `close()` costs a connection instead of an error. Call `close()` once, at process shutdown. | `REQ-E-017b` |
-| `close()` is scoped to the config | Closing one store's connection closes the pool that every store built from the same config is sharing. Siblings with an operation in flight are the ones that notice. | `REQ-E-017c` |
-| A memory is not searchable when `add()` returns | Atlas embeds and indexes asynchronously, about 15 s on the cluster this was developed against. Poll for the memory rather than reading straight back. | `REQ-E-091` |
-| An empty search result is ambiguous | `MemoryManager` turns a failed store into a warning and returns what survived, so zero hits can mean zero matches or a search that failed. Watch for `store search failed` in your logs. | `store search failed` |
+| One client per event loop | A new loop means a new connection and a new handshake. A synchronous `Agent` calling `invoke()` in a loop pays that per call. Drive the package from one loop, through the SDK's `invoke_async`. | `MongoDBConfig` |
+| The connection resolves per operation | An operation after `close()` opens a fresh pool rather than raising, so a mistaken `close()` costs a connection instead of an error. Call `close()` once, at process shutdown. | `MongoDBStorage.close()` |
+| `close()` is scoped to the config | Closing one store's connection closes the pool that every store built from the same config is sharing. Siblings with an operation in flight are the ones that notice. | `MongoDBMemoryStore.close()` |
+| A memory is not searchable when `add()` returns | Atlas embeds and indexes asynchronously, after the write is acknowledged. Poll for the memory rather than reading straight back. | `MongoDBMemoryStore.add()` |
+| An empty search result is ambiguous | `MemoryManager` turns a failed store into a warning and returns what survived, so zero hits can mean zero matches or a search that failed. Watch for `store search failed` in your logs. | `MongoDBMemoryStore.search()` |
 | Document size | 16 MB, the server's `BSON` ceiling. Checked before the write, so you get the SDK's `StorageError` naming the size instead of a driver error. Chunk, or store a pointer. | `MAX_DOCUMENT_BYTES` |
 | Storage key length | 1024 bytes, which keeps a key inside an index entry. Same early `StorageError`. | `MAX_KEY_BYTES` |
 | `list()` is unpaginated | The SDK's protocol takes a prefix and no cursor, so a prefix matching a million keys returns a million keys. Use narrower prefixes, or `namespace()`. | `Storage.list()` |
@@ -800,9 +800,9 @@ configuration you chose, so it is recorded.
 creates or registers, on the span that is current at that moment. That is the store's constructor, if you
 build the store inside a traced block, or the first operation on a new event loop, if you call a
 synchronous `Agent` repeatedly and each call runs a fresh loop. On the memory store that first operation
-does its setup in `memory.initialize`, so the event lands on that span rather than on `memory.search`. A store built at import time has no span to
-record on, and its first operation takes over the pool construction built, which creates nothing. The
-driver connects lazily, so the cost of connecting sits inside the first operation's span either way.
+does its setup in `memory.initialize`, so the event lands on that span rather than on `memory.search`. A
+store built at import time has no span to record on, and its first operation takes over the pool that
+construction built, which creates nothing. The driver connects lazily, so the cost of connecting sits inside the first operation's span either way.
 
 Log records keep their messages, levels and logger names, which are the module names under
 `strands_mongodb`, so a handler on `logging.getLogger("strands_mongodb")` sees every one. Each record
@@ -813,7 +813,7 @@ about one. The event names are stable:
 | `strands_mongodb_event` | Level | Logged when |
 |---|---|---|
 | `retry_writes_disabled` | `WARNING` | The client has retryable writes turned off |
-| `attribution_not_visible` | `DEBUG` | An injected client did not take the Strands handshake attribution |
+| `attribution_not_visible` | `DEBUG` | An injected client did not take the Strands-MongoDB driver attribution |
 | `closed_loop_client_dropped` | `DEBUG` | An event loop closed before its client could be closed |
 | `reserved_key_collision` | `WARNING` | A stored document's metadata uses a key the store sets on every result |
 | `no_search_setup` | `WARNING` | The deployment has no Atlas Search, so no search index is set up |
@@ -854,7 +854,7 @@ connecting to anything.
 | `pymongo-search-utils` | >= 0.3.0, pulled in by the `memory` extra (and so by `all`) only |
 | `typing-extensions` | >= 4.13.2 |
 | `opentelemetry-api` | >= 1.30.0. The API only: this package installs no SDK, provider or exporter |
-| MongoDB | Any deployment serves storage. The text tier needs Atlas Search; the vector tier needs Atlas or an Atlas CLI local deployment. The default embedding path also needs a model registered on the cluster, measured present on Atlas and absent on a local `mongot` 8.3.8. |
+| MongoDB | Any deployment serves storage. The text tier needs Atlas Search; the vector tier needs Atlas or an Atlas CLI local deployment. The default embedding path also needs an embedding model registered on the deployment. An Atlas CLI local deployment (`mongot` 8.3.8) has none, so use the manual path or the text tier there. |
 
 ## Development
 
@@ -906,8 +906,13 @@ reason on a cluster that has it. For the widest coverage:
 | `MONGODB_ATLAS_URI` | Atlas CLI local, `mongot`, no registered model | An `autoEmbed` index rejected at creation, and the degraded default that follows |
 | `MONGODB_AUTOEMBED_URI` | Atlas cluster with a registered model | The default embedding mode, end to end |
 
+For the last row, `python scripts/atlas_ci_cluster.py up` creates a throwaway Atlas cluster with what automated
+embedding needs and prints its connection string; `down <name>` deletes it. It is what CI runs, and it needs
+the Atlas CLI, logged in, with `MONGODB_ATLAS_PROJECT_ID` set to the project to create it in.
+
 Each test session writes to a database named `strands_mongodb_test_<random>` and drops it at the
-end, so pointing `MONGODB_URI` at a deployment you care about is survivable but still not advised.
+end, so pointing `MONGODB_URI` at a deployment you care about keeps the tests out of its existing
+databases, but is still not recommended.
 
 ## License
 
