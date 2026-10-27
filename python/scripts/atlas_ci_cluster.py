@@ -62,7 +62,12 @@ def _atlas(arguments: Sequence[str]) -> str:
     Raises:
         subprocess.CalledProcessError: If the command fails. Its stderr is passed through to ours.
     """
-    completed = subprocess.run(["atlas", *arguments], check=True, capture_output=True, text=True)
+    try:
+        completed = subprocess.run(["atlas", *arguments], check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as error:
+        # Captured so `down` can recognise CLUSTER_NOT_FOUND, and printed so a CI log shows why.
+        print(f"atlas {' '.join(arguments[:2])} failed: {error.stderr or error.stdout}", file=sys.stderr)
+        raise
     return completed.stdout
 
 
@@ -174,17 +179,15 @@ def _wait_for_search(uri: str) -> None:
         client.close()
 
 
-def _publish(name: str, uri: str, password: str) -> None:
+def _publish(name: str, uri: str) -> None:
     """Hand the cluster to the rest of the run: GitHub step outputs in CI, export lines otherwise.
 
     Args:
         name: The cluster name.
         uri: Its connection string.
-        password: The database user's password, masked first.
     """
     outputs = os.environ.get("GITHUB_OUTPUT")
     if outputs:
-        print(f"::add-mask::{password}")
         print(f"::add-mask::{uri}")
         with open(outputs, "a", encoding="utf-8") as handle:
             handle.write(f"name={name}\nuri={uri}\n")
@@ -217,6 +220,9 @@ def up(run: Runner = _atlas, *, now: datetime.datetime | None = None) -> str:
     if not name.startswith(PREFIX):
         raise ValueError(f"ATLAS_CI_CLUSTER must start with {PREFIX!r}, so that down and the reaper can find it")
     password = secrets.token_hex(24)
+    if os.environ.get("GITHUB_OUTPUT"):
+        # Masked before any command runs, so an error message that echoed it would show it masked.
+        print(f"::add-mask::{password}")
     delete_after = (now + LIFETIME).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
@@ -242,7 +248,7 @@ def up(run: Runner = _atlas, *, now: datetime.datetime | None = None) -> str:
     described = json.loads(run(["clusters", "connectionStrings", "describe", name, "-o", "json"]))
     uri = connection_uri(described["standardSrv"], name, password)
     _wait_for_search(uri)
-    _publish(name, uri, password)
+    _publish(name, uri)
     return name
 
 

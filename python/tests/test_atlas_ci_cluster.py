@@ -108,8 +108,10 @@ class TestWhatUpCreates:
         printed = capsys.readouterr().out
         outputs = (tmp_path / "outputs").read_text()
 
-        assert printed.splitlines()[-3:-1] == [f"::add-mask::{password}", f"::add-mask::{_uri(outputs)}"]
-        assert printed.count(password) == 2
+        lines = printed.splitlines()
+        assert lines[0] == f"::add-mask::{password}", "the password must be masked before any command runs"
+        assert f"::add-mask::{_uri(outputs)}" in lines
+        assert [line for line in lines if password in line] == [lines[0], f"::add-mask::{_uri(outputs)}"]
         assert "name=strands-ci-42-1\n" in outputs and password in _uri(outputs)
 
     def test_a_cluster_left_over_from_an_earlier_run_is_deleted_first(
@@ -180,3 +182,20 @@ def test_the_connection_string_carries_the_user_and_refuses_anything_but_srv(scr
 
 def _uri(outputs: str) -> str:
     return next(line.removeprefix("uri=") for line in outputs.splitlines() if line.startswith("uri="))
+
+
+def test_a_failing_command_shows_what_the_atlas_cli_said(
+    script: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AT-233. A failure without the CLI's own message cannot be diagnosed from a CI log."""
+
+    def failing(*arguments: Any, **options: Any) -> Any:
+        raise subprocess.CalledProcessError(
+            1, ["atlas", "clusters", "create"], output="", stderr="Error: INVALID_ATTRIBUTE"
+        )
+
+    monkeypatch.setattr(script.subprocess, "run", failing)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        script._atlas(["clusters", "create"])
+    assert "INVALID_ATTRIBUTE" in capsys.readouterr().err
