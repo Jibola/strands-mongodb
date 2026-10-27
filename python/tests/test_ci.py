@@ -2301,7 +2301,7 @@ class TestTheThrowawayClusterIsAlwaysDeleted:
         """AT-234 -- so the teardown can find a cluster that ``up`` created and then failed on."""
         name = str((self._job(workflow).get("env") or {}).get("ATLAS_CI_CLUSTER", ""))
 
-        assert name.startswith("strands-ci-") and "github.run_id" in name and "github.run_attempt" in name
+        assert name.startswith("sm-ci-") and "github.run_id" in name and "github.run_attempt" in name
 
     def test_the_cloud_credentials_reach_only_the_steps_that_create_and_delete(self, workflow: dict[str, Any]) -> None:
         """AT-234 -- the test step needs a connection string, not the power to create clusters."""

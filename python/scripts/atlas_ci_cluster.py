@@ -3,7 +3,7 @@
 CI runs this around the Atlas tiers, and you can run it the same way locally::
 
     python scripts/atlas_ci_cluster.py up                 # prints the name and the connection string
-    python scripts/atlas_ci_cluster.py down strands-ci-<suffix>
+    python scripts/atlas_ci_cluster.py down sm-ci-<suffix>
 
 ``up`` creates an M10 replica set on the newest MongoDB release, with storage auto-scaling on (automated
 embedding requires it), a database user and an access-list entry for this machine's address. The user and
@@ -29,6 +29,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -37,10 +38,13 @@ import time
 from collections.abc import Callable, Sequence
 from typing import Any, Final
 
-__all__ = ["LIFETIME", "PREFIX", "cluster_config", "connection_uri", "expired", "main"]
+__all__ = ["LIFETIME", "PREFIX", "check_name", "cluster_config", "connection_uri", "expired", "main"]
 
-PREFIX: Final = "strands-ci-"
+PREFIX: Final = "sm-ci-"
 """Name prefix of every cluster this script creates, and the only clusters it ever deletes."""
+
+_MAX_NAME: Final = 23
+"""Atlas builds the cluster's hostname from the first 23 characters of its name."""
 
 LIFETIME: Final = datetime.timedelta(hours=3)
 """How long a cluster, its user and its access-list entry may live. A full run takes under an hour."""
@@ -69,6 +73,24 @@ def _atlas(arguments: Sequence[str]) -> str:
         print(f"atlas {' '.join(arguments[:2])} failed: {error.stderr or error.stdout}", file=sys.stderr)
         raise
     return completed.stdout
+
+
+def check_name(name: str) -> None:
+    """Refuse a name this script does not own or Atlas would reject.
+
+    Args:
+        name: The cluster name.
+
+    Raises:
+        ValueError: If it lacks :data:`PREFIX`, is longer than 23 characters, holds anything but lowercase
+            letters, digits and dashes, or ends in a dash (Atlas rejects a hostname prefix ending in one).
+    """
+    if not name.startswith(PREFIX):
+        raise ValueError(f"{name!r} does not start with {PREFIX!r}, so this script does not own it")
+    if len(name) > _MAX_NAME or name.endswith("-") or not re.fullmatch(r"[a-z0-9-]+", name):
+        raise ValueError(
+            f"{name!r} must be at most {_MAX_NAME} lowercase letters, digits and dashes, not ending in a dash"
+        )
 
 
 def cluster_config(name: str, *, region: str = "US_EAST_1") -> dict[str, Any]:
@@ -208,7 +230,7 @@ def up(run: Runner = _atlas, *, now: datetime.datetime | None = None) -> str:
         The cluster name.
 
     Raises:
-        ValueError: If ``ATLAS_CI_CLUSTER`` names a cluster without this script's prefix.
+        ValueError: If ``ATLAS_CI_CLUSTER`` is not a name :func:`check_name` accepts.
     """
     now = now or datetime.datetime.now(datetime.timezone.utc)
     listed = json.loads(run(["clusters", "list", "-o", "json"]) or "{}").get("results", [])
@@ -217,8 +239,7 @@ def up(run: Runner = _atlas, *, now: datetime.datetime | None = None) -> str:
         run(["clusters", "delete", stale, "--force"])
 
     name = os.environ.get("ATLAS_CI_CLUSTER") or f"{PREFIX}{now.strftime('%Y%m%d%H%M%S')}"
-    if not name.startswith(PREFIX):
-        raise ValueError(f"ATLAS_CI_CLUSTER must start with {PREFIX!r}, so that down and the reaper can find it")
+    check_name(name)
     password = secrets.token_hex(24)
     if os.environ.get("GITHUB_OUTPUT"):
         # Masked before any command runs, so an error message that echoed it would show it masked.
@@ -260,11 +281,10 @@ def down(name: str, run: Runner = _atlas) -> None:
         run: Runs one Atlas CLI command. Replaced in tests.
 
     Raises:
-        ValueError: If ``name`` is not a cluster this script creates.
+        ValueError: If ``name`` is not a name :func:`check_name` accepts.
         subprocess.CalledProcessError: If deleting the cluster fails for a reason other than its absence.
     """
-    if not name.startswith(PREFIX):
-        raise ValueError(f"refusing to delete {name!r}: this script only deletes clusters named {PREFIX}*")
+    check_name(name)
     try:
         run(["clusters", "delete", name, "--force"])
     except subprocess.CalledProcessError as error:

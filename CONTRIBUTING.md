@@ -111,9 +111,9 @@ embedding should say whether the author ran `autoembed` locally.
 ### The cluster the `Atlas tiers` job creates
 
 The job runs [`python/scripts/atlas_ci_cluster.py`](python/scripts/atlas_ci_cluster.py), which you can also
-run yourself. `up` creates an M10 named `strands-ci-<suffix>`, a database user and an access-list entry for
+run yourself. `up` creates an M10 named `sm-ci-<suffix>`, a database user and an access-list entry for
 the machine running it (both expire after three hours), waits until the search process answers, and prints
-the connection string. `down <name>` deletes the cluster and the user. `up` also deletes any `strands-ci-`
+the connection string. `down <name>` deletes the cluster and the user. `up` also deletes any `sm-ci-`
 cluster older than three hours, in case a run stopped before its teardown.
 
 It authenticates the way the Atlas CLI does: a logged-in `atlas auth login` session locally, and in CI a

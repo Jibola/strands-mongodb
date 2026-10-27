@@ -406,7 +406,7 @@ jobs:
     env:
       # Named from the run before anything is created, so the teardown step can delete it even when
       # `up` fails half way.
-      ATLAS_CI_CLUSTER: strands-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      ATLAS_CI_CLUSTER: sm-ci-${{ github.run_id }}-${{ github.run_attempt }}
       DO_NOT_TRACK: '1'
       MONGODB_ATLAS_SKIP_UPDATE_CHECK: 'yes'
 

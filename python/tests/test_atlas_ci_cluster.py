@@ -56,7 +56,7 @@ class FakeAtlas:
         if call[:2] == ["clusters", "create"]:
             self.created = json.loads(Path(call[call.index("--file") + 1]).read_text())
         if call[:3] == ["clusters", "connectionStrings", "describe"]:
-            return json.dumps({"standardSrv": "mongodb+srv://strands-ci-1.abcde.mongodb.net"})
+            return json.dumps({"standardSrv": "mongodb+srv://sm-ci-1.abcde.mongodb.net"})
         return ""
 
     def named(self, *prefix: str) -> list[list[str]]:
@@ -68,7 +68,7 @@ def atlas(script: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     """A fake CLI, no real search wait, and GitHub's output file in a temporary directory."""
     monkeypatch.setattr(script, "_wait_for_search", lambda uri: None)
     monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "outputs"))
-    monkeypatch.setenv("ATLAS_CI_CLUSTER", "strands-ci-42-1")
+    monkeypatch.setenv("ATLAS_CI_CLUSTER", "sm-ci-42-1")
     return FakeAtlas()
 
 
@@ -81,7 +81,7 @@ class TestWhatUpCreates:
         script.up(atlas, now=NOW)
 
         config = atlas.created
-        assert config is not None and config["name"] == "strands-ci-42-1"
+        assert config is not None and config["name"] == "sm-ci-42-1"
         assert config["versionReleaseSystem"] == "CONTINUOUS"
         assert config["terminationProtectionEnabled"] is False
         region = config["replicationSpecs"][0]["regionConfigs"][0]
@@ -95,7 +95,7 @@ class TestWhatUpCreates:
         (user,) = atlas.named("dbusers", "create")
         (entry,) = atlas.named("accessLists", "create")
         assert user[user.index("--deleteAfter") + 1] == expiry
-        assert user[user.index("--scope") + 1] == "strands-ci-42-1"
+        assert user[user.index("--scope") + 1] == "sm-ci-42-1"
         assert "--currentIp" in entry and entry[entry.index("--deleteAfter") + 1] == expiry
 
     def test_the_password_is_masked_before_it_is_handed_on(
@@ -112,7 +112,7 @@ class TestWhatUpCreates:
         assert lines[0] == f"::add-mask::{password}", "the password must be masked before any command runs"
         assert f"::add-mask::{_uri(outputs)}" in lines
         assert [line for line in lines if password in line] == [lines[0], f"::add-mask::{_uri(outputs)}"]
-        assert "name=strands-ci-42-1\n" in outputs and password in _uri(outputs)
+        assert "name=sm-ci-42-1\n" in outputs and password in _uri(outputs)
 
     def test_a_cluster_left_over_from_an_earlier_run_is_deleted_first(
         self, script: ModuleType, atlas: FakeAtlas
@@ -120,21 +120,21 @@ class TestWhatUpCreates:
         old = (NOW - script.LIFETIME - datetime.timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
         recent = (NOW - datetime.timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
         atlas.clusters = [
-            {"name": "strands-ci-1-1", "createDate": old},
-            {"name": "strands-ci-2-1", "createDate": recent},
+            {"name": "sm-ci-1-1", "createDate": old},
+            {"name": "sm-ci-2-1", "createDate": recent},
             {"name": "production", "createDate": old},
         ]
 
         script.up(atlas, now=NOW)
 
-        assert atlas.named("clusters", "delete") == [["clusters", "delete", "strands-ci-1-1", "--force"]]
+        assert atlas.named("clusters", "delete") == [["clusters", "delete", "sm-ci-1-1", "--force"]]
 
     def test_a_name_without_the_prefix_is_refused(
         self, script: ModuleType, atlas: FakeAtlas, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("ATLAS_CI_CLUSTER", "production")
 
-        with pytest.raises(ValueError, match="strands-ci-"):
+        with pytest.raises(ValueError, match="does not own"):
             script.up(atlas, now=NOW)
         assert atlas.named("clusters", "create") == []
 
@@ -145,37 +145,37 @@ class TestWhatDownDeletes:
     def test_the_cluster_and_its_user_are_deleted(self, script: ModuleType) -> None:
         atlas = FakeAtlas()
 
-        script.down("strands-ci-42-1", atlas)
+        script.down("sm-ci-42-1", atlas)
 
         assert atlas.calls == [
-            ["clusters", "delete", "strands-ci-42-1", "--force"],
-            ["dbusers", "delete", "strands-ci-42-1", "--force"],
+            ["clusters", "delete", "sm-ci-42-1", "--force"],
+            ["dbusers", "delete", "sm-ci-42-1", "--force"],
         ]
 
     def test_a_cluster_without_the_prefix_is_never_deleted(self, script: ModuleType) -> None:
         atlas = FakeAtlas()
 
-        with pytest.raises(ValueError, match="refusing"):
+        with pytest.raises(ValueError, match="does not own"):
             script.down("production", atlas)
         assert atlas.calls == []
 
     def test_a_cluster_that_was_never_created_is_not_an_error(self, script: ModuleType) -> None:
         atlas = FakeAtlas(fail={"clusters delete": "Error: CLUSTER_NOT_FOUND", "dbusers delete": "not found"})
 
-        script.down("strands-ci-42-1", atlas)
+        script.down("sm-ci-42-1", atlas)
 
     def test_any_other_delete_failure_is_reported(self, script: ModuleType) -> None:
         atlas = FakeAtlas(fail={"clusters delete": "Error: UNEXPECTED_ERROR"})
 
         with pytest.raises(subprocess.CalledProcessError):
-            script.down("strands-ci-42-1", atlas)
+            script.down("sm-ci-42-1", atlas)
 
 
 def test_the_connection_string_carries_the_user_and_refuses_anything_but_srv(script: ModuleType) -> None:
     """AT-233."""
-    uri = script.connection_uri("mongodb+srv://c.abcde.mongodb.net", "strands-ci-1", "ab12")
+    uri = script.connection_uri("mongodb+srv://c.abcde.mongodb.net", "sm-ci-1", "ab12")
 
-    assert uri == "mongodb+srv://strands-ci-1:ab12@c.abcde.mongodb.net/?retryWrites=true&w=majority"
+    assert uri == "mongodb+srv://sm-ci-1:ab12@c.abcde.mongodb.net/?retryWrites=true&w=majority"
     with pytest.raises(ValueError):
         script.connection_uri("mongodb://c.abcde.mongodb.net", "u", "p")
 
@@ -199,3 +199,19 @@ def test_a_failing_command_shows_what_the_atlas_cli_said(
     with pytest.raises(subprocess.CalledProcessError):
         script._atlas(["clusters", "create"])
     assert "INVALID_ATTRIBUTE" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("name", ["sm-ci-40560367215-1", "sm-ci-20261027182922"])
+def test_a_valid_name_passes(script: ModuleType, name: str) -> None:
+    """AT-233. Atlas builds the hostname from the first 23 characters of the name."""
+    script.check_name(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["strands-ci-40560367215-1", "sm-ci-123456789012345678", "production", "sm-ci-40560367215-"],
+)
+def test_a_name_atlas_would_reject_or_this_script_does_not_own_is_refused(script: ModuleType, name: str) -> None:
+    """AT-233. Too long, a hostname prefix ending in a dash, or not this script's prefix."""
+    with pytest.raises(ValueError):
+        script.check_name(name)
