@@ -10,16 +10,14 @@ __all__ = ["missing_extra"]
 def missing_extra(extra: str, error: ImportError, *, module: str) -> NoReturn:
     """Re-raise an import failure as a message naming the extra that fixes it.
 
-    A bare ``pip install strands-mongodb`` installs no runtime dependencies, so importing a
-    backend without its extra otherwise surfaces as a bare ``ModuleNotFoundError`` for
-    ``pymongo`` or ``strands`` that gives the caller nothing to act on.
+    A bare ``pip install strands-mongodb`` installs no runtime dependencies, so without this a backend
+    imported without its extra fails with a ``ModuleNotFoundError`` that does not say what to install.
 
-    ``module`` is passed rather than derived from ``extra``, because the two diverge:
-    ``strands_mongodb.memory_store`` is installed by ``strands-mongodb[memory]``. Every caller
-    passes its own ``__name__``, so the path in the message is the path that failed.
+    ``module`` is passed rather than derived from ``extra`` because the two names differ:
+    ``strands_mongodb.memory_store`` needs the ``memory`` extra.
 
     Args:
-        extra: The extra providing this surface's dependencies -- ``storage`` or ``memory``.
+        extra: The extra providing this surface's dependencies: ``storage`` or ``memory``.
         error: The original import failure.
         module: The importing module's ``__name__``.
 

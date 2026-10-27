@@ -1,14 +1,13 @@
 """Caller-filter validation and scope composition, shared by the search paths.
 
-Three guards and one composer, all pure functions over plain mappings. No pymongo import, no I/O, nothing
-that needs a deployment, which is deliberate: this is the code path a cross-scope read would run through, and
-a security guard that can only be tested against a live cluster gets tested less often.
+Three guards and one composer, all pure functions over plain mappings. Nothing here imports pymongo or
+does I/O, so the security guards can be tested without a deployment.
 
-The guards are independent on purpose. ``REQ-E-050`` is about what a key *is*, ``REQ-E-174`` is
-about what a value *does*, and ``REQ-E-049`` is about whether the index declared it. Collapsing them into
-one pass would produce one message for three unrelated problems with three unrelated remedies.
+The guards are separate because they answer different questions with different remedies: what a key
+is (a string with no leading ``$``), what a value does (no regex), and whether the index declared the
+field. One combined pass would give one message for three unrelated problems.
 
-Private, like ``_client``. The validated filter shape is a promise; these function signatures are not.
+Private module: the validated filter shape is a promise, these signatures are not.
 """
 
 from __future__ import annotations
@@ -16,8 +15,7 @@ from __future__ import annotations
 import copy
 import re
 
-# Imported at runtime rather than under ``TYPE_CHECKING``, and that is the fix for one of ``AT-179``'s two
-# bypasses: the operator guard recurses on what it can prove is a mapping, and ``dict`` is not that test.
+# Imported at runtime, not under ``TYPE_CHECKING``: the guards' ``isinstance`` checks need ``Mapping``.
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -26,46 +24,30 @@ if TYPE_CHECKING:
 
 __all__ = ["compose", "validate"]
 
-# Field paths the vector index definition always declares filterable, before `filter_fields`. Named
-# here for documentation only: callers pass the set in, so the index definition stays the one authority.
+# Fields the vector index always declares filterable, before `filter_fields`. `_indexes` builds the
+# declared set from this, and `validate` takes that set as an argument rather than reading this.
 BAKED_IN_FILTER_FIELDS = ("scope", "store_name")
 
-# `bson.Regex`, matched by name instead of by import (``REQ-E-174``). This module states at the top that it
-# imports no part of pymongo, and that is worth more than the two characters an import would save: a guard
-# every scope check runs through is a guard that has to be cheap to test, and `bson` is a compiled
-# extension in the default install. The MRO is walked rather than `type(value)` compared, so a subclass
-# cannot slip past. Verified against pymongo 4.x, where the class is `bson.regex.Regex`.
+# `bson.Regex`, matched by name so this module needs no pymongo import. The MRO is walked so a subclass
+# cannot slip past. In pymongo 4.x the class is `bson.regex.Regex`.
 _REGEX_TYPE_NAMES = frozenset({"bson.regex.Regex"})
 
 
 def _reject_operator_keys(value: Any) -> None:
-    """Raise if any key at any depth is ``$``-prefixed or not a string (``REQ-E-050``).
+    """Raise if any key at any depth is ``$``-prefixed or not a string.
 
-    MongoDB's own ``_validate_filter``, byte-identical in
-    ``langgraph-checkpoint-mongodb/.../utils.py:46`` and ``langgraph-store-mongodb/.../base.py:49``,
-    with one difference: it recurses into ``dict`` values only, and this recurses into lists and tuples
-    too. Measured against both copies, ``{"a": [{"$where": "sleep(1000)"}]}`` passes them, and
-    ``REQ-E-050`` says *at any depth*.
+    Walks every mapping, list and tuple, which are the only containers bson encodes. A dict inside a list
+    is an equality operand to ``$match`` and cannot act as operators, but that is the server's guarantee,
+    not this function's, so lists are walked too.
 
-    That extension is defense in depth rather than a patched vulnerability: probed on
-    MongoDB 8.3.8, a dict inside a list is an equality operand and matches nothing, and every construct
-    that would read it as operators is a ``$`` key already rejected here. It is closed because that
-    safety is a property of ``$match`` rather than of this function.
+    Only keys are checked: a key is what MQL dispatches on, and a value is data (the string ``"$where"``
+    as a value is just a string). The one value that is not data is a regex, which
+    :func:`_reject_regex_values` refuses. Values are checked as the Python objects passed in, so a custom
+    codec on the client that encodes some other type as a subdocument is outside this guard.
 
-    Keys are checked, and values are checked only for *being* a mapping. A value is data whatever it
-    holds; a key is what MQL dispatches on. The string ``"$where"`` in a value position is a
-    five-character string. The one value that is not data is a regex, which MQL dispatches on as surely as
-    it dispatches on a key, and :func:`_reject_regex_values` is where that is refused.
-
-    Recursion is on ``collections.abc.Mapping`` and not on ``dict``, which is the whole of ``AT-179``'s
-    first half. bson encodes any mapping as a subdocument, so a value the guard declined to walk still
-    arrives at the server as one: measured on MongoDB 8.0.32, a filter of
-    ``{"tier": UserDict({"$ne": "gold"})}`` passed this guard, composed into
-    ``{"$and": [..., {"tier": {"$ne": "gold"}}]}``, and matched the document whose tier is *not* gold --
-    the exact opposite of the exact-match policy, from a filter that never contained a ``dict``. A nested
-    one, ``{"tier": {"inner": UserDict({"$ne": None})}}``, passed for the same reason. Reported by a
-    production-readiness review; the scope conjunction held throughout, so this was a filter-policy bypass
-    rather than a cross-scope read.
+    Recursion is on ``collections.abc.Mapping``, not ``dict``. bson encodes any mapping as a
+    subdocument, so ``{"tier": UserDict({"$ne": "gold"})}`` would otherwise pass this guard and reach
+    the server as ``{"tier": {"$ne": "gold"}}``, matching every document whose tier is not gold.
 
     Args:
         value: A filter, or any value reached while walking one.
@@ -88,27 +70,16 @@ def _reject_operator_keys(value: Any) -> None:
 
 
 def _reject_regex_values(value: Any) -> None:
-    """Raise if any value at any depth is a regex (``REQ-E-174``).
+    """Raise if any value at any depth is a regex.
 
-    The third guard, and independent of the other two for the same reason they are independent of each
-    other: it is a different question with a different remedy. ``REQ-E-050`` asks what a key *is*,
-    ``REQ-E-049`` asks whether the index declared it, and this asks what a value *does*.
+    A filter maps field paths to exact values. Given a regex, ``$match`` and ``$eq`` pattern-match
+    instead of comparing: ``{"tier": re.compile("^gol")}`` matches a document whose tier is ``"gold"``.
+    The operator guard cannot catch this because there is no ``$`` key. Pattern filters are refused
+    rather than supported, because their cost and reach depend on the pattern rather than on what a
+    reader sees.
 
-    A filter is documented as a mapping of field path to exact value, and every value in one is inert --
-    with one exception, which is why this function exists. Given a regex, ``$match`` and ``$eq`` both
-    pattern-match instead of comparing: measured on MongoDB 8.0.32, ``{"tier": re.compile("^gol")}`` and
-    ``{"tier": bson.Regex("^gol")}`` each matched the document whose tier is ``"gold"``, where an exact
-    match on the six characters ``^gol`` matches nothing. Neither was rejected by the operator guard,
-    because neither contains a key at all. Reported by a production-readiness review.
-
-    Refused rather than supported, and that is a policy choice with a date on it. A pattern filter is a
-    reasonable thing to want; it is also the difference between a predicate a reader can evaluate by
-    looking at it and one whose cost and blast radius depend on the pattern. If it is wanted later it
-    should arrive as a named, declared capability rather than as a value type that happens to work.
-
-    Both flavours are refused, because both reach the server as a BSON regex: Python's own
-    ``re.Pattern``, and pymongo's ``bson.Regex``, which exists precisely to carry a pattern this package's
-    filters must not carry. Lists and tuples are walked for the same reason the operator guard walks them.
+    Both ``re.Pattern`` and ``bson.Regex`` are refused, since both reach the server as a BSON regex.
+    Lists and tuples are walked as in the operator guard.
 
     Args:
         value: A filter, or any value reached while walking one.
@@ -152,25 +123,20 @@ def _is_regex(value: Any) -> bool:
 
 
 def _reject_undeclared_fields(caller_filter: Mapping[str, Any], declared: Collection[str]) -> None:
-    """Raise if the filter names a path the index did not declare filterable (``REQ-E-049``).
+    """Raise if the filter names a path the index did not declare filterable.
 
-    It was assumed Atlas answers a pre-filter over an undeclared path with unfiltered results rather than an
-    error, which made this guard the only thing between a caller and silently cross-scope reads.
-    Measured on mongot 8.3.8, it is code 8, ``Path 'x' needs to be indexed as filter``. The
-    guard stays for a smaller but real reason: the server names the path and stops there, while a caller
-    who typed a field name needs the config key to edit, the index rebuild it implies, and the list of
-    what is filterable now. It also fails before the round trip rather than after it. ``REQ-E-071``
-    records the correction; unverified on Atlas proper, so the loud behaviour is not assumed everywhere.
+    mongot rejects such a filter itself (code 8, ``Path 'x' needs to be indexed as filter``, seen on
+    8.3.8; not verified on Atlas proper). This guard still runs first so the error names the config key
+    to edit, the index rebuild it needs, and what is filterable now, without a round trip.
 
-    Top-level keys only, and that is exact rather than approximate. ``_reject_operator_keys`` has
-    already rejected ``$and`` and ``$or``, so no caller filter can place a field path below the top
-    level, and a dict value is MQL exact-subdocument equality whose path is the key above it.
+    Checking top-level keys only is exact: the operator guard has already rejected ``$and`` and ``$or``,
+    so no field path can sit below the top level, and a dict value is exact subdocument equality on the
+    key above it.
 
     Args:
         caller_filter: A filter that has already passed the operator guard.
         declared: Every path the index declares filterable: ``scope``, ``store_name`` and the config's
-            ``filter_fields``. Passed in rather than derived, so the index definition stays the single
-            authority.
+            ``filter_fields``. Passed in so the index definition stays the single authority.
 
     Raises:
         ValueError: Naming every undeclared path, not only the first, and naming what is available.
@@ -191,12 +157,18 @@ def _reject_undeclared_fields(caller_filter: Mapping[str, Any], declared: Collec
 def validate(caller_filter: Mapping[str, Any], *, declared_fields: Iterable[str]) -> None:
     """Check a caller-supplied filter against all three guards.
 
-    ``REQ-E-050``, ``REQ-E-174`` and ``REQ-E-049``, run in that order, and the order is part of the
-    contract. The two guards that ask what the filter *is* run before the one that asks whether the index
-    declared its fields: ``{"$where": ...}`` is both forbidden and undeclared, and a caller told their
-    ``$where`` key is missing from ``filter_fields`` would reasonably try to declare it. The same argument
-    puts the regex guard second rather than last, and it is second rather than first because an operator
-    key is the more serious of the two and should be the message a caller sees when a filter has both.
+    A valid filter is a mapping from declared field paths to exact values. In detail:
+
+    * Every key, at any depth (inside nested mappings, lists and tuples), is a string that does not
+      start with ``$``. So no operators: no ``$and``, ``$or``, ``$ne``, ``$in``, ``$where``, ``$expr``.
+    * No value, at any depth, is a regex (``re.Pattern`` or ``bson.Regex``).
+    * Every top-level key is in ``declared_fields``. Dotted paths such as ``"metadata.tier"`` are allowed
+      when declared exactly so.
+
+    The order is part of the contract: operator keys, then regex values, then undeclared fields.
+    ``{"$where": ...}`` is both forbidden and undeclared, and a caller told to declare ``$where`` in
+    ``filter_fields`` might try to. An operator key is the more serious problem, so it is reported
+    before a regex.
 
     Args:
         caller_filter: The filter as the caller supplied it. Not modified.
@@ -215,37 +187,28 @@ def compose(
     scope: str,
     store_name: str,
 ) -> dict[str, Any]:
-    """Compose caller filters with the scope predicate as a conjunction (``REQ-E-051``).
+    """Compose caller filters with the scope predicate as a conjunction.
 
-    ``$and`` rather than a merged dict, and that is the requirement rather than a style preference.
-    ``{**scope_predicate, **caller_filter}`` lets a caller key of the same name win, and the key whose
-    name is worth overwriting is ``scope``. Under a conjunction the caller's term can only narrow.
+    ``$and`` rather than a merged dict: ``{**scope_predicate, **caller_filter}`` would let a caller's
+    ``scope`` key overwrite the store's. Under ``$and`` a caller term can only narrow, and a
+    contradictory one (``{"scope": "tenant-b"}`` against ``tenant-a``) matches nothing.
 
-    Verified on MongoDB 8.3.8: ``{"$and": [{"scope": {"$eq": "tenant-a"}}, {"scope": "tenant-b"}]}``
-    matches 0 documents. A contradictory caller term yields nothing rather than yielding their term,
-    which is what makes conjunction sufficient here and lets the tests assert on the emitted dict.
+    Variadic because a memory store has two caller filters: the one configured on the store and the one
+    on a single ``MongoDBSearchQuery``. Each stays its own term, since merging them would need a ``$and``
+    that :func:`validate` rejects.
 
-    Variadic because a memory store has **two** caller filters and they arrive from different places:
-    the one configured on the store, which applies to every query, and the one on a single
-    ``MongoDBSearchQuery``. Merging the pair before composing is not available, since the merge would
-    have to be a ``$and`` of its own and :func:`validate` rejects a ``$``-prefixed key at any depth. Two
-    terms in one conjunction is the same predicate either way, and each stays a plain field-to-value
-    mapping that the guards can still read.
-
-    Does not validate. Callers run :func:`validate` first, because the two have different arguments and
-    a caller with no declared-field set to hand should still be able to compose.
+    Does not validate. Callers run :func:`validate` first.
 
     Args:
         *caller_filters: Caller filters, already validated, in the order they should appear.
-            ``None`` and ``{}`` both add no term, so a call site with nothing to add passes either.
-        scope: This store's scope. Never taken from caller input (``REQ-E-046``); an absent scope
-            resolves to a sentinel upstream, never to unfiltered (``REQ-E-048``).
+            ``None`` and ``{}`` both add no term.
+        scope: This store's scope. Never taken from caller input; an absent scope resolves to a sentinel
+            upstream, never to unfiltered.
         store_name: This store's name, isolating it from other stores in the same collection.
 
     Returns:
-        A ``$and`` predicate with the scope term first, then the store term, then every caller filter
-        that has anything in it. Deep-copied, so the caller's dicts and the returned predicate share no
-        structure in either direction.
+        A ``$and`` predicate with the scope term first, then the store term, then every non-empty caller
+        filter. Deep-copied, so the caller's dicts and the returned predicate share no structure.
     """
     terms: list[dict[str, Any]] = [
         {"scope": {"$eq": scope}},
@@ -253,7 +216,6 @@ def compose(
     ]
     for caller_filter in caller_filters:
         if caller_filter:
-            # Deep, not shallow. A caller who mutates a nested value after composing must not be able
-            # to alter a query that is already in flight.
+            # Deep, so mutating a nested value after composing cannot alter a query already in flight.
             terms.append(copy.deepcopy(dict(caller_filter)))
     return {"$and": terms}

@@ -2,18 +2,14 @@
 
 Two surfaces, each behind its own install extra:
 
-- :mod:`strands_mongodb.storage` -- ``MongoDBStorage``, implementing the SDK's unified
+- :mod:`strands_mongodb.storage`: ``MongoDBStorage``, implementing the SDK's unified
   ``strands.storage.Storage`` protocol. Install with ``pip install 'strands-mongodb[storage]'``.
-- :mod:`strands_mongodb.memory_store` -- ``MongoDBMemoryStore``, implementing the SDK's
+- :mod:`strands_mongodb.memory_store`: ``MongoDBMemoryStore``, implementing the SDK's
   ``strands.memory.MemoryStore`` protocol. Install with ``pip install 'strands-mongodb[memory]'``.
 
-A third name, ``MongoDBVectorSearchStrategy``, is declared and belongs to phase 2: constructing it
-raises ``NotImplementedError`` naming the phase. It needs no extra, because it needs nothing.
-
-All three are reachable from here, resolved on first attribute access rather than at import
-time. Importing this package must never pull a dependency the caller did not ask for: a
-``[storage]``-only install can ``import strands_mongodb`` and use ``MongoDBStorage`` without ever
-executing the memory module, which would fail on ``pymongo_search_utils``.
+Both classes are importable from here and are loaded on first access, not at import time. That way a
+``[storage]``-only install can use ``MongoDBStorage`` without importing the memory module, which would
+fail on ``pymongo_search_utils``.
 """
 
 from __future__ import annotations
@@ -23,11 +19,8 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
-    # Declared for type checkers only. A module-level `__getattr__` is invisible to them, so
-    # without these the lazily exported names would resolve to `object` and every downstream use
-    # would lose its types. Never executed at runtime, which is the point.
+    # Type checkers cannot see through `__getattr__`, so without these the lazy names would type as `object`.
     from strands_mongodb.memory_store import MongoDBMemoryStore
-    from strands_mongodb.search import MongoDBVectorSearchStrategy
     from strands_mongodb.storage import MongoDBStorage
 
 try:
@@ -36,26 +29,20 @@ except PackageNotFoundError:
     # Imported from a source tree that was never installed.
     __version__ = "0.0.0+unknown"
 
-__all__ = ["MongoDBMemoryStore", "MongoDBStorage", "MongoDBVectorSearchStrategy", "__version__"]
+__all__ = ["MongoDBMemoryStore", "MongoDBStorage", "__version__"]
 
 _LAZY: Final[dict[str, str]] = {
     "MongoDBStorage": "strands_mongodb.storage",
     "MongoDBMemoryStore": "strands_mongodb.memory_store",
-    # Phase 2 (`REQ-E-075`): declared, and raises when constructed. Listed here for the same reason
-    # as the other two, since the published API surface carries the name, and it costs nothing extra
-    # to resolve:
-    # `search.py` imports nothing at runtime.
-    "MongoDBVectorSearchStrategy": "strands_mongodb.search",
 }
 
 
 def __getattr__(name: str) -> object:
     """Resolve a backend class on first access, importing only its own module.
 
-    PEP 562. The return type is ``object`` and not ``Any`` on purpose: a module-level
-    ``__getattr__`` makes a type checker accept every attribute name on this module, so ``Any``
-    would silently type check any misspelling and everything done with it. With ``object``, the
-    access still passes but the first real use of a typo is rejected.
+    A module-level ``__getattr__`` (PEP 562) makes a type checker accept any attribute name on this
+    module. Returning ``object`` rather than ``Any`` means a misspelled name is still rejected at its
+    first real use.
 
     Args:
         name: The attribute being looked up.
@@ -64,10 +51,9 @@ def __getattr__(name: str) -> object:
         The class named by ``name``.
 
     Raises:
-        AttributeError: If ``name`` is not a lazily exported class. Not ``KeyError``:
-            :func:`hasattr` converts only ``AttributeError`` to ``False``, and ``inspect``,
-            ``copy``, ``pickle`` and REPL display hooks all probe modules for attributes that do
-            not exist here.
+        AttributeError: If ``name`` is not a lazily exported class. ``hasattr``, ``inspect``, ``copy``
+            and ``pickle`` rely on this exception type when probing for attributes.
+        ImportError: If the class's install extra is missing. The message names the extra to install.
     """
     module_name = _LAZY.get(name)
     if module_name is None:
@@ -78,8 +64,7 @@ def __getattr__(name: str) -> object:
 def __dir__() -> list[str]:
     """List the lazily exported names alongside the eager ones.
 
-    Without this, ``dir(strands_mongodb)`` omits both classes until something has already
-    imported them, so tab completion would show them only after the user knew to type them.
+    Without this, ``dir(strands_mongodb)`` and tab completion omit both classes until they are imported.
 
     Returns:
         The module's attribute names, sorted.

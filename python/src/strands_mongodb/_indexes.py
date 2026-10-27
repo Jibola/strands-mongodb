@@ -1,30 +1,22 @@
 """Index specifications, idempotent ensure and verify, and search-index readiness polling.
 
-Reimplemented against ``AsyncCollection`` rather than calling ``pymongo_search_utils``' index helpers
-(``REQ-E-066``). Those helpers are synchronous, poll with a blocking ``time.sleep``, and their
-``vector_search_index_definition`` is not even exported, so there is nothing here to reuse.
+Written against ``AsyncCollection`` rather than calling ``pymongo_search_utils``' index helpers, which are
+synchronous and poll with a blocking ``time.sleep``.
 
-Three kinds of index and three different idempotency tests, which is the whole reason this is a
-module rather than a list of ``create_indexes`` calls:
+Each kind of index has its own idempotency test:
 
-* **Ordinary** indexes match on the **key list**, then compare every option this package asked for. Not
-  on the name, because the server does not treat the name as an identity: creating a second index over
-  keys that already carry one is ``OperationFailure`` code 85 whatever it is called. And not on the key
-  list alone, because the dedup index exists for its ``unique`` flag rather than for its keys, and
-  accepting an ordinary index over the same three fields ships a missing uniqueness guard with every index
-  reported present.
-* **TTL** indexes are ordinary indexes whose ``expireAfterSeconds`` is one of those options. It stopped
-  being a special case once the comparison covered everything.
-* **Atlas Search** indexes are listed by name and compared on ``latestDefinition``, then polled, because
-  a build is asynchronous: created and queryable are two different states, and a search over an
-  unfinished index returns zero documents rather than an error.
+* **Ordinary** indexes (TTL included) match on the **key list**, then every option this package asked for
+  is compared. Not on the name: the server rejects a second index over the same keys (code 85) whatever
+  it is called. Not on the keys alone either: the dedup index exists for its ``unique`` flag, so a
+  non-unique index over the same fields must not count.
+* **Atlas Search** indexes match by name, are compared on ``latestDefinition``, then polled. A build is
+  asynchronous, and a search over an unfinished index returns zero documents rather than an error.
 
-Every behaviour above was measured against MongoDB 8.3.8 before it was written, and two of them
-contradicted what was first drafted for them. This module is what follows from the measurements, not from
-that draft.
+Nothing here drops or alters an existing index. A conflict is reported with the commands that resolve it,
+because the index may be serving queries this package knows nothing about.
 
-Private, like ``_client`` and ``_filter``. The specs are a promise to the operator who provisions them,
-not an API.
+Private module, but the specs are a promise to operators: the README's index commands are rendered
+from them, and a test keeps the two identical.
 """
 
 from __future__ import annotations
@@ -41,15 +33,13 @@ from strands_mongodb import _telemetry
 from strands_mongodb._extras import missing_extra
 from strands_mongodb._filter import BAKED_IN_FILTER_FIELDS
 
-# `storage` rather than `memory`, for the same reason `_client` names it: both surfaces reach this
-# module and everything it needs is in the narrower extra. `StorageError` is in `strands`, which both
-# extras install, so one guard covers the pair.
+# Both surfaces reach this module and everything it needs is in the narrower `storage` extra.
 try:
     from pymongo import IndexModel
     from pymongo.errors import OperationFailure, PyMongoError
     from pymongo.operations import SearchIndexModel
     from strands.types.exceptions import StorageError
-except ImportError as error:  # pragma: no cover - exercised in a subprocess by AT-008b
+except ImportError as error:  # pragma: no cover - exercised in a subprocess
     missing_extra("storage", error, module=__name__)
 
 if TYPE_CHECKING:
@@ -69,6 +59,7 @@ __all__ = [
     "SearchIndexSpec",
     "SearchSupport",
     "VectorMode",
+    "check_ttl",
     "declared_filter_fields",
     "drop_index_command",
     "ensure",
@@ -93,21 +84,37 @@ VECTOR_FIELD: Final[str] = "embedding"
 """Document field holding a caller-supplied embedding, on the manual-vector path only."""
 
 EXPIRES_FIELD: Final[str] = "expires_at"
-"""Document field the TTL indexes watch. Absent on documents with no expiry, which is why the TTL
-index can be created unconditionally: it is inert for a document that does not carry this field."""
+"""Document field the TTL indexes watch. Absent on documents with no expiry, for which the index is inert."""
+
+
+def check_ttl(ttl_seconds: int | None) -> None:
+    """Reject a negative ``ttl_seconds``.
+
+    A negative lifetime stamps an ``expires_at`` in the past, so the TTL monitor deletes every write on its
+    next sweep. ``0`` is allowed: it asks for expiry at the next sweep.
+
+    Args:
+        ttl_seconds: The configured lifetime, or ``None`` for no expiry.
+
+    Raises:
+        ValueError: If ``ttl_seconds`` is below ``0``.
+    """
+    if ttl_seconds is not None and ttl_seconds < 0:
+        raise ValueError(
+            f"strands_mongodb: 'ttl_seconds' is {ttl_seconds}, and a lifetime cannot be negative. A negative "
+            f"value stamps an expiry in the past, so every write would be deleted on the next TTL sweep. Use "
+            f"0 to expire at the next sweep, or None for no expiry."
+        )
+
 
 DEFAULT_EMBEDDING_MODEL: Final[str] = "voyage-4-lite"
-"""Atlas embedding model used when the config names none.
-
-Taken from the community ``strands-mongodb-store`` 0.2.0, and confirmed against it, rather than
-chosen here, so a caller moving between the two packages gets the same vectors from the same text.
-"""
+"""Atlas embedding model used when the config names none. Matches the community ``strands-mongodb-store``."""
 
 DEFAULT_VECTOR_INDEX_NAME: Final[str] = "vector_index"
-"""Default Atlas Vector Search index name, from langchain-mongodb ``vectorstores.py:219``."""
+"""Default Atlas Vector Search index name, the same as langchain-mongodb's."""
 
 DEFAULT_TEXT_INDEX_NAME: Final[str] = "text_index"
-"""Default Atlas Search index name, from langchain-mongodb ``retrievers/parent_document.py:218``."""
+"""Default Atlas Search index name, the same as langchain-mongodb's."""
 
 SIMILARITIES: Final[tuple[str, ...]] = ("cosine", "dotProduct", "euclidean")
 """Distance metrics an Atlas vector index accepts. Mirrors ``types.VectorSimilarity`` at runtime."""
@@ -116,91 +123,53 @@ MAX_DIMENSIONS: Final[int] = 8192
 """Upper bound Atlas enforces on ``numDimensions``. Measured: outside ``[1..8192]`` is code 8."""
 
 READY_TIMEOUT_SECONDS: Final[float] = 300.0
-"""How long a search-index build is waited on, before a caller overrides it (``REQ-E-123``).
+"""Default seconds to wait for search-index builds to report ``READY``.
 
-Was ``pymongo_search_utils``' own ``TIMEOUT`` of 120, on the reasoning that
-reimplementing their polling against the async driver (``REQ-E-066``) is no reason to change how long a
-caller waits. Two measurements against cloud Atlas retired that: two index builds in a new database on
-an idle ``strands-dev`` took **104.7s** on 2026-09-02, and a single build on the same cluster with the
-three-tier suite's collections beside it ran past **120s** on 2026-09-15, failing the README's own
-AutoEmbeddings quickstart. A budget inside the observed range is wrong in both directions, so the number
-is now a measurement with room rather than an inheritance.
-
-Raising it changes when a *failure* arrives and not when a success does: the poll interval decides the
-latter and is untouched. ``MongoDBConfig["index_ready_timeout"]`` is the per-deployment override, for
-the case no default covers -- a shared cluster where a build queues behind somebody else's.
+Builds on cloud Atlas have taken about 105 seconds idle and over 120 seconds on a busy cluster. A longer
+timeout delays only a failure. Override it with ``MongoDBConfig["index_ready_timeout"]``.
 """
 
 POLL_INTERVAL_SECONDS: Final[float] = 0.5
-"""Delay between readiness reads. ``pymongo_search_utils``' own ``INTERVAL``."""
+"""Delay between readiness reads, in seconds."""
 
 _READY_STATUS: Final[str] = "READY"
 _FAILED_STATUS: Final[str] = "FAILED"
 _NAMESPACE_EXISTS: Final[int] = 48
 
 RANK_FUSION_MIN_MAJOR: Final[int] = 8
-"""Major version of ``mongod`` from which ``$rankFusion`` exists (``REQ-E-143``).
-
-Eight, not 8.1. The MongoDB 8.0 manual carries the stage with its own compatibility note and a worked
-example putting ``$vectorSearch`` in an input pipeline; 8.2 is where ``$scoreFusion`` arrives and 8.3
-where ``$rerank`` does. Atlas hands out 8.0.23 by default, so an off-by-one-minor floor here would have
-switched hybrid search off for most of the deployments it was written for.
-
-A major-version integer and not a full version tuple because the stage has not changed since it landed:
-there is no 8.0.x patch to exclude, and a finer floor would be a claim this package cannot support.
-"""
+"""Major version of ``mongod`` from which ``$rankFusion`` (with ``$vectorSearch`` inputs) exists: 8.0, not 8.1."""
 
 SEARCH_UNSUPPORTED_CODES: Final[frozenset[int]] = frozenset({31082, 115, 6047401})
-"""Server error codes meaning "this deployment has no Atlas Search", as ``list_search_indexes()`` reports.
+"""Server error codes from ``list_search_indexes()`` that mean "this deployment has no Atlas Search".
 
-A set rather than one code, because four deployments answer this probe with three different numbers
-(``REQ-E-053a`` holds the table). Measured 2026-09-02, on the ``list_search_indexes()`` surface:
+* **31082** on ``mongo:8`` (8.3.8).
+* **115** (``CommandNotSupported``) on enterprise ``mongod`` 7.0.12 with no mongot configured.
+* **6047401** on ``mongo:6`` (6.0.28) and ``mongo:7`` (7.0.40).
 
-* **31082** on ``mongo:8``, reported version 8.3.8 with ``modules: []``. Every search surface on that
-  deployment answers with this one, which is why it was long the only member here.
-* **115**, ``CommandNotSupported``, on ``mongod`` 7.0.12 with ``modules: ['enterprise']``. That build
-  carries mongot support and has none configured, so its query stages answer 31082 while its
-  search-index commands answer this.
-* **6047401** on ``mongo:6`` 6.0.28 and ``mongo:7`` 7.0.40, both ``modules: []``, *"$listSearchIndexes
-  stage is only allowed on MongoDB Atlas"*.
+The number is the stable part: the message differs between deployments, and so does ``codeName`` (31082 is
+``SearchNotEnabled`` on 8.3.8 and ``Location31082`` on 7.0.12).
 
-Ordinary index creation and every CRUD path work normally on all four. Two things the readings settle.
-The message is not a candidate key, since it differs between the four deployments and between surfaces
-on one of them, and neither is ``codeName``: the same numeric 31082 is ``SearchNotEnabled`` on 8.3.8 and
-``Location31082`` on 7.0.12. The number is the stable part.
-
-Code 59, ``CommandNotFound``, means the same thing at ``create_search_index`` on 6.0.28 and 7.0.40, and
-is deliberately absent. That call runs only after :func:`search_support` has cleared the deployment, so
-a member matching it would be unreachable. ``AT-053d`` asserts the exclusion so it stays a decision.
+Code 59 (``CommandNotFound``) means the same at ``create_search_index`` on 6.0 and 7.0, but is left out on
+purpose: that call only runs after :func:`search_support` has cleared the deployment, so it is unreachable.
 """
 
 _COLLECTION_ABSENT: Final[int] = 26
 """Server error code for a namespace that does not exist. Not an error when reading indexes."""
 
 SIMPLE_LOCALE: Final[str] = "simple"
-"""The one collation locale that compares strings byte by byte, which is what a key space needs.
-
-Every other locale is a language-aware comparison, and every language-aware comparison is a comparison
-this package's ``_id`` key model cannot be built on: see :func:`require_binary_comparison`. Public
-because ``AT-176`` asserts against it and the refusal message names it.
-"""
+"""The one collation locale that compares strings byte by byte. See :func:`require_binary_comparison`."""
 
 Readiness = Literal["ready", "building", "failed"]
-"""The three states ``REQ-E-062`` distinguishes, because the remedy differs between them."""
+"""The three states of a search index build, each with a different remedy."""
 
 
 class SearchSupport(NamedTuple):
-    """What :func:`search_support` found, which is an answer and the evidence for it.
-
-    Two fields rather than a ``bool`` because ``REQ-E-053a`` asks the warning and the later query failure
-    to name *the server's own code*, and the only place that code exists is inside the probe. Returning
-    it means an operator on 7.0.40 reads 6047401 in the message and can match it against their own log,
-    where a fixed 31082 sent them looking for an error their server never emitted.
+    """What :func:`search_support` found.
 
     Attributes:
         available: Whether the deployment runs Atlas Search.
-        code: The server error code that said it does not, or ``None``. Set only when ``available`` is
-            ``False``, which is the invariant every reader of this record may assume.
+        code: The server error code that said it does not, so messages can name the code this server
+            sent. Set only when ``available`` is ``False``, otherwise ``None``.
     """
 
     available: bool
@@ -210,15 +179,8 @@ class SearchSupport(NamedTuple):
 def readiness(status: str) -> Readiness:
     """Map a search index's reported ``status`` onto the state whose remedy the caller needs.
 
-    Written as a default rather than as a lookup, and that is the finding rather than a style
-    preference. Immediately after creating one vector and one full-text index on 8.3.8, the vector
-    index reported ``BUILDING`` and the full-text index reported ``PENDING``. ``PENDING`` was not in the
-    design's list of statuses, so a lookup table built from that list would have had no entry for the
-    state half the indexes were actually in.
-
-    An unrecognised status read as *building* costs one poll interval. Read as *ready* it ships
-    a real failure: the search runs against an unfinished index, returns zero documents, and the
-    user reads it as the agent having forgotten. The server documents no full status vocabulary.
+    Any other status (a new full-text index reports ``PENDING``, for one) reads as building, which costs
+    a poll. Reading it as ready would search an unfinished index, which returns nothing and no error.
 
     Args:
         status: The ``status`` field as the server reported it.
@@ -249,10 +211,10 @@ class VectorMode:
 
     @property
     def auto_embed(self) -> bool:
-        """Whether the deployment embeds, rather than the caller.
+        """Whether the deployment embeds the text, rather than the caller.
 
         Returns:
-            ``True`` when a model is set, which is the only way the server-side path is selected.
+            ``True`` when a model is set.
         """
         return self.model is not None
 
@@ -260,26 +222,18 @@ class VectorMode:
 def vector_mode(config: MongoDBConfig) -> VectorMode:
     """Resolve the vector path from the config, rejecting the combinations that mean two things.
 
-    ``REQ-E-067``. The exactly-one-mode rule mirrors ``pymongo_search_utils._check_param_config``
-    without importing it, since that function lives in the ``[memory]`` extra and reads its own
-    parameter names.
-
-    Both manual fields are checked here rather than left to Atlas, even though Atlas rejects a bad
-    metric and an out-of-range dimension count too. Its rejection arrives at index creation, after the
-    collection and the other five indexes exist, as a code 8 naming a JSON path in a command the caller
-    never wrote. Rejecting the same values while they are still a dict costs two comparisons.
+    Manual values are checked here because Atlas rejects them only at index creation, with a code 8.
 
     Args:
-        config: The connection configuration. Only the four vector-related keys are read.
+        config: The connection configuration. Only the vector-related keys are read.
 
     Returns:
         The resolved mode, with exactly one path populated. An empty config resolves to AutoEmbeddings
-        with :data:`DEFAULT_EMBEDDING_MODEL`, which keeps the zero-configuration path the Atlas one.
+        with :data:`DEFAULT_EMBEDDING_MODEL`.
 
     Raises:
         ValueError: If both paths are configured, if only one of the manual pair is set, or if a manual
-            value is outside what Atlas accepts. Names the fields in conflict, because the caller wrote
-            a dict and needs to know which key to remove.
+            value is outside what Atlas accepts. The message names the conflicting keys.
     """
     model = config.get("embedding_model")
     dimensions = config.get("embedding_dimensions")
@@ -333,14 +287,11 @@ def vector_mode(config: MongoDBConfig) -> VectorMode:
 def declared_filter_fields(extra: Iterable[str]) -> tuple[str, ...]:
     """Return every path the vector index declares filterable, in index order.
 
-    ``REQ-E-071``, and the reason it is readable rather than only writable: ``_filter.validate`` has to
-    reject a filter over an undeclared path, and the index definition is the single authority
-    for what is declared. Two modules computing the same list separately is how they drift apart.
+    Shared by the index definition and ``_filter``'s check of filter paths, so the two cannot drift.
 
     Args:
-        extra: The config's ``filter_fields``. Duplicates of the baked-in pair are dropped, since Atlas
-            rejects a definition with two ``filter`` entries on one path and a caller who lists
-            ``scope`` there is asking for something already true.
+        extra: The config's ``filter_fields``. Duplicates of the baked-in fields are dropped, since Atlas
+            rejects a definition with two ``filter`` entries on one path.
 
     Returns:
         ``scope`` and ``store_name`` first, then the caller's fields in the order given.
@@ -359,11 +310,9 @@ def vector_index_definition(
     vector_field: str = VECTOR_FIELD,
     filter_fields: Iterable[str] = (),
 ) -> dict[str, Any]:
-    """Build the Atlas Vector Search definition the ``memory`` collection needs.
+    """Build the Atlas Vector Search index definition for the ``memory`` collection.
 
-    The AutoEmbeddings variant uses ``type: "autoEmbed"`` over the text field, not ``type: "vector"``
-    with ``numDimensions: -1``. The latter is langchain-mongodb's constructor
-    validation rather than a wire format, and the server answers ``-1`` with code 8.
+    AutoEmbeddings uses ``type: "autoEmbed"`` over the text field (``numDimensions: -1`` is code 8).
 
     Args:
         mode: The resolved path, from :func:`vector_mode`.
@@ -398,11 +347,9 @@ def vector_index_definition(
 
 
 def text_index_definition(*, text_field: str = CONTENT_FIELD) -> dict[str, Any]:
-    """Build the Atlas Search full-text definition the ``memory`` collection needs.
+    """Build the Atlas Search full-text index definition for the ``memory`` collection.
 
-    ``dynamic: False``, so only the text field is indexed. Dynamic mapping would index every field of
-    every document, including whatever metadata a caller attached to a memory, which is storage and
-    build time spent on fields no query in this package reads.
+    ``dynamic: False`` indexes only the text field, not metadata no query reads.
 
     Args:
         text_field: The field to map as a string.
@@ -418,19 +365,14 @@ class IndexSpec:
     """One ordinary index: what to create, and what makes an existing index count as it.
 
     Attributes:
-        name: Name used when this package creates the index. Never used to *find* one, since the server
+        name: Name used when this package creates the index. Never used to find one, since the server
             does not treat the name as an identity.
-        keys: The key list, in order. This is the match key, and it can match more than one existing
-            index: the server's identity for an index is its keys *and* its collation, so a collection
-            may carry several over one key list (``REQ-E-190``). Every one of them is examined.
-        options: Every option this package asks for, and therefore every option compared against an
-            existing index. Options nobody here set are nobody here's business: a ``background`` or
-            ``hidden`` flag another tool added is not a mismatch.
-        date_only: Whether every key of this index names a field this package writes BSON dates into and
-            nothing else. A collation decides how strings compare, so on such an index it decides nothing,
-            and the binary-comparison rule does not apply to it (``REQ-E-191``). Declared rather than
-            inferred from the field name, because which fields hold what is a fact about what this
-            package writes and not something to guess from a document nothing here has read.
+        keys: The key list, in order, used to match existing indexes. It can match several: the
+            server's identity for an index is its keys and its collation, and every match is examined.
+        options: Every option this package asks for, and so every option compared against an existing
+            index. Options set by someone else (``background``, ``hidden``) are not a mismatch.
+        date_only: Whether every key names a field that holds only BSON dates. A collation cannot change
+            how such an index compares, so the collation checks skip it.
     """
 
     name: str
@@ -447,12 +389,7 @@ class IndexSpec:
         return IndexModel(list(self.keys), name=self.name, **dict(self.options))
 
     def creation_command(self, collection_name: str) -> str:
-        """Render the server command that creates this index (``REQ-E-061``).
-
-        The raw ``createIndexes`` command rather than a shell helper, because that is the command
-        pymongo itself sends and so it can be checked from this repository. A helper's argument order is
-        a detail this package has no way to verify, and getting it wrong hands an operator something
-        that fails in their hands.
+        """Render the raw ``createIndexes`` command (what pymongo sends) for an operator to run.
 
         Args:
             collection_name: Collection the index belongs on.
@@ -470,11 +407,7 @@ class IndexSpec:
 def drop_index_command(collection_name: str, index_name: str) -> str:
     """Render the command that removes a conflicting ordinary index, for a mismatch message.
 
-    Takes the name found on the deployment rather than reading one off a spec, because the index in the
-    way is the one somebody else created and it is named whatever they named it.
-
-    Rendered rather than run. Dropping an index this package did not create is destructive, it is not
-    recoverable from here, and the index may be serving queries this package knows nothing about.
+    Rendered, never run: the index may be serving queries this package knows nothing about.
 
     Args:
         collection_name: Collection the index sits on.
@@ -491,9 +424,9 @@ class SearchIndexSpec:
     """One Atlas Search index: ``vectorSearch`` or ``search``.
 
     Attributes:
-        name: The index name, which here *is* the identity. ``list_search_indexes`` takes a name and
-            ``createSearchIndexes`` rejects a second definition under an existing one with code 68.
-        definition: The definition, compared verbatim against ``latestDefinition``.
+        name: The index name, which for a search index is its identity. ``createSearchIndexes`` rejects a
+            different definition under an existing name with code 68.
+        definition: The definition. An existing index must contain it (see ``_definition_gap``).
         type: ``"vectorSearch"`` or ``"search"``.
     """
 
@@ -510,7 +443,7 @@ class SearchIndexSpec:
         return SearchIndexModel(definition=dict(self.definition), name=self.name, type=self.type)
 
     def creation_command(self, collection_name: str) -> str:
-        """Render the ``createSearchIndexes`` command that creates this index (``REQ-E-061``).
+        """Render the ``createSearchIndexes`` command that creates this index, for an operator to run.
 
         Args:
             collection_name: Collection the index belongs on.
@@ -539,20 +472,18 @@ class SearchIndexSpec:
 def storage_specs() -> tuple[IndexSpec, ...]:
     """Return the ordinary indexes the ``storage`` collection needs.
 
-    Row 1 is ``_id_``, which the server creates and which is the reason key-as-``_id`` was chosen in the
-    first place. That leaves the TTL index.
+    Keys are stored in ``_id``, whose index the server creates, so only the TTL index remains.
 
     Returns:
-        One spec. Takes no arguments, so every store asks for the same list and the command block
-        ``REQ-E-061`` hands an operator is the block that satisfies the next verify.
+        One spec, the same for every store.
     """
     return (
         IndexSpec(
             name="strands_expires_at_ttl",
             keys=((EXPIRES_FIELD, 1),),
             options={"expireAfterSeconds": 0},
-            # `expires_at` holds a BSON date or nothing -- a TTL index requires it, and `_expiry_at` is
-            # the only writer. So no collation on this index can change what it compares (REQ-E-191).
+            # This package only ever writes `expires_at` as a BSON date, so a collation cannot change what
+            # this index compares.
             date_only=True,
         ),
     )
@@ -561,19 +492,8 @@ def storage_specs() -> tuple[IndexSpec, ...]:
 def memory_specs() -> tuple[IndexSpec, ...]:
     """Return the ordinary indexes the ``memory`` collection needs.
 
-    The expiry index is optional and is created anyway. Making it conditional on a
-    configured TTL is the obvious implementation and it fails silently: a store that gains an expiry
-    after its first ``initialize()`` stamps ``expires_at`` on every document and nothing ever deletes
-    them, with no error to read and no way to notice except watching the collection grow. Unconditional
-    fails loudly instead, as one more index in the block an operator provisions, and it costs nothing at
-    rest because a TTL index is inert for documents that carry no ``expires_at``.
-
-    **That argument described a situation that could not arise until this package added**
-    ``ttl_seconds`` to ``MongoDBMemoryStoreConfig``: before it, nothing on this surface wrote
-    ``expires_at`` at all, and this index was inert on every document in every collection this package
-    had ever created. It is now load-bearing, and the unconditional choice is what makes ``REQ-E-149``
-    true -- a store that gains a ``ttl_seconds`` expires its existing documents on the next sweep, with
-    no migration, because the index was there the whole time.
+    The TTL index exists whether or not ``ttl_seconds`` is set, so a store that gains one later expires
+    its documents without a migration. It is inert for documents without ``expires_at``.
 
     Returns:
         Three specs: the unique partial dedup index, the recency index, and the TTL index.
@@ -584,8 +504,7 @@ def memory_specs() -> tuple[IndexSpec, ...]:
             keys=(("scope", 1), ("store_name", 1), ("content_hash", 1)),
             options={
                 "unique": True,
-                # Partial, because a unique index treats a missing field as `null`: without this, the
-                # second document with no `content_hash` collides with the first.
+                # A unique index treats a missing field as `null`, so documents without a hash would collide.
                 "partialFilterExpression": {"content_hash": {"$exists": True}},
             },
         ),
@@ -597,8 +516,8 @@ def memory_specs() -> tuple[IndexSpec, ...]:
             name="strands_expires_at_ttl",
             keys=((EXPIRES_FIELD, 1),),
             options={"expireAfterSeconds": 0},
-            # `expires_at` holds a BSON date or nothing -- a TTL index requires it, and `_expiry_at` is
-            # the only writer. So no collation on this index can change what it compares (REQ-E-191).
+            # This package only ever writes `expires_at` as a BSON date, so a collation cannot change what
+            # this index compares.
             date_only=True,
         ),
     )
@@ -606,10 +525,6 @@ def memory_specs() -> tuple[IndexSpec, ...]:
 
 def memory_search_specs(config: MongoDBConfig) -> tuple[SearchIndexSpec, ...]:
     """Return the Atlas Search indexes the ``memory`` collection needs.
-
-    Config-driven where the ordinary specs are not, because both names and the whole vector definition
-    come from it. This is also the path ``initialize()`` takes, so the mode conflict in ``REQ-E-067``
-    has to be rejected from here and not only when :func:`vector_mode` is called directly.
 
     Args:
         config: The connection configuration.
@@ -638,22 +553,14 @@ def memory_search_specs(config: MongoDBConfig) -> tuple[SearchIndexSpec, ...]:
 async def search_support(collection: AsyncCollection[Any]) -> SearchSupport:
     """Report whether this deployment can run Atlas Search at all, and on what evidence.
 
-    ``REQ-E-053a``. Asked before :func:`ensure` is given a ``search`` set, so a deployment without
-    mongot gets its ordinary indexes and a warning instead of a failure. The alternative, letting
-    ``createSearchIndexes`` fail and treating a member of :data:`SEARCH_UNSUPPORTED_CODES` as benign
-    wherever it turns up, would also swallow the code on a deployment that has mongot and is
-    misconfigured, which is ``REQ-E-061``'s condition and has a different remedy.
+    Called before :func:`ensure` gets search specs, so a deployment without mongot gets its ordinary
+    indexes and a warning. Probing first keeps errors from ``createSearchIndexes`` on a deployment that
+    has mongot from being mistaken for "no search".
 
-    ``list_search_indexes`` is the probe rather than a ``buildInfo`` read of ``modules``, because what
-    the caller needs to know is whether the *call* works. ``mongo:8`` reports version 8.3.8 with an
-    empty ``modules`` list and no search, an Atlas CLI local deployment reports the same empty list and
-    has search, so the version document cannot distinguish them. The reading that settles it is
-    ``mongod`` 7.0.12, which reports ``modules: ['enterprise']`` and has no search: on the four measured
-    deployments the module list does not merely fail to separate them, it points the wrong way.
-
-    Named for what it returns rather than ``search_available``, which it replaced. The old
-    name invited ``if await search_available(...)``, and a two-field record is always truthy, so keeping
-    it would have turned every caller into a silent always-has-search bug.
+    The probe calls ``list_search_indexes`` because ``buildInfo`` cannot tell: ``mongo:8`` and an Atlas
+    CLI local deployment both report empty ``modules`` and only the second has search, while enterprise
+    7.0.12 reports ``modules: ['enterprise']`` and has none. The result is always truthy; test
+    ``.available``.
 
     Args:
         collection: The collection whose deployment to probe. Need not exist.
@@ -664,8 +571,8 @@ async def search_support(collection: AsyncCollection[Any]) -> SearchSupport:
         one it used.
 
     Raises:
-        StorageError: If the call fails for any other reason, including authentication. A probe that
-            reported ``False`` on a bad password would send the caller looking for the wrong problem.
+        StorageError: If the call fails for any other reason, including authentication. A bad password
+            must not read as "no search".
     """
     with _telemetry.span("strands_mongodb.indexes.probe", _probe_attributes(collection, "search")):
         return await _search_support(collection)
@@ -680,7 +587,7 @@ async def _search_support(collection: AsyncCollection[Any]) -> SearchSupport:
     except OperationFailure as error:
         if error.code in SEARCH_UNSUPPORTED_CODES:
             return SearchSupport(available=False, code=error.code)
-        # An absent collection has no indexes, which answers the question asked here: the call worked.
+        # Code 26 (absent collection) still means the call worked, so search is available.
         if error.code != _COLLECTION_ABSENT:
             raise StorageError(
                 f"strands_mongodb: probing Atlas Search support on "
@@ -697,15 +604,11 @@ async def _search_support(collection: AsyncCollection[Any]) -> SearchSupport:
 class CollationReport(NamedTuple):
     """What ``listCollections`` says about one collection's string comparison.
 
-    Two fields rather than one optional collation, because the two answers this call can give are not
-    the same answer and reading them as one is ``REQ-E-186``. A collection with no collation and a
-    collection that does not exist are both reported by the server as nothing, and only the first of them
-    is a *verification* that string comparison here is binary.
+    An absent collection and an uncollated one both have no collation, but only the second is verified.
 
     Attributes:
         exists: Whether the server reported the collection at all.
-        collation: The collation document it reported, or ``None`` for a collection with none -- which,
-            when ``exists`` is ``False``, means only that there was no document to read one from.
+        collation: The collation document it reported, or ``None`` if there was none (or no collection).
     """
 
     exists: bool
@@ -715,33 +618,19 @@ class CollationReport(NamedTuple):
 async def read_collation(collection: AsyncCollection[Any]) -> CollationReport:
     """Report whether the collection exists and what default collation it carries.
 
-    ``listCollections`` filtered to one name, which is the only way to ask: a collation is fixed at
-    creation and lives in the collection's options, and nothing on ``AsyncCollection`` carries it. The
-    filter is not an optimisation -- an unfiltered call reads every collection in the database to answer
-    a question about one, and on a database an application shares that is a listing it has no business
-    producing.
+    Uses ``listCollections`` filtered to this name, so a shared database's other collections are not
+    listed. The server (8.0.32) reports a collation under ``options.collation`` and does not store a
+    simple one: a collection created with ``{locale: "simple"}`` reports empty ``options``.
 
     Args:
         collection: The collection to ask about. Need not exist.
 
     Returns:
-        A :class:`CollationReport`. An absent collection is ``(False, None)`` and an uncollated one is
-        ``(True, None)``: the same *collation*, deliberately distinguished, because a caller that refuses
-        on the collation wants them merged and a caller that caches the answer must not merge them
-        (``REQ-E-186``).
-
-        Measured on 8.0.32, because the shape is the whole contract of this function and it is not
-        derivable from the documentation: a collection created with ``{locale: "en", strength: 2}`` is
-        reported with the resolved ten-field document under ``options.collation``, and a collection
-        created with ``{locale: "simple"}`` is reported with ``options`` **empty**. The server does not
-        store a simple collation, so on that version the only collation this ever returns is one worth
-        refusing. :func:`require_binary_comparison` still admits ``simple`` explicitly, for a server that
-        reports what it was asked for.
+        A :class:`CollationReport`: ``(False, None)`` for an absent collection, ``(True, None)`` for one
+        without a collation.
 
     Raises:
-        StorageError: If the call fails. Unlike :func:`search_support` there is no code to forgive: an
-            absent collection is an empty result rather than an error, so anything that arrives here is
-            a real failure and reporting the collection as uncollated would be reporting a guess.
+        StorageError: If the call fails. An absent collection is not a failure.
     """
     with _telemetry.span("strands_mongodb.indexes.probe", _probe_attributes(collection, "collation")):
         return await _read_collation(collection)
@@ -765,38 +654,25 @@ async def _read_collation(collection: AsyncCollection[Any]) -> CollationReport:
 async def require_binary_comparison(collection: AsyncCollection[Any]) -> bool:
     """Refuse a collection whose default collation is not binary, and say whether it verified one.
 
-    A collation is a property of the collection, and every query against that collection inherits it
-    unless it names another. This package's key space is one document per key with the key in ``_id``, so
-    equality on a key, the range bounds behind a prefix scan, and the uniqueness of ``_id_`` are all
-    string comparisons it does not choose. Under a case-folding collation a namespaced read matches
-    another namespace's document, a prefix delete removes it, and two keys that differ only in case stop
-    being two keys -- so the refusal here is about isolation and about the key model, not about ordering.
+    An isolation check. Keys live in ``_id``, and key equality, prefix ranges and ``_id`` uniqueness all
+    use the collection's default collation. Under a case-folding one, a namespace can read and delete
+    another's documents, and keys differing only in case collide. A per-query ``{"locale": "simple"}``
+    is no fix: such queries cannot use the ``_id`` index, and ``_id`` uniqueness would stay folded.
 
-    Overriding per query was the alternative and it is worse. ``collation={"locale": "simple"}`` on each
-    call restores binary matching and makes the ``_id`` index unusable for it, turning the two operations
-    the key layout exists to keep on that index -- ``list`` and ``delete_prefix`` -- into collection
-    scans; and ``_id_`` is the one index whose collation cannot be chosen, so the uniqueness would stay
-    folded and a legitimate second key would arrive as a duplicate. A collection like this cannot host
-    this key space, and saying so once is more use than working incorrectly in a way that reads as
-    working.
-
-    **A collection that is not there is not a collection that passed** (``REQ-E-186``). Nothing here can
-    refuse it -- there is no collation to object to, and this package creates collections implicitly and
-    without one, so refusing would make the first write to an empty database fail. What it must not do is
-    let a caller record the answer: the collection somebody else creates a moment later may carry any
-    collation at all, and a namespace cached as verified is never read again. The return value is that
-    distinction and it is the whole reason this function has one.
+    An absent collection passes, since this package creates collections implicitly without a collation,
+    but it is not verified: someone may create it a moment later with any collation.
 
     Args:
         collection: The collection about to be operated on.
 
     Returns:
-        ``True`` if the collection exists and compares strings byte by byte, which is an answer worth
-        caching. ``False`` if it does not exist yet, which is not an answer at all.
+        ``True`` if the collection exists and compares strings byte by byte, an answer worth caching.
+        ``False`` if it does not exist yet, which must not be cached.
 
     Raises:
-        StorageError: If the collection has a collation whose locale is not
-            :data:`SIMPLE_LOCALE`, naming the locale found and the remedy.
+        StorageError: If the collection has a collation whose locale is not :data:`SIMPLE_LOCALE`,
+            naming the locale found and the remedy. Also if reading the collation fails, with the driver's
+            error chained.
     """
     report = await read_collation(collection)
     collation = report.collation
@@ -818,34 +694,17 @@ async def require_binary_comparison(collection: AsyncCollection[Any]) -> bool:
 
 
 async def rank_fusion_support(collection: AsyncCollection[Any]) -> bool:
-    """Report whether this deployment can run ``$rankFusion`` (``REQ-E-143``).
+    """Report whether this deployment can run ``$rankFusion``.
 
-    A version read, which is the probe :func:`search_support` spends a paragraph refusing. The two are
-    asking about different processes and the difference is the whole justification. Atlas Search is
-    **mongot**, attached or not attached independently of ``mongod``'s version: ``mongo:8`` reports
-    8.3.8 with no search, an Atlas CLI local deployment reports the same empty ``modules`` list and has
-    search, and ``mongod`` 7.0.12 reports ``modules: ['enterprise']`` and has none -- on the four
-    measured deployments the version document points the wrong way. ``$rankFusion`` is an aggregation
-    stage inside ``mongod`` itself, so that same document is authoritative for it.
+    Unlike :func:`search_support`, this reads ``buildInfo``: ``$rankFusion`` is a ``mongod`` stage, so
+    ``mongod``'s version decides it. ``versionArray`` avoids parsing suffixes such as ``-rc1``.
 
-    The floor is major version 8. Not 8.1: the MongoDB 8.0 manual gives 8.0 in the stage's own
-    compatibility note and lists ``$vectorSearch`` among the stages an input pipeline may contain, with
-    a worked example. ``$scoreFusion`` is the one that needs 8.2, and ``$rerank`` needs 8.3 plus Native
-    Reranking enabled in Atlas project settings plus a Voyage AI key; neither is used here.
-
-    ``versionArray`` rather than the ``version`` string, because the server computes it as integers and
-    the string carries suffixes like ``-rc1`` whose parsing this package would otherwise own.
-
-    Every failure reads as ``False``, which is the opposite of :func:`search_support`'s closed-set raise
-    and is the right asymmetry. That probe's answer decides whether search runs at all, so a wrong
-    password must not read as a missing cluster. This one only decides which of two working tiers is
-    preferred: degrading costs the caller the better ranking, while guessing ``True`` costs them a query
-    that fails on every search. Only one of the two is recoverable, and a deployment that will not
-    answer ``buildInfo`` has a problem the next call surfaces anyway.
+    Every failure reads as ``False``. The answer only picks between two working search tiers, so a wrong
+    ``False`` costs ranking quality while a wrong ``True`` makes every search fail.
 
     Args:
-        collection: Any collection on the deployment to probe. Need not exist -- ``buildInfo`` is a
-            database command and does not read it.
+        collection: Any collection on the deployment to probe. Need not exist, since ``buildInfo`` is a
+            database command.
 
     Returns:
         ``True`` if the server reports major version :data:`RANK_FUSION_MIN_MAJOR` or later.
@@ -864,8 +723,7 @@ async def _rank_fusion_support(collection: AsyncCollection[Any]) -> bool:
     if not isinstance(version, Sequence) or isinstance(version, str) or not version:
         return False
     major = version[0]
-    # `bool` is a subclass of `int` and `True >= 8` is `False`, so it would answer correctly by
-    # accident. Excluded anyway: a server sending a boolean here is not a server whose version is known.
+    # `bool` is a subclass of `int`; a boolean here is not a known version.
     if not isinstance(major, int) or isinstance(major, bool):
         return False
     return major >= RANK_FUSION_MIN_MAJOR
@@ -882,21 +740,15 @@ async def ensure(
 ) -> None:
     """Bring a collection's indexes to the declared state, or explain what is stopping that.
 
-    ``REQ-E-060`` through ``REQ-E-064``, ``REQ-E-066`` and ``REQ-E-068``. Safe to call on every
-    ``initialize()``: the warm path is one read per ordinary set plus one per search index, and no
-    writes.
-
-    ``create=False`` is verify-only rather than skip (``REQ-E-061``). A caller whose credentials have no
-    DDL rights still needs to know whether the indexes are there, because a missing vector index does
-    not fail a search, it returns nothing. Verification still waits out a build somebody else started,
-    since *building* is a state whose remedy is patience rather than a command.
-
-    Nothing here drops or alters an existing index. Every conflict is reported with the command that
-    resolves it, and the decision stays with whoever knows what else that index serves.
+    Safe to call on every ``initialize()``: when everything is in place it costs one read for the
+    ordinary indexes plus one per search index, and no writes. ``create=False`` verifies without
+    creating (for credentials with no DDL rights) and still waits for a build someone else started.
+    Nothing here drops or alters an existing index; each conflict is reported with the commands that
+    resolve it.
 
     Args:
-        collection: The collection to index. Its ``database`` is used for the one collection creation
-            the search path needs.
+        collection: The collection to index. Its ``database`` is used to create the collection before a
+            search index is created.
         ordinary: Ordinary and TTL indexes, from :func:`storage_specs` or :func:`memory_specs`.
         search: Atlas Search indexes, from :func:`memory_search_specs`.
         create: Whether missing indexes may be created.
@@ -906,13 +758,12 @@ async def ensure(
     Raises:
         StorageError: If an existing index conflicts with a declared one, if a search build has failed,
             if a build does not finish inside ``timeout``, if something is missing and ``create`` is
-            ``False``, or if the driver refuses a call. Driver errors arrive chained, so the server's
-            own code and message survive.
+            ``False``, or if a driver call fails. Driver errors are chained, so the server's code and
+            message survive.
     """
     attributes = _namespace_attributes(collection)
     attributes["strands_mongodb.indexes.mode"] = "ensure" if create else "verify"
-    # A list rather than an int, so the two helpers can add to it and the count still reaches the span when
-    # one of them raises part way through: a failed call that created two indexes created two indexes.
+    # A list the helpers append to, so the span still gets the count when one of them raises part way.
     created: list[int] = []
     with _telemetry.span("strands_mongodb.indexes.ensure", attributes):
         try:
@@ -943,12 +794,10 @@ def _probe_attributes(
 async def _ensure_ordinary(
     collection: AsyncCollection[Any], specs: tuple[IndexSpec, ...], *, create: bool, created: list[int]
 ) -> None:
-    """Create or verify the ordinary indexes, matching on the key list (``REQ-E-063``)."""
+    """Create or verify the ordinary indexes, matching on the key list."""
     namespace = f"{collection.database.name}.{collection.name}"
     present = await _guard(collection.index_information(), what=f"reading indexes on {namespace}")
-    # A list per key list, not one entry. The server's identity for an index is its keys and its
-    # collation, so a key list can have several indexes over it and a mapping that keeps one keeps
-    # whichever `index_information` happened to report last -- which is creation order (REQ-E-190).
+    # Several indexes can share a key list (identity is keys plus collation), so keep all of them.
     by_keys: dict[tuple[tuple[str, int], ...], list[tuple[str, Mapping[str, Any]]]] = {}
     for name, found in present.items():
         by_keys.setdefault(tuple(tuple(pair) for pair in found["key"]), []).append((name, found))
@@ -973,9 +822,8 @@ async def _ensure_ordinary(
         ", ".join(spec.name for spec in missing),
         extra=_telemetry.event_extra("creating_indexes", namespace=namespace),
     )
-    # One call for all of them. Three round trips where one would do is three chances for a partial
-    # result to leave the collection half indexed, and the server tolerates a concurrent identical
-    # create anyway (measured: 10 at once, zero failures, one index).
+    # One call for all of them. The server tolerates concurrent identical creates (10 at once: no
+    # failures, one index).
     await _guard(
         collection.create_indexes([spec.to_model() for spec in missing]),
         what=f"creating indexes on {namespace}",
@@ -990,9 +838,8 @@ def _folding_locale(found: Mapping[str, Any]) -> str | None:
         found: The entry ``index_information`` reported for an index.
 
     Returns:
-        The locale, or ``None`` when the index reports no collation at all or reports ``simple``. Absence
-        is the ordinary answer rather than a missing one: the server does not store a simple collation, so
-        an index created without one and an index created ``{locale: "simple"}`` both report nothing.
+        The locale, or ``None`` when the index reports no collation or ``simple``. The server does not
+        store a simple collation, so an index created with one reports nothing.
     """
     collation = found.get("collation")
     if not isinstance(collation, Mapping):
@@ -1009,29 +856,17 @@ def _check_matches(
     spec: IndexSpec,
     matches: Sequence[tuple[str, Mapping[str, Any]]],
 ) -> None:
-    """Hold every existing index over a declared index's keys to the rules, not just one (``REQ-E-190``).
+    """Check every existing index over a declared index's keys, not just one.
 
-    Two questions, and they are different questions. The first is about the deployment: does anything over
-    these keys enforce a rule this package cannot see? A unique index under a folding collation does, it is
-    enforced by the server whether or not a correct index sits beside it, and ``REQ-E-187``'s cross-tenant
-    write loss follows from it regardless. That is refused wherever it appears in the list.
-
-    The second is about this package: is any of these indexes one this package can use? Exactly one needs
-    to be -- correct options and a collation this package's queries can match on -- and the rest are then
-    somebody else's business, which is ``REQ-E-063``'s standing position. A folding index that enforces
-    nothing is not a rule anyone is wrong about, so beside a usable index it is accepted; alone, it is the
-    only index over those keys, no binary query can use it, and ``REQ-E-187`` refuses it as before.
-
-    Args:
-        collection_name: The collection, for the commands in the message.
-        namespace: ``database.collection``, for the message.
-        spec: The declared index these indexes matched on keys.
-        matches: Every existing index over those keys, in the order the server reported them.
+    Two checks. First, a unique index under a folding collation is refused wherever it appears: the
+    server enforces its folded uniqueness even beside a correct index, so records from different scopes
+    can collide. Second, at least one match must be usable (the right options and a binary collation).
+    Once one is, the others are someone else's business, so a non-unique folding index beside a usable
+    one is accepted. ``matches`` is every existing index over the spec's keys, in server order.
 
     Raises:
-        StorageError: If any match enforces uniqueness under a folding collation, or if no match is one
-            this package can use. In the second case the first match's own failure is what is reported,
-            which for a single match is the message it has always produced.
+        StorageError: If any match enforces uniqueness under a folding collation, or if no match is
+            usable. In the second case the first match's failure is reported.
     """
     if not spec.date_only:
         for found_name, found in matches:
@@ -1048,8 +883,7 @@ def _check_matches(
             first = first or refusal
             continue
         return
-    # Unreachable with an empty `matches`, which the caller filters out, and otherwise `first` is set:
-    # the loop returns on the first match that passes both checks, so arriving here means none did.
+    # The caller never passes an empty `matches`, so reaching here means every match failed.
     assert first is not None
     raise first
 
@@ -1061,22 +895,11 @@ def _folded_constraint_message(
     found_name: str,
     locale: str,
 ) -> str:
-    """Build the refusal for a unique index enforcing its rule under a folding collation (``REQ-E-190``).
+    """Build the refusal for a unique index that enforces uniqueness under a folding collation.
 
-    Separate from ``_check_collation``'s message because the situation it describes is different, and the
-    difference is the part a reader will not guess: here the declared index may be present and perfectly
-    correct, so the obvious remedy -- create the right index -- has already been done and did not help.
-
-    Args:
-        collection_name: The collection, for the commands in the message.
-        namespace: ``database.collection``, for the message.
-        spec: The declared index whose keys this index covers.
-        found_name: What the existing index is called.
-        locale: The locale it folds under.
-
-    Returns:
-        The message, ending in the command that removes the index and the command that recreates the
-        declared one, for the case where it is not there either.
+    Separate from ``_check_collation``'s message because here the declared index may already be present
+    and correct, so creating it does not help. The message ends with the drop command and the command
+    that creates the declared index.
     """
     return (
         f"strands_mongodb: the index {found_name!r} on {namespace} covers the keys {list(spec.keys)} "
@@ -1100,35 +923,18 @@ def _check_collation(
     found_name: str,
     found: Mapping[str, Any],
 ) -> None:
-    """Refuse a matched index whose collation does not compare strings byte for byte (``REQ-E-187``).
+    """Refuse a matched index whose collation does not compare strings byte for byte.
 
-    ``require_binary_comparison`` asks the same question of the *collection*, and an index carries its
-    own answer: a collection with no default collation passes that preflight while holding a unique index
-    created ``{locale: "en", strength: 2}``. That index is what the dedup rule is enforced by, so on such
-    a collection the rule is the folded one -- two memories whose text differs only in case hash to
-    different values, match the same index entry, and the second write comes back
-    ``ids=[], inserted=0, duplicates=1`` for a memory that was never stored. The caller is told it was
-    already there, and ``_existing()`` re-queries with the binary selector, which a collated index cannot
-    serve, so nothing can find it.
+    An index carries its own collation, so a collection that passes ``require_binary_comparison`` can
+    still hold a folding unique index. The dedup rule would then be the folded one: records whose keys
+    differ only in case collide, so a memory can be reported as a duplicate and never stored.
 
-    Not an entry in :attr:`IndexSpec.options`, which is where a rule about an index option would
-    otherwise live. The server does not store a simple collation -- an index created without one and an
-    index created ``{locale: "simple"}`` both report no ``collation`` at all -- so a wanted value of
-    ``{"locale": "simple"}`` would find it absent on every correct index and refuse every deployment.
-    What is checkable is the opposite: a collation that *is* reported and is not ``simple``.
-
-    Args:
-        collection_name: The collection, for the commands in the message.
-        namespace: ``database.collection``, for the message.
-        spec: The declared index the existing one matched on keys.
-        found_name: What the existing index is called, which is whatever its creator chose.
-        found: The entry ``index_information`` reported for it.
+    Not an :attr:`IndexSpec.options` entry: the server does not store a simple collation, so a wanted
+    ``{"locale": "simple"}`` would be absent on every correct index.
 
     Raises:
-        StorageError: If the index reports a collation whose locale is not ``simple``. Reported with the
-            drop and recreate commands rather than acted on, for ``REQ-E-063``'s standing reason: the
-            index may be serving queries nothing here knows about, and dropping it is not this package's
-            decision to make.
+        StorageError: If the index reports a collation whose locale is not ``simple``. The message holds
+            the drop and recreate commands; nothing is dropped here.
     """
     if spec.date_only:
         return
@@ -1160,8 +966,7 @@ def _check_options(
     """Compare an existing index against the options a spec asked for, raising on the first difference.
 
     Only options this package sets are compared. ``v``, ``background``, ``hidden`` and anything else the
-    server or another tool added are not ours to have an opinion about, and treating them as mismatches
-    would make every index on a real deployment look wrong.
+    server or another tool added are ignored.
     """
     for option, wanted in spec.options.items():
         if option in found and found[option] == wanted:
@@ -1181,11 +986,7 @@ def _check_options(
 
 
 def _missing_ordinary_message(collection_name: str, namespace: str, missing: Sequence[IndexSpec]) -> str:
-    """Build the verify-only message, which is a work order rather than a complaint (``REQ-E-061``).
-
-    Every command goes on its own line, all of them in one message. A caller who has to raise one ticket
-    per index raises three tickets, and the whole list is computable in a single pass.
-    """
+    """Build the verify-only message, listing every missing index's creation command on its own line."""
     commands = "\n".join(spec.creation_command(collection_name) for spec in missing)
     return (
         f"strands_mongodb: {len(missing)} required index(es) are absent from {namespace} and "
@@ -1226,8 +1027,8 @@ async def _ensure_search(
     if missing:
         if not create:
             raise StorageError(_missing_search_message(collection.name, namespace, missing))
-        # Before the index, not after. `createSearchIndexes` against a missing namespace is code 26,
-        # while `createIndexes` in the same position creates the collection implicitly (REQ-E-068).
+        # `createSearchIndexes` on a missing collection fails with code 26, unlike `createIndexes`, which
+        # creates it implicitly.
         await _create_collection(collection, namespace)
         for spec in missing:
             logger.info(
@@ -1246,9 +1047,8 @@ async def _ensure_search(
 
     if not waiting:
         return
-    # The timeout is raised here, after the wait span has closed, and not inside it. A wait that ran out is
-    # an outcome of the wait rather than a failure of it (REQ-E-204): the span says `timed_out` and keeps
-    # its status unset, and the error belongs to the `ensure` span, which is the call that gives up.
+    # Raised after the wait span closes: a timeout is the wait's outcome (`timed_out`, status unset), and
+    # the error belongs to the `ensure` span.
     with _telemetry.span("strands_mongodb.indexes.wait", _namespace_attributes(collection)):
         stuck = await _wait_until_ready(collection, waiting, namespace, timeout=timeout, interval=interval)
         _telemetry.annotate("strands_mongodb.indexes.outcome", "ready" if stuck is None else "timed_out")
@@ -1257,8 +1057,8 @@ async def _ensure_search(
             f"strands_mongodb: waited {timeout}s for {len(stuck)} search index(es) on "
             f"{namespace} to report READY and they did not: {', '.join(stuck)}. BUILDING at this point means "
             f"a build slower than the timeout. A store with a named search_type can call initialize() "
-            f"again to keep waiting; under 'auto' the tier is dropped for this store instance, and a new "
-            f"store picks it up once it is READY. Any other status is worth reading directly with "
+            f"again to keep waiting; under 'auto' the store answers from its other tiers and tries this one "
+            f"again later. Any other status is worth reading directly with "
             f"db.{collection.name}.getSearchIndexes()."
         )
 
@@ -1266,18 +1066,16 @@ async def _ensure_search(
 async def _read_search_index(collection: AsyncCollection[Any], name: str, namespace: str) -> dict[str, Any] | None:
     """Read one search index by name, or ``None`` if it is not there.
 
-    ``list_search_indexes`` is itself a coroutine returning an async cursor, so the cursor arrives from
-    the ``await`` rather than from iterating the call. Pinned by ``MP-002``, because getting it the other
-    way round is a ``TypeError`` on a deployment and nothing at all against a loose fake.
+    ``list_search_indexes`` is a coroutine that returns an async cursor, so it is awaited before it is
+    iterated.
     """
     try:
         cursor = await collection.list_search_indexes(name)
         async for document in cursor:
             return dict(document)
     except OperationFailure as error:
-        # A collection that does not exist has no indexes, which is the answer rather than an error.
-        # `list_indexes` already normalises this for ordinary indexes; the aggregate behind
-        # `$listSearchIndexes` is not documented to, so it is normalised here.
+        # Code 26: an absent collection has no indexes. `$listSearchIndexes` is not documented to hide
+        # this the way `list_indexes` does, so it is handled here.
         if error.code != _COLLECTION_ABSENT:
             raise StorageError(
                 f"strands_mongodb: reading search index {name!r} on {namespace} failed: {error}"
@@ -1288,11 +1086,10 @@ async def _read_search_index(collection: AsyncCollection[Any], name: str, namesp
 
 
 def _check_definition(collection_name: str, namespace: str, spec: SearchIndexSpec, document: Mapping[str, Any]) -> None:
-    """Check that an existing search index's definition covers the declared one (``REQ-E-069``).
+    """Check that an existing search index's definition covers the declared one.
 
-    Re-issuing a *different* definition under an existing name is code 68, *"already exists with a
-    different definition. Drop it first if needed."*, so this reports the same thing before the server
-    has to, and reports it on the warm path where nothing is re-issued at all.
+    The server would reject a different definition under the same name with code 68, but only on
+    creation. This catches the mismatch on the warm path too, where nothing is created.
     """
     definition = document.get("latestDefinition")
     if definition is None:
@@ -1313,24 +1110,17 @@ def _check_definition(collection_name: str, namespace: str, spec: SearchIndexSpe
 def _definition_gap(wanted: Any, found: Any, path: str = "definition") -> str | None:
     """Describe the first place ``found`` fails to cover ``wanted``, or ``None`` if it covers it.
 
-    Containment rather than equality, because equality is not available (``REQ-E-069``).
-    ``latestDefinition`` round-trips byte for byte for a ``vectorSearch`` index and is rewritten for a
-    ``search`` one: mongot 8.3.8 collapses the one-element list in ``mappings.fields.<field>`` into the
-    object it held and fills in ``indexOptions``, ``store`` and ``norms``. Comparing for equality
-    therefore passes on the vector index and fails on the text index that this package created itself
-    one call earlier.
+    Containment, not equality, because mongot rewrites a ``search`` index's ``latestDefinition``: it
+    collapses the one-element list in ``mappings.fields.<field>`` into the object it held and fills in
+    ``indexOptions``, ``store`` and ``norms``. Equality would fail on a text index this package just
+    created. (A ``vectorSearch`` definition comes back unchanged.)
 
-    Three rules, in the order they are applied:
+    The rules:
 
-    * A declared object is covered when every key it declares is present and covered. Keys the server or
-      another tool added are ignored, which is the rule ``REQ-E-063`` already applies to ordinary index
-      options and the only rule under which an index somebody else wrote can be judged at all.
-    * A declared one-element list is covered by the object the server reports in its place, which is the
-      rewrite above.
-    * A declared list is covered when **something** in the reported list covers each of its entries,
-      order-insensitively. Order is in fact preserved for the vector definition, but requiring it would
-      report a mismatch over an index that is functionally identical, and extra fields are somebody
-      else's business.
+    * A declared object is covered when every key it declares is present and covered. Added keys are
+      ignored.
+    * A declared one-element list is covered by an object reported in its place.
+    * A declared list is covered when each of its entries is covered by some reported entry, in any order.
 
     Args:
         wanted: The declared definition, or a fragment of one.
@@ -1367,14 +1157,10 @@ def _definition_gap(wanted: Any, found: Any, path: str = "definition") -> str | 
 
 
 def _failed_message(collection_name: str, namespace: str, spec: SearchIndexSpec, document: Mapping[str, Any]) -> str:
-    """Build the message for a build that failed (``REQ-E-062``).
+    """Build the message for a search index build that failed.
 
-    Reported rather than recreated. An identical definition issued over a failed build is accepted and
-    does not restart it, so a create here would burn the whole timeout to learn what the status already
-    said.
-
-    ``statusDetail`` is rendered whole rather than picked apart. Its shape is per-host and per-index and
-    is not something this package can claim to know; the reader needs the server's words.
+    Reported rather than recreated: issuing the same definition over a failed build is accepted but does
+    not restart it. ``statusDetail`` is rendered whole, since its shape varies by host and index.
     """
     detail = json.dumps(document.get("statusDetail", []), default=str)
     return (
@@ -1388,7 +1174,7 @@ def _failed_message(collection_name: str, namespace: str, spec: SearchIndexSpec,
 
 
 def _missing_search_message(collection_name: str, namespace: str, missing: Sequence[SearchIndexSpec]) -> str:
-    """Build the verify-only message for absent search indexes (``REQ-E-061``)."""
+    """Build the verify-only message for absent search indexes."""
     commands = "\n".join(spec.creation_command(collection_name) for spec in missing)
     return (
         f"strands_mongodb: {len(missing)} required search index(es) are absent from {namespace} and "
@@ -1403,10 +1189,9 @@ def _missing_search_message(collection_name: str, namespace: str, missing: Seque
 async def _create_collection(collection: AsyncCollection[Any], namespace: str) -> None:
     """Create the collection if it is not already there, without checking first.
 
-    ``check_exists=False`` removes a check-then-act race and a round trip. It also removes
-    ``CollectionInvalid`` from the picture: pymongo raises that only from the client-side branch this
-    argument disables, so a genuine race arrives as code 48 instead. On 8.3.8 the second create is
-    accepted outright and 48 never arrives, so the handler below is defense for other server versions.
+    ``check_exists=False`` avoids a check-then-act race and a round trip, and means pymongo never raises
+    ``CollectionInvalid``. A lost race arrives as code 48 (namespace exists) instead, which is ignored.
+    8.3.8 accepts the second create outright; the handler is for other server versions.
     """
     try:
         await collection.database.create_collection(collection.name, check_exists=False)
@@ -1425,22 +1210,15 @@ async def _wait_until_ready(
     timeout: float,
     interval: float,
 ) -> list[str] | None:
-    """Poll until every index reports READY, or until ``timeout`` (``REQ-E-062``, ``REQ-E-066``).
+    """Poll until every index reports READY, or until ``timeout``.
 
-    ``asyncio.sleep`` rather than ``time.sleep``. That single substitution is most of what
-    ``REQ-E-066`` is about: the reference helpers block, and blocking here stalls every other coroutine
-    in an agent process for as long as the build takes.
-
-    Transitions are logged as they happen. A two-minute wait with no output reads as a hang, and the
-    status is the only thing that distinguishes a slow build from a stuck one.
-
-    Readiness is a claim about two things, so both are checked before an index leaves ``pending``: the
-    status the server reports, and the definition it reports alongside it (``REQ-E-175``). See the
-    comment on the ``ready`` branch for what drifts and how.
+    Sleeps with ``asyncio.sleep`` so other coroutines keep running during a build. Status changes are
+    logged, so a long wait does not look like a hang. An index leaves ``pending`` only when it reports
+    READY and its reported definition still covers the declared one.
 
     Returns:
-        ``None`` once every index is ready, or ``"<name> is <status>"`` for each one still pending when the
-        deadline passed. The caller raises on the second, once its wait span has recorded the outcome.
+        ``None`` once every index is ready, or ``"<name> is <status>"`` for each one still pending at the
+        deadline, for the caller to raise on.
 
     Raises:
         StorageError: If a build reports FAILED, if a ready index's definition does not cover the declared
@@ -1453,10 +1231,8 @@ async def _wait_until_ready(
     while True:
         for name in list(pending):
             document = await _read_search_index(collection, name, namespace)
-            # An index that has vanished reads as *building*, through the same default that catches an
-            # unrecognised status. It was there on the previous read, so something else dropped it, and
-            # waiting is the only move left: reporting ready would be false, and recreating it would
-            # race whoever is holding the other end of that drop.
+            # A vanished index reads as building. Someone else dropped it, and recreating it would race
+            # whoever did.
             status = "absent" if document is None else str(document.get("status", "unreported"))
             if status != last.get(name):
                 logger.info(
@@ -1469,27 +1245,12 @@ async def _wait_until_ready(
                 last[name] = status
             state = readiness(status)
             if state == "failed":
-                # Reachable only for the literal FAILED status, which cannot come from a missing
-                # document, so the fallback below is for the type checker rather than for a caller.
+                # A missing document never reports FAILED, so `or {}` is only for the type checker.
                 raise StorageError(_failed_message(collection.name, namespace, pending[name], document or {}))
             if state == "ready":
-                # Rechecked here, and not only on the cold read before the poll began
-                # (``REQ-E-175``). The status is not the whole answer: a definition that was right when
-                # the wait started can be wrong when it ends, because a search index cannot be redefined
-                # in place but it can be dropped and recreated, and mongot will happily build the
-                # replacement under the same name while this loop watches the name rather than the
-                # definition. Two ways in, both measured against the fake:
-                #
-                # * an index found BUILDING with a covering definition, dropped and recreated by another
-                #   actor mid-build, reporting READY with a definition that no longer covers this
-                #   package's;
-                # * an index this package created itself one call earlier, whose build was never checked
-                #   against what was asked for at all -- the cold read found nothing, so
-                #   ``_ensure_search`` had no document to check and never got another.
-                #
-                # Accepting either ships a silent empty result with the loudest symptom removed: searches run,
-                # return nothing or the wrong thing, and every index reports READY. One extra containment
-                # check over a document already in hand is the whole cost; there is no additional read.
+                # Recheck the definition: another actor may have dropped and recreated the index under
+                # the same name during the wait, and an index created by this call was never checked.
+                # Accepting a wrong definition makes searches return nothing while every index is READY.
                 _check_definition(collection.name, namespace, pending[name], document or {})
                 del pending[name]
 
@@ -1501,11 +1262,10 @@ async def _wait_until_ready(
 
 
 async def _guard(awaitable: Any, *, what: str) -> Any:
-    """Await something and turn a driver error into the exception a caller catches.
+    """Await something and turn a driver error into ``StorageError``.
 
-    ``StorageError`` is what the ``Storage`` protocol documents, and a caller should not have to import
-    pymongo to handle a failure from a package they configured with a dict. The original is chained, so
-    the server's code and message stay reachable through ``__cause__``.
+    ``StorageError`` is what the ``Storage`` protocol documents. The driver error is chained, so the
+    server's code and message stay reachable through ``__cause__``.
     """
     try:
         return await awaitable

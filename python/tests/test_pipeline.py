@@ -431,8 +431,15 @@ class TestTheHybridTierIsOneNativeStage:
         ``min_score`` would return nothing while the collection was full."""
         stages = self._hybrid()
 
-        assert _names(stages) == ["$rankFusion", "$set"]
+        assert _names(stages) == ["$rankFusion", "$set", "$limit"]
         assert stages[1] == {"$set": {"score": {"$meta": "score"}}}
+
+    def test_the_fused_list_is_capped_at_the_limit(self) -> None:
+        """AT-225 / ``REQ-E-217``. Each input pipeline returns up to ``limit`` documents and the fusion
+        returns their union, so without a final ``$limit`` two tiers that disagree return twice the limit."""
+        stages = self._hybrid(limit=7)
+
+        assert stages[-1] == {"$limit": 7}
 
     def test_the_outer_projection_uses_neither_tiers_score_name(self) -> None:
         """The fused score has a third ``$meta`` name of its own, and asking for either tier's name here
@@ -455,7 +462,7 @@ class TestTheHybridTierIsOneNativeStage:
         stages = self._hybrid()
         pipelines = stages[0]["$rankFusion"]["input"]["pipelines"]
 
-        assert _names(stages)[-1] == "$set"
+        assert "$set" in _names(stages)
         assert not any("$set" in _names(branch) for branch in pipelines.values())
 
     def test_no_union_reaches_the_server_on_this_path(self) -> None:

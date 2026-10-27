@@ -1,10 +1,7 @@
-"""What both examples need and neither should own.
+"""Shared scaffolding for the two examples in this directory.
 
-Not part of the installed package. It lives here so the two scripts can share a scripted model, a
-connection lookup and a key-space census without either one growing a second job, and so a reader can
-see every piece of scaffolding in one file instead of hunting it through both examples.
-
-Nothing here is API. The names are stable only for the two scripts beside it.
+Holds the scripted model, the connection lookup, the argument parser and the key-prefix census, so each
+example script contains only what it demonstrates. Not part of the installed package and not an API.
 """
 
 from __future__ import annotations
@@ -40,8 +37,7 @@ __all__ = [
     "step_parser",
 ]
 
-#: The one variable either example requires. Named in the failure message rather than described, so a
-#: reader can copy it out of the error into an export.
+#: The environment variable both examples read the connection string from.
 URI_VARIABLE = "MONGODB_URI"
 
 #: Everything between the scheme and the host, which is where a password sits.
@@ -51,19 +47,14 @@ _line = count(1)
 
 
 class ExampleError(RuntimeError):
-    """A condition the reader can fix, reported without a traceback.
+    """A condition the reader can fix, reported as one line without a traceback.
 
-    Anything else is left to propagate. A stack trace is the right output for a bug in the example,
-    and the wrong output for a missing environment variable.
+    Any other exception propagates with its traceback, since it points at a bug in the example.
     """
 
 
 def say(message: str) -> None:
-    """Print one numbered line of prose.
-
-    Numbering, rather than plain prints, because both examples are read as a transcript after the
-    fact: a numbered line can be pointed at, and a step that prints nothing between line 4 and line 5
-    is visible.
+    """Print one numbered line of output, so a transcript can be referred to by line.
 
     Args:
         message: One line, already worded for a reader.
@@ -106,11 +97,10 @@ def connection() -> str:
 
 
 def model_banner(name: str) -> str:
-    """Say which model is running the turn and what picking it changed.
+    """Say which model runs the turn and which parts of the output it affects.
 
-    Naming the model is not enough on its own. A reader who sees a plausible assistant reply and no
-    note about where it came from can read a canned string as evidence of model behavior, so the line
-    says what is scripted and what is not (``REQ-E-085``).
+    The scripted model's replies are canned, so the banner says so. Otherwise a reader could take a
+    canned reply as evidence of model behaviour.
 
     Args:
         name: The value of ``--model``.
@@ -121,7 +111,8 @@ def model_banner(name: str) -> str:
     if name == "scripted":
         return (
             "model: scripted. The assistant's replies come from a list in _support.py, so the turn "
-            "costs nothing and reads the same on every run. Every MongoDB call below is real. Pass "
+            "costs nothing and reads the same on every run. Only the model is scripted: when a step runs, its "
+            "MongoDB calls are real. Pass "
             "--model bedrock to run the same script against the SDK's default provider."
         )
     return (
@@ -131,14 +122,10 @@ def model_banner(name: str) -> str:
 
 
 def mongodb_config(uri: str, database: str) -> MongoDBConfig:
-    """Build the connection half of a ``MongoDBConfig``.
+    """Build a ``MongoDBConfig`` from a connection string.
 
-    Both examples pass a connection string rather than a client, which is the shape a reader is most
-    likely to start from and the one that leaves lifecycle to the package.
-
-    Typed as ``MongoDBConfig`` and not ``dict[str, Any]``. The package exports the ``TypedDict``, so an
-    example that declares it gets the same key checking a reader's own code would, and a returned
-    ``dict[str, Any]`` would silently accept a misspelled ``connection_sting``.
+    Passing a connection string rather than a client leaves the client's lifecycle to the package.
+    The return type lets a type checker catch a misspelled key.
 
     Args:
         uri: A MongoDB connection string.
@@ -153,9 +140,8 @@ def mongodb_config(uri: str, database: str) -> MongoDBConfig:
 def step_parser(description: str, steps: Sequence[str]) -> argparse.ArgumentParser:
     """Build the parser both examples share.
 
-    Every default is a fixed string rather than a generated one, and that is what makes the command
-    one step prints runnable as the next step: a random default would be gone by the time the reader
-    ran it.
+    Every default is a fixed string, not a generated one, so the next-step command one run prints still
+    points at the same data when the reader runs it.
 
     Args:
         description: Shown by ``--help``.
@@ -183,8 +169,8 @@ def next_command(script: str, step: str, options: Sequence[tuple[str, str]]) -> 
         script: File name of the running example.
         step: The step to run next.
         options: Flag and value pairs to carry over, already filtered to the ones that differ from
-            their defaults. Dropping a flag here sends the reader to a namespace the previous step
-            never wrote to, which is why the acceptance test asserts on this string.
+            their defaults. A dropped flag would send the next step to a namespace the previous
+            step never wrote to.
 
     Returns:
         A command line, quoted so it survives a copy into a shell.
@@ -198,10 +184,7 @@ def next_command(script: str, step: str, options: Sequence[tuple[str, str]]) -> 
 def carried_options(
     parser: argparse.ArgumentParser, parsed: argparse.Namespace, names: Sequence[str]
 ) -> list[tuple[str, str]]:
-    """Return the options worth repeating in the next command.
-
-    An option holding its default is left out, because a command line of every flag at its default
-    value is noise a reader has to read past to find the one thing that matters.
+    """Return the options to repeat in the next command, leaving out any that hold their default.
 
     Args:
         parser: The parser that produced ``parsed``, read for its defaults.
@@ -220,10 +203,9 @@ def carried_options(
 
 
 def emit_summary(payload: dict[str, Any], *, enabled: bool) -> None:
-    """Print the one machine-readable line, when it was asked for.
+    """Print one line of JSON when ``--summary-json`` was passed.
 
-    Off by default so a reader sees prose and nothing else. The acceptance tests turn it on rather
-    than parsing the prose, which is what lets the prose be rewritten without breaking them.
+    The tests read this line instead of parsing the prose, so the prose can change freely.
 
     Args:
         payload: Anything JSON-serializable.
@@ -234,19 +216,17 @@ def emit_summary(payload: dict[str, Any], *, enabled: bool) -> None:
 
 
 async def prefix_census(collection: Any) -> list[dict[str, Any]]:
-    """Count documents and bytes per top-level key prefix.
+    """Count documents and bytes per top-level key prefix, as read from the collection.
 
-    Read from the collection rather than assembled from what the script believes it wrote. The
-    prefixes are the SDK's, not this package's: ``session/`` comes from ``SnapshotSessionManager``,
-    ``offloader/`` from ``ContextOffloader`` and ``memory/`` from ``FileMemoryStore``. A census that
-    reports what it found survives the SDK renaming one of them; a hard-coded list does not.
+    The prefixes belong to the SDK (``session/`` from ``SnapshotSessionManager``, ``offloader/`` from
+    ``ContextOffloader``, ``memory/`` from ``FileMemoryStore``), so they are discovered, not hard-coded.
 
     Args:
         collection: An ``AsyncCollection`` holding storage documents.
 
     Returns:
         One entry per prefix, sorted by prefix, each with ``prefix``, ``documents`` and ``bytes``.
-        A key with no ``/`` reports under its whole self.
+        A key with no ``/`` is its own prefix, reported with a ``/`` appended.
     """
     pipeline: list[dict[str, Any]] = [
         {
@@ -265,19 +245,16 @@ async def prefix_census(collection: Any) -> list[dict[str, Any]]:
 
 
 class ScriptedModel(Model):
-    """A ``Model`` that reads its replies from a list instead of a provider.
+    """A ``Model`` that reads its replies from a list instead of calling a provider.
 
-    Here so both examples run with ``MONGODB_URI`` as their only configuration. The parts of these
-    examples worth reading are the memory store, the storage backend and what MongoDB holds afterwards;
-    the model's contribution is to produce one turn so the extraction trigger and the offloader's
-    after-tool hook fire. A scripted reply does that for free, and a reader with no Bedrock access can
-    still run the whole thing. Pass ``--model bedrock`` to swap in a real one.
+    The examples need a model only to produce a turn, so the extraction trigger and the offloader's
+    after-tool hook have something to fire on. A scripted reply does that at no cost and needs no
+    provider credentials. Pass ``--model bedrock`` to use a real model.
 
-    The event sequence is the SDK's own, taken from ``tests/fixtures/mocked_model_provider.py``:
-    ``messageStart``, then a ``contentBlockStart`` / ``contentBlockDelta`` / ``contentBlockStop`` triple
-    per content block, then ``messageStop`` carrying the stop reason. A block with a ``toolUse`` sets the
-    reason to ``tool_use`` and serializes its input, which is how the event loop knows to run the tool
-    and come back for another turn.
+    The event sequence matches the SDK's mocked provider: ``messageStart``, then ``contentBlockStart``,
+    ``contentBlockDelta`` and ``contentBlockStop`` per content block, then ``messageStop`` with the stop
+    reason. A ``toolUse`` block sets the reason to ``tool_use``, which makes the event loop run the tool
+    and ask for another reply.
     """
 
     def __init__(self, replies: Sequence[dict[str, Any]]) -> None:
@@ -291,7 +268,7 @@ class ScriptedModel(Model):
         self._index = 0
 
     def update_config(self, **model_config: Any) -> None:
-        """Accept and ignore configuration, because there is none to change."""
+        """Accept and ignore configuration; there is none."""
 
     def get_config(self) -> dict[str, Any]:
         """Return an empty configuration.
@@ -302,7 +279,7 @@ class ScriptedModel(Model):
         return {}
 
     async def structured_output(self, output_model: Any, prompt: Any, system_prompt: str | None = None, **kwargs: Any):
-        """Refuse, rather than return nothing.
+        """Refuse, since a scripted model has no structured output.
 
         Args:
             output_model: Ignored.
@@ -311,8 +288,7 @@ class ScriptedModel(Model):
             **kwargs: Ignored.
 
         Raises:
-            NotImplementedError: Always. A scripted model has no structured output, and a silent
-                ``None`` from a structured call is an afternoon of debugging for whoever meets it.
+            NotImplementedError: Always. Raising is clearer than returning ``None``.
         """
         raise NotImplementedError("ScriptedModel has no structured output; pass --model bedrock")
         yield {}  # pragma: no cover - unreachable, present so the method is an async generator
@@ -320,21 +296,16 @@ class ScriptedModel(Model):
     async def stream(self, *args: Any, **kwargs: Any) -> AsyncIterator[StreamEvent]:
         """Stream the next scripted reply as ``StreamEvent`` dictionaries.
 
-        Every argument is ignored, including the messages. A model that answered the conversation would
-        make the example's output depend on the model, and the point of these two scripts is that the
-        output depends on MongoDB.
-
-        ``StreamEvent`` rather than ``dict[str, Any]`` in the annotation, because the supertype promises
-        it and mypy checks each yielded literal against it. That is worth having here: an event with a
-        misspelled key streams as a no-op and produces a turn with no content, which reads like a model
-        problem rather than a typo.
+        Every argument is ignored, including the messages, so the output depends only on MongoDB.
+        The ``StreamEvent`` annotation lets mypy check each yielded event; a misspelled key would
+        otherwise stream as a silent no-op.
 
         Yields:
             One reply's worth of stream events.
 
         Raises:
-            RuntimeError: If the script has run out. Raising names the shortfall; falling off the end
-                would yield an empty stream, which the event loop reads as a reply with no content.
+            RuntimeError: If the script has run out of replies. An empty stream would read as a reply
+                with no content.
         """
         if self._index >= len(self._replies):
             raise RuntimeError(
@@ -375,7 +346,7 @@ def resolve_model(name: str, replies: Sequence[dict[str, Any]]) -> Model:
         the environment already provides and whichever model id the SDK defaults to.
 
     Raises:
-        ExampleError: If ``name`` is neither.
+        ExampleError: If ``name`` is neither of those.
     """
     if name == "scripted":
         return ScriptedModel(replies)

@@ -33,11 +33,14 @@ The first version with working code in it. Planned, not released.
 - `MongoDBMemoryStore`, with `initialize()`, `add()`, `search()`, `delete()`, `delete_all()` and
   `get_tools()`.
 - Three search tiers behind `MongoDBMemoryStore.search()`: `vector`, `text`, and `hybrid` fusing the
-  two with `$rankFusion`. `auto` picks among them.
+  two with `$rankFusion`. `auto` picks among them. Every tier returns at most the requested limit.
+- Under `auto`, a search tier that could not be prepared at startup is tried again on a later
+  operation, first after 60 seconds and then with the delay doubling up to an hour. A retry does not
+  wait for an index build.
 - Record expiry, armed differently on each surface: `MongoDBMemoryStore.initialize()` provisions the
   TTL index itself, while `MongoDBStorage` leaves it to an explicit `await storage.ensure_indexes()`
   at startup, because an `Agent` builds its storage where an operator never sees it and DDL should
-  not be issued from there.
+  not be issued from there. A negative `ttl_seconds` is rejected at construction.
 - `appName` attribution on every client the package builds from a connection string: `strands-mongodb`,
   or the caller's own value with `-strands-mongodb` appended. An injected client is left as it is.
 - OpenTelemetry spans for every public operation of both stores, and for the index work they cause,
