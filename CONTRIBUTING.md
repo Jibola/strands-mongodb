@@ -98,7 +98,7 @@ starts the workflow by hand from the Actions tab:
 | `Latest SDK compatibility` | Weekly or on demand, against the newest published `strands-agents` rather than the pinned one. Typechecks, then runs `compat`, then runs `contract` |
 | `Atlas tiers` | Weekly, or on demand. Creates an Atlas cluster for the run, runs `hatch run test -m "integration or autoembed"` against it, and deletes it |
 
-![Where each test tier runs: the unit and contract tiers and the integration tier on every change, the Atlas tiers on a throwaway cluster weekly or on demand](docs/images/ci-tiers.svg)
+![Where each test tier runs: the unit and contract tiers and the integration tier on every change, the Atlas tiers on a throwaway cluster weekly or on demand](docs/images/ci-tiers.png)
 
 Every change gets the `integration` tier, from a fork as readily as from a branch, because the Atlas local
 container carries the search process it needs. Only `autoembed` needs a real Atlas cluster: automated
