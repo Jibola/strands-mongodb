@@ -1,12 +1,11 @@
-"""``MongoDBStorage`` -- MongoDB behind the Strands unified ``Storage`` protocol.
+"""``MongoDBStorage``: MongoDB behind the Strands unified ``Storage`` protocol.
 
 Requires the ``storage`` extra::
 
     pip install 'strands-mongodb[storage]'
 
-One ``Storage`` instance is consumed by five SDK subsystems -- sessions, context offloading,
-memory persistence, context history and transcripts -- via the top-level ``storage`` parameter
-on ``Agent``, so a single implementation covers all of them.
+Pass one instance to ``Agent(storage=...)`` and it serves all five SDK subsystems that use storage:
+sessions, context offloading, memory persistence, context history and transcripts.
 """
 
 from __future__ import annotations
@@ -18,8 +17,8 @@ from typing import TYPE_CHECKING, Any, Final, ParamSpec, TypeVar
 
 from ._extras import missing_extra
 
-# Imported for their side effect of proving the `storage` extra is installed: without it the
-# failure would otherwise surface deep inside a method call as a bare ModuleNotFoundError.
+# Imported only to prove the `storage` extra is installed, so a missing extra fails here with a clear
+# message instead of as a bare ModuleNotFoundError inside a method call.
 try:
     import pymongo  # noqa: F401
     from strands.storage import Storage  # noqa: F401
@@ -29,13 +28,8 @@ except ImportError as error:
 from pymongo.errors import PyMongoError
 from strands.storage.search.keyword import tokenize
 
-# Private in the SDK, and used here for the same reason all three shipped backends use them: they are
-# what makes `a//b` and `a/b` one key on every backend. Reimplementing the two would be reimplementing
-# a compatibility promise, and a copy that drifted would show up as a key set that collides on
-# `LocalFileStorage` and stays distinct here.
-# ``StorageSearchResult`` is constructed rather than only annotated, so it moves out of the
-# ``TYPE_CHECKING`` block. It is a dataclass in the same module as the protocol and pulls in nothing the
-# storage extra does not already require.
+# Private in the SDK, but every shipped backend uses the same two normalizers: they make `a//b` and `a/b`
+# one key everywhere. A local copy that drifted would make keys collide on `LocalFileStorage` and not here.
 from strands.storage.storage import _NAMESPACED, StorageSearchResult, _normalize_key, _normalize_prefix
 from strands.types.exceptions import StorageError
 
@@ -52,26 +46,24 @@ if TYPE_CHECKING:
 __all__ = ["MAX_DOCUMENT_BYTES", "MAX_KEY_BYTES", "MongoDBStorage"]
 
 MAX_KEY_BYTES: Final[int] = 1024
-"""Longest key this package writes, in UTF-8 bytes.
+"""Longest key this package writes, in UTF-8 bytes, including the instance prefix.
 
-Our policy, not the server's. MongoDB 8.3.8 accepts a 1,000,000-byte ``_id`` and round-trips it,
-because the pre-4.2 index key limit no longer applies at the default feature compatibility version.
-A key that long still costs what an index entry that long costs on every ``list`` range scan, and it
-fails outright on a deployment pinned below FCV 4.2. 1024 is the old limit, which makes it the number
-a MongoDB reader already recognises, and the headroom is wide: the longest key shape the SDK builds is
-131 bytes for a realistic session and agent id pair.
+A package limit, not a server one. MongoDB 8.3.8 accepts a 1,000,000-byte ``_id`` at the default feature
+compatibility version, but a long key makes every ``list`` range scan pay for a long index entry, and it
+fails outright on a deployment pinned below FCV 4.2. 1024 is that old index key limit. The longest key
+the SDK builds for a realistic session and agent id pair is about 131 bytes.
 """
 
 MAX_DOCUMENT_BYTES: Final[int] = 16 * 1024 * 1024
-"""The BSON document ceiling, ours rather than the driver's.
+"""The BSON document size limit (16 MiB) that ``write`` checks before sending.
 
-``pymongo.common.MAX_BSON_SIZE`` holds the same number and is not public API. ``AT-038b`` pins this
-constant to the ``maxBsonObjectSize`` a real deployment advertises, so the two cannot drift.
+Defined here because ``pymongo.common.MAX_BSON_SIZE`` is not public API. A test pins it to the
+``maxBsonObjectSize`` a real deployment reports.
 """
 
-# Bytes a stored document costs before its key and payload: the 4-byte length, the `_id`
-# and `data` element headers, the whole `updated_at` element, and the terminator. Shape-specific, so
-# `AT-038a` pins both constants to `bson.encode` rather than to this comment.
+# Bytes a stored document costs besides its key and payload: the 4-byte length, the `_id` and `data`
+# element headers, the whole `updated_at` element and the terminator, plus the `expires_at` element when
+# a TTL is set. A test pins both numbers to `bson.encode`.
 _DOCUMENT_OVERHEAD_BYTES: Final[int] = 46
 _EXPIRES_OVERHEAD_BYTES: Final[int] = 20
 
@@ -82,10 +74,9 @@ _R = TypeVar("_R")
 def _encoded_size(key: str, data: bytes, *, expires: bool) -> int:
     """Size of the document ``write`` would build, without building it.
 
-    Arithmetic rather than ``len(bson.encode(document))`` because the call this protects is the one
-    most likely to be near a memory limit already: encoding a 16 MiB payload only to measure it doubles
-    its peak footprint. ``AT-038a`` asserts this agrees with the encoder exactly, over an empty
-    payload, multi-byte and 4-byte code points in the key, and a 1024-byte key with a 4 MiB payload.
+    Computed arithmetically because encoding a payload near 16 MiB only to measure it doubles peak
+    memory on the call most likely to be short of it. A test checks the result matches the encoder
+    exactly, including multi-byte keys.
 
     Args:
         key: The ``_id`` the document will carry, prefix included.
@@ -101,16 +92,13 @@ def _encoded_size(key: str, data: bytes, *, expires: bool) -> int:
 def _successor(text: str) -> str | None:
     """Smallest string that sorts above every key starting with ``text``.
 
-    The upper bound of the ``_id`` range scan, and the reason it is a function rather than
-    ``text[:-1] + chr(ord(text[-1]) + 1)``. That one-liner has two inputs it cannot express, both
-    reachable through a protocol that permits any string as a key:
+    The upper bound of the ``_id`` range scan. Simply incrementing the last character fails on two
+    inputs, both valid keys:
 
-    * A prefix ending at ``U+D7FF`` increments to ``U+D800``, a lone surrogate, which no BSON encoder
-      accepts. The next scalar value is ``U+E000`` and nothing sorts between them, so skipping the
-      block keeps the bound exact as well as encodable.
-    * A prefix ending at ``U+10FFFF`` has no successor in that position at all, and ``chr`` raises
-      ``ValueError``. Incrementing the character to its left is still an exact bound, and a prefix made
-      only of ``U+10FFFF`` has no upper bound to give: everything sorting above it starts with it.
+    * ``U+D7FF`` would increment to ``U+D800``, a lone surrogate that BSON cannot encode. Nothing sorts
+      between the two, so jumping to ``U+E000`` keeps the bound exact.
+    * ``U+10FFFF`` has no successor and ``chr`` raises. Incrementing the character to its left is still
+      an exact bound, and a prefix made only of ``U+10FFFF`` has no upper bound at all.
 
     Args:
         text: The prefix the range starts at. Never empty; an empty prefix is an unfiltered query.
@@ -137,22 +125,15 @@ def _abbreviate(key: str) -> str:
 def _reporting(
     verb: str,
 ) -> Callable[[Callable[_P, Coroutine[Any, Any, _R]]], Callable[_P, Coroutine[Any, Any, _R]]]:
-    """Turn any driver error out of the wrapped method into ``StorageError``.
+    """Turn any driver error raised by the wrapped method into ``StorageError``.
 
-    A decorator over the whole method rather than a helper wrapping one awaitable, which is the shape
-    ``_indexes._guard`` uses. ``list`` is why: ``find`` contacts nothing, so a connection that dies
-    while the cursor drains raises from the ``async for``, and a helper that wraps the call alone never
-    sees it. ``REQ-E-036`` says no method leaks a bare ``PyMongoError``, and that is the method it would
-    leak from.
+    It wraps the whole method rather than one awaitable because ``list`` raises while its cursor drains,
+    after ``find`` has returned. Wrapping only the call would let that ``PyMongoError`` escape.
 
-    The message is built here and in ``_indexes`` from the same sentence, so a reader of the log has no
-    reason to know which module produced which line. There is no shared ``_errors`` module for it: two
-    format strings and a test pinning them together is less machinery than a third module.
+    The message uses the same sentence as ``_indexes``, and a test keeps the two in step.
 
-    The wrapped type is ``Coroutine`` rather than ``Awaitable``, and that is not cosmetic. ``Storage``
-    declares its five methods with ``async def``, so a decorator that widened them to ``Awaitable``
-    would leave ``MongoDBStorage`` satisfying the protocol at runtime and failing it under mypy, which
-    is exactly the position a user typing ``Agent(storage=MongoDBStorage(config))`` would hit.
+    The wrapped type is ``Coroutine``, not ``Awaitable``: ``Storage`` declares its methods with
+    ``async def``, and widening them would make ``MongoDBStorage`` fail the protocol under mypy.
 
     Args:
         verb: What the method was doing, as a present participle, for the message.
@@ -167,8 +148,7 @@ def _reporting(
             try:
                 return await method(*args, **kwargs)
             except PyMongoError as error:
-                # Bound through a local rather than indexed off `args` directly, which mypy rejects
-                # for a `ParamSpec`.
+                # Through a local because mypy rejects indexing `args` of a `ParamSpec` directly.
                 positional: tuple[Any, ...] = args
                 storage: MongoDBStorage = positional[0]
                 subject = positional[1] if len(positional) > 1 else ""
@@ -181,19 +161,29 @@ def _reporting(
     return decorate
 
 
-# The `Storage` protocol is satisfied structurally and this class does not inherit it, matching all
-# three backends the SDK ships (`InMemoryStorage`, `LocalFileStorage`, `S3Storage`). The memory
-# surface goes the other way, because both vended memory stores do.
+# `Storage` is satisfied structurally, not inherited, like the SDK's own backends.
+# `for_sandbox` is absent on purpose: the SDK probes it with `hasattr` and falls back, so a stub that
+# raised would break context offloading instead of degrading it.
 
 
 class MongoDBStorage:
-    """MongoDB-backed implementation of ``strands.storage.Storage``.
+    """A ``strands.storage.Storage`` backed by a MongoDB collection.
 
-    The connection half arrives as a whole ``MongoDBConfig``, built once per process and reused; the
-    per-instance half arrives as keyword arguments, because two storages in one database differ by
-    collection and ``namespace()`` returns a second instance differing only by prefix. Passing the
-    same config object to every instance is what makes them share one connection pool
-    (``REQ-E-012``).
+    Each key is stored as one document whose ``_id`` is the key (with this instance's prefix), so every
+    operation is a primary-key lookup or a range scan over the ``_id`` index.
+
+    The connection settings arrive as a ``MongoDBConfig``; build it once per process and reuse it.
+    Instances given the same config object share one connection pool. Per-instance placement
+    (collection, prefix, TTL) is passed as keyword arguments.
+
+    Keys are normalized the way the SDK's own backends normalize them: runs of ``/`` collapse and leading
+    and trailing ``/`` are stripped, so ``a//b`` and ``/a/b/`` are the key ``a/b``. A key that is empty
+    after that, or that contains a backslash or a ``..`` segment, raises ``StorageError``.
+
+    Every key operation (``write``, ``read``, ``delete``, ``list``, ``delete_prefix``, and ``search`` once
+    its query has tokens) and ``ensure_indexes`` raise ``StorageError`` if the collection's default
+    collation is not binary. Keys must compare byte by byte, or one prefix could read and delete another's
+    documents.
 
     Example:
         ```python
@@ -201,20 +191,10 @@ class MongoDBStorage:
         sessions = MongoDBStorage(config, collection="sessions")
         transcripts = MongoDBStorage(config, collection="transcripts")  # same pool
         ```
-
-    One document per key, ``_id`` holding the key verbatim, so every operation is a primary-key hit or
-    a range scan over the index MongoDB creates whether or not it is asked to. ``list`` is that
-    range scan rather than a filtered collection scan, which is what makes it usable on a collection of
-    4 MiB payloads.
-
-    ``for_sandbox`` is absent permanently: the SDK probes it with ``hasattr`` and falls back when it is
-    missing, so a stub that raised would break context offloading for every MongoDB user rather than
-    degrade it.
     """
 
-    # Declared without a value on purpose. `getattr(storage, "_namespaced", None)` is what the SDK's
-    # three call sites read, so an unscoped instance has to leave it absent while `namespace()` sets it
-    # (`REQ-E-039`). An assignment here would mark every instance as already scoped.
+    # Declared without a value on purpose. The SDK reads `getattr(storage, "_namespaced", None)` to tell
+    # whether a storage is already scoped, so it must stay absent until `namespace()` sets it.
     _namespaced: object
 
     def __init__(
@@ -226,55 +206,48 @@ class MongoDBStorage:
         prefix: str = "",
         ttl_seconds: int | None = None,
     ) -> None:
-        """Resolve the shared connection and record this instance's placement in it.
+        """Create a storage over one collection.
 
         Args:
-            config: Connection and deployment settings. Positional-only, following ``S3Storage``'s
-                resource-first shape, and passed whole so it can be shared with a
-                ``MongoDBMemoryStore`` through ``MongoDBMemoryStoreConfig.config``.
+            config: Connection and deployment settings. Positional-only. Pass the same object to a
+                ``MongoDBMemoryStore`` (through ``MongoDBMemoryStoreConfig.config``) to share the pool.
             collection: Collection holding this instance's documents.
-            prefix: Key prefix prepended to every key, scoping this instance within the collection.
-                Normalized to end in exactly one ``/``, or to be empty, so that four spellings of one
-                prefix do not become four key spaces.
-            ttl_seconds: Lifetime for documents this instance writes. ``None`` means they never
-                expire, which is not the same as ``0``: a MongoDB TTL index with
-                ``expireAfterSeconds: 0`` deletes documents as soon as their timestamp passes
-                (``REQ-E-035``). Setting this stamps ``expires_at`` and nothing more. **Expiry needs
-                the TTL index, and no operation on this class creates it**: call
-                :meth:`ensure_indexes` once, at startup, or provision it out of band from the spec
-                ``_indexes.storage_specs()`` holds. Documents written before it exists expire once it
-                does, since a TTL index acts on what is already in the collection.
+            prefix: Prefix prepended to every key, scoping this instance within the collection.
+                Normalized to end in exactly one ``/``, or to be empty, so ``"a"``, ``"a/"`` and ``"/a"``
+                are one key space.
+            ttl_seconds: Lifetime of documents this instance writes, in seconds, counted from each write.
+                ``None`` means they never expire, which is not the same as ``0`` (expire at the next TTL
+                sweep, which the server runs about once a minute). This only stamps ``expires_at``:
+                **expiry needs the TTL index, which nothing creates implicitly**. Call
+                :meth:`ensure_indexes` once at startup, or run the ``createIndexes`` command in the
+                README's "Indexes and privileges" section. Documents written before the index exists
+                expire once it does.
 
         Raises:
-            KeyError: If ``config`` has no ``database``. It is ``Required`` in the ``TypedDict``, so
-                mypy rejects a literal that omits it; this catches a config assembled at runtime.
-            ValueError: If ``config`` supplies neither ``client`` nor ``connection_string``
-                (``REQ-E-015``).
-            StorageError: If ``prefix`` contains a ``..`` segment.
+            KeyError: If ``config`` has no ``database``. Mypy rejects a literal that omits it; this
+                catches a config assembled at runtime.
+            ValueError: If ``config`` supplies neither ``client`` nor ``connection_string``.
+            ValueError: If ``ttl_seconds`` is negative.
+            ValueError: If the driver rejects a value in ``connection_string``, such as an out-of-range
+                port.
+            pymongo.errors.ConfigurationError: If the driver cannot parse ``connection_string``, such as
+                one with no host or a scheme other than ``mongodb://`` or ``mongodb+srv://``.
+            StorageError: If ``prefix`` contains a backslash or a ``..`` segment.
         """
-        # `database` is read before `resolve` deliberately. Resolving first would register a
-        # connection pool in the process-global registry and only then raise, leaving a pool that no
-        # instance owns and no `close()` can reach.
+        # Read before `resolve`, which registers a pool in the process-wide registry. Raising after that
+        # would leave a pool no instance owns and no `close()` can reach.
         self._database_name = config["database"]
+        _indexes.check_ttl(ttl_seconds)
         self._collection_name = collection
-        # `_normalize_prefix` keeps a trailing slash, which is significant for matching but not for a
-        # prefix that is always followed by a key, so it is stripped and re-added. `"tenant-a"`,
-        # `"tenant-a/"`, `"/tenant-a"` and `"tenant-a//"` all arrive here as `"tenant-a/"`.
+        # `_normalize_prefix` keeps a trailing slash, so strip it and add exactly one back.
         normalized = _normalize_prefix(prefix).rstrip("/")
         self._prefix = f"{normalized}/" if normalized else ""
         self._ttl_seconds = ttl_seconds
         self._config = config
-        # Read once, at construction, and handed to the one `_indexes.ensure` call this class makes
-        # (`REQ-E-122`). Nothing on this surface waits on a search build, so the value only ever
-        # travels; the key exists so that a caller who set it for a memory store does not find it
-        # silently ignored here.
+        # Only passed on to `_indexes.ensure`; read so a value set for a memory store is honoured here too.
         self._index_ready_timeout: float = config.get("index_ready_timeout", _indexes.READY_TIMEOUT_SECONDS)
-        # Resolved here and the result dropped on the floor, which is deliberate. The connection an
-        # operation uses comes from `_connection` below, freshly, because the registry is keyed by
-        # running event loop (`REQ-E-017a`) and a reference captured here would pin this instance to
-        # whichever loop happened to construct it (`REQ-E-017b`). What this call buys is the failure
-        # arriving at construction: a config with neither `client` nor `connection_string` raises
-        # `ValueError` here (`REQ-E-015`) rather than at the first `write`.
+        # Called only to fail fast on a config with no client or connection string. The result is
+        # dropped: the registry is keyed by event loop, so each operation resolves its own connection.
         _client.resolve(config)
 
     @_telemetry.traced("storage", "write")
@@ -282,17 +255,17 @@ class MongoDBStorage:
     async def write(self, key: str, data: bytes) -> None:
         """Store ``data`` under ``key``, replacing whatever was there.
 
-        One ``replace_one`` with ``upsert=True`` rather than a read followed by an insert or an update:
-        the create and the overwrite are the same call, so two writers racing on one key cannot produce
-        a duplicate-key error between them (``REQ-E-020``).
+        A single upsert, so two writers racing on one key never hit a duplicate-key error. When the
+        instance has ``ttl_seconds``, the document gets an ``expires_at`` stamp.
 
         Args:
             key: The key to write under. Normalized, so ``a//b`` and ``a/b`` are one key.
             data: The bytes to store, round-tripped unchanged including ``b""``.
 
         Raises:
-            StorageError: If the key is empty, contains a ``..`` segment, exceeds
-                :data:`MAX_KEY_BYTES`, or would build a document over :data:`MAX_DOCUMENT_BYTES`. Also
+            StorageError: If the key is empty, contains a backslash or a ``..`` segment, exceeds
+                :data:`MAX_KEY_BYTES` with the prefix included, or would build a document over
+                :data:`MAX_DOCUMENT_BYTES`. Also if the collection's default collation is not binary, or
                 if the write fails, with the driver's error chained.
         """
         await self._require_binary_keys()
@@ -300,9 +273,8 @@ class MongoDBStorage:
         expires = self._ttl_seconds is not None
         size = _encoded_size(document_id, data, expires=expires)
         if size > MAX_DOCUMENT_BYTES:
-            # Before the call, so the driver's `DocumentTooLarge` is never the user's first signal
-            # (`REQ-E-029`). The numbers are in the message because the useful next question is how
-            # much to shed, and `DocumentTooLarge` does not answer it.
+            # Checked before sending so the caller sees the sizes, which the driver's `DocumentTooLarge`
+            # does not report.
             raise StorageError(
                 f"strands_mongodb: the document for the key {_abbreviate(document_id)!r} would encode "
                 f"to {size} bytes, over the {MAX_DOCUMENT_BYTES}-byte BSON limit in {self._target}. "
@@ -312,9 +284,7 @@ class MongoDBStorage:
         now = datetime.datetime.now(datetime.timezone.utc)
         document: dict[str, Any] = {"_id": document_id, "data": data, "updated_at": now}
         if self._ttl_seconds is not None:
-            # Only when a TTL is configured. An `expires_at` of `None` would be indexed by the TTL
-            # index and, as measured, a document whose field is not a date is simply never
-            # expired, so the field would cost bytes and mean nothing (`REQ-E-035`).
+            # Only with a TTL. The TTL index never expires a non-date value, so `None` would be dead bytes.
             document[EXPIRES_FIELD] = now + datetime.timedelta(seconds=self._ttl_seconds)
 
         await self._collection().replace_one({"_id": document_id}, document, upsert=True)
@@ -324,8 +294,7 @@ class MongoDBStorage:
     async def read(self, key: str) -> bytes | None:
         """Return the bytes stored under ``key``, or ``None`` if there are none.
 
-        ``None`` rather than an exception, because the SDK's session manager reads a missing key as "no
-        session yet" on every cold start (``REQ-E-021``).
+        A missing key is not an error: the SDK's session manager reads it as "no session yet".
 
         Args:
             key: The key to read.
@@ -334,36 +303,32 @@ class MongoDBStorage:
             The stored bytes, or ``None`` when the key is absent.
 
         Raises:
-            StorageError: If the key is invalid or too long, or if the read fails for any reason other
-                than the key being absent, with the driver's error chained (``REQ-E-022``).
+            StorageError: If the key is empty, contains a backslash or a ``..`` segment, or exceeds
+                :data:`MAX_KEY_BYTES`. Also if the collection's default collation is not binary, or if
+                the read fails, with the driver's error chained. An absent key is not a failure.
         """
         await self._require_binary_keys()
         document = await self._collection().find_one({"_id": self._id_for(key)})
         _telemetry.annotate("strands_mongodb.found", document is not None)
         if document is None:
             return None
-        # `bytes(...)` rather than the value as stored, and not for the type annotation's sake. Measured
-        # on pymongo 4.17.0: binary subtype 0, which is what this package writes, decodes to exact
-        # `bytes` and makes this a no-op. Subtypes 2 and 0x80 decode to `Binary`, and `Binary.__eq__`
-        # compares the subtype, so the value a caller gets back would not equal the payload that was
-        # stored. A collection an older driver also wrote is where that arrives.
+        # pymongo decodes binary subtype 0 (what this package writes) to `bytes`, but subtypes 2 and 0x80
+        # to `Binary`, whose `__eq__` also compares the subtype. Data written by another client would then
+        # not equal the stored payload.
         return bytes(document["data"])
 
     @_telemetry.traced("storage", "delete")
     @_reporting("deleting")
     async def delete(self, key: str) -> None:
-        """Remove ``key``, doing nothing if it is not there.
-
-        ``deleted_count`` is deliberately not read. Absent and deleted are the same outcome to a caller
-        cleaning up, and treating a count of 0 as a failure would turn every idempotent teardown into an
-        error (``REQ-E-023``).
+        """Remove ``key``. Deleting a key that does not exist is not an error.
 
         Args:
             key: The key to remove.
 
         Raises:
-            StorageError: If the key is invalid or too long, or if the delete fails, with the driver's
-                error chained.
+            StorageError: If the key is empty, contains a backslash or a ``..`` segment, or exceeds
+                :data:`MAX_KEY_BYTES`. Also if the collection's default collation is not binary, or if
+                the delete fails, with the driver's error chained.
         """
         await self._require_binary_keys()
         result = await self._collection().delete_one({"_id": self._id_for(key)})
@@ -372,29 +337,26 @@ class MongoDBStorage:
     @_telemetry.traced("storage", "list")
     @_reporting("listing")
     async def list(self, query: str) -> builtins.list[str]:
-        """Return every key under ``query``, in ascending order.
+        """Return every key under the prefix ``query``, in ascending order.
 
-        A bounded range over the ``_id`` index, projected to ``_id`` alone, which is what keeps a
-        listing from pulling every payload across the wire to return their names. The sort is the
-        protocol's promise and MongoDB's byte order over UTF-8 matches Python's ``sorted()`` for every
-        key it accepts, which ``AT-027`` checks against a deployment rather than against a fake.
+        Only keys are fetched, never payloads. MongoDB's byte order over UTF-8 matches Python's
+        ``sorted()`` for every key this class accepts.
 
         Args:
             query: A key prefix. ``""`` matches everything, which is how the SDK's keyword search
                 strategy reads the whole store.
 
         Returns:
-            Full keys rather than the part after the prefix, with this instance's namespace prefix
-            removed (``REQ-E-026``, ``REQ-E-030``).
+            Full keys (not just the part after ``query``), without this instance's own prefix.
 
         Raises:
-            StorageError: If the prefix contains a ``..`` segment, or if the scan fails at any point,
-                including part way through draining the cursor.
+            StorageError: If the prefix contains a backslash or a ``..`` segment, if the collection's
+                default collation is not binary, or if the scan fails at any point, including part way
+                through draining the cursor.
         """
         await self._require_binary_keys()
         cursor = self._collection().find(self._range_for(query), {"_id": 1})
-        # Only this instance's prefix comes off, never the queried one: a caller passing `sessions/` has
-        # to get keys it can hand back to `read`.
+        # Strip only the instance prefix, so the keys returned can be passed straight back to `read`.
         offset = len(self._prefix)
         keys = [str(document["_id"])[offset:] async for document in cursor.sort("_id", 1)]
         _telemetry.annotate("strands_mongodb.result_count", len(keys))
@@ -403,36 +365,30 @@ class MongoDBStorage:
     @_telemetry.traced("storage", "search")
     @_reporting("searching")
     async def search(self, query: str) -> builtins.list[StorageSearchResult]:
-        """Search stored content, ranked best-first, in one server-side aggregation.
+        """Rank stored keys by how many of the query's tokens they contain.
 
-        Token-overlap scoring identical to the SDK's ``KeywordSearchStrategy``, computed on the server
-        over the key space instead of in Python over every payload (``REQ-E-032``). The SDK's
-        default costs ``list("")`` plus one ``read`` per key; this costs one ``aggregate`` and, measured
-        over 1,000 keys carrying 400-byte payloads, zero document fetches, because ``_id`` is the only
-        field the pipeline reads and the scan is covered by ``_id_`` (``AT-032e``).
-
-        The trade is deliberate: scores come from the key alone, so a query token that appears only
-        inside a payload matches here where the SDK's default would match it.
+        Scoring matches the SDK's ``KeywordSearchStrategy`` (token overlap), but **only keys are
+        scored, not payloads**: a word that appears only inside stored data does not match. In
+        exchange the search is one server-side aggregation that reads no documents, where the SDK's
+        default reads every payload.
 
         Args:
-            query: A natural-language string. One that tokenizes to nothing returns without a round trip.
+            query: A natural-language string. One that tokenizes to nothing returns ``[]`` without a
+                round trip.
 
         Returns:
             Matched keys with relevance scores, highest first, ties in ascending key order. ``data`` is
-            left ``None``, which ``StorageSearchResult`` permits and the shipped consumer handles by
-            reading back at most its own ``max_results`` keys (``REQ-E-032b``).
+            ``None``; the SDK's consumer reads back only the keys it keeps.
 
         Raises:
-            StorageError: If the aggregation fails, or fails part way through draining the cursor.
+            StorageError: If the query has tokens and the collection's default collation is not binary,
+                or if the aggregation fails, including part way through draining the cursor.
         """
         tokens = tokenize(query)
         if not tokens:
-            # `KeywordSearchStrategy` short circuits here too. Without it the server would scan the whole
-            # namespace to score every key zero and hand back the same empty list (`REQ-E-032a`).
+            # Same short circuit as `KeywordSearchStrategy`: scoring every key zero would cost a full scan.
             return []
-        # After the short circuit above, not before it. `REQ-E-032a` is that a query tokenizing to
-        # nothing costs no round trip, and a preflight ahead of it would spend one -- on a call that
-        # never reaches the key space and so has nothing to be protected from.
+        # After the short circuit, so an empty query costs no round trip at all.
         await self._require_binary_keys()
         cursor = await self._collection().aggregate(self._search_pipeline(tokens))
         offset = len(self._prefix)
@@ -444,22 +400,25 @@ class MongoDBStorage:
         return results
 
     def _search_pipeline(self, tokens: set[str]) -> builtins.list[dict[str, Any]]:
-        """Build the four stages ``search`` sends, exposed so ``AT-032e`` can ``explain`` the real thing.
+        """Build the pipeline ``search`` sends. Separate so a test can ``explain`` it.
 
         Args:
-            tokens: The already-tokenized query. Sorted on the way in so that two callers asking the same
-                question produce one plan-cache shape rather than one per token order.
+            tokens: The already-tokenized query. Sorted on the way in so the same question always
+                produces one plan-cache shape.
 
         Returns:
-            The pipeline, with the range ``$match`` omitted entirely when this instance has no prefix:
-            ``_range_for("")`` is ``{}`` there, and an empty ``$match`` is still a stage to run.
+            The pipeline. The range ``$match`` is omitted when this instance has no prefix, since an empty
+            ``$match`` is still a stage to run.
         """
         stages: builtins.list[dict[str, Any]] = []
-        # The instance prefix, not the query. `search` takes prose, and this is the bound that turns a
-        # `COLLSCAN` into a covered `IXSCAN` on `_id_`, measured both ways.
+        # Bounded by the instance prefix (not the query, which is prose). This makes the scan a covered
+        # IXSCAN on `_id_` instead of a COLLSCAN.
         instance_range = self._range_for("")
         if instance_range:
             stages.append({"$match": instance_range})
+        # Score the key the caller wrote, without this instance's prefix, as the SDK's backends do.
+        # Cut by code point, which is how `len` counts the prefix.
+        key: Any = {"$substrCP": ["$_id", len(self._prefix), {"$strLenCP": "$_id"}]} if self._prefix else "$_id"
         stages.append(
             {
                 "$project": {
@@ -468,17 +427,13 @@ class MongoDBStorage:
                             "$setIntersection": [
                                 {
                                     "$map": {
-                                        # `[\p{L}\p{N}_]+` rather than `\w+`, which is the one substitution
-                                        # that reads as equivalent and is not. MongoDB's `\w` is ASCII-only
-                                        # by default; Python's is everything `str.isalnum()` accepts plus
-                                        # underscore, which is exactly categories L, N and `_`. Measured:
-                                        # `\w+` tokenizes `café` to `caf`, `m`, `nchen` and drops `日本語`
-                                        # entirely, so non-ASCII keys silently stop matching (`AT-032d`).
-                                        # It is also the positive form of the `/[^\p{L}\p{N}_]+/u` regex the
-                                        # SDK cites for TypeScript parity.
+                                        # Not `\w+`: MongoDB's `\w` is ASCII-only, so `münchen` would split
+                                        # into `m` and `nchen` and `日本語` would vanish. The SDK tokenizer
+                                        # uses Python's Unicode `\w`, which is exactly this class (letters,
+                                        # digits and `_`).
                                         "input": {
                                             "$regexFindAll": {
-                                                "input": {"$toLower": "$_id"},
+                                                "input": {"$toLower": key},
                                                 "regex": r"[\p{L}\p{N}_]+",
                                             }
                                         },
@@ -493,20 +448,18 @@ class MongoDBStorage:
             }
         )
         stages.append({"$match": {"score": {"$gt": 0}}})
-        # Blocking, and it cannot be otherwise: the sort key is the field the stage above computed. `_id`
-        # ascending is the tie-break, which keeps the order stable and matches what the SDK's stable sort
-        # produces from an already-sorted key listing.
+        # A blocking sort, unavoidably, since `score` is computed above. `_id` breaks ties, matching what
+        # the SDK's stable sort gives over an already-sorted listing.
         stages.append({"$sort": {"score": -1, "_id": 1}})
         return stages
 
     @_telemetry.traced("storage", "delete_prefix")
     @_reporting("deleting the prefix")
     async def delete_prefix(self, prefix: str) -> int:
-        """Remove every key under ``prefix`` in one call, returning how many went.
+        """Remove every key under ``prefix`` in one call and return how many were removed.
 
-        Not part of the ``Storage`` protocol. It exists because deleting a session means deleting a key
-        range, and the alternative is a ``list`` followed by one ``delete`` per key, which is a round
-        trip per snapshot for a history that can run to hundreds (``REQ-E-031``).
+        Not part of the ``Storage`` protocol. Use it to delete a whole session in one round trip instead
+        of a ``list`` followed by one ``delete`` per key.
 
         Args:
             prefix: The key prefix to remove. ``""`` empties this instance's key space.
@@ -515,7 +468,8 @@ class MongoDBStorage:
             The number of documents removed.
 
         Raises:
-            StorageError: If the prefix contains a ``..`` segment, or if the delete fails.
+            StorageError: If the prefix contains a backslash or a ``..`` segment, if the collection's
+                default collation is not binary, or if the delete fails, with the driver's error chained.
         """
         await self._require_binary_keys()
         result = await self._collection().delete_many(self._range_for(prefix))
@@ -524,75 +478,62 @@ class MongoDBStorage:
         return removed
 
     def namespace(self, prefix: str) -> MongoDBStorage:
-        """Return a second instance scoped to ``prefix`` within the same collection.
+        """Return a new instance scoped to ``prefix`` within the same collection.
 
-        A real ``MongoDBStorage`` rather than the SDK's ``_NamespacedStorage`` wrapper, following
-        ``LocalFileStorage``. The wrapper has exactly the five protocol methods, so it would put
-        ``delete_prefix`` out of reach and turn ``list`` back into a full scan plus a Python-side strip.
-
-        The sentinel is what makes that safe. Three SDK call sites read ``_namespaced`` to decide
-        whether the caller already scoped the storage, and without it the memory store's keys land a
-        level deeper here than they do on ``LocalFileStorage`` (``REQ-E-039``).
+        The result is a full ``MongoDBStorage``, so ``delete_prefix`` and the indexed ``list`` keep
+        working on it.
 
         Args:
             prefix: Prefix to prepend to every key, appended to any prefix already in force.
 
         Returns:
             A new instance sharing this one's connection pool, collection and TTL.
+
+        Raises:
+            StorageError: If ``prefix`` contains a backslash or a ``..`` segment.
         """
+        # A real instance rather than the SDK's `_NamespacedStorage`, which exposes only the five protocol
+        # methods and would turn `list` into a full scan with a Python-side strip.
         scoped = MongoDBStorage(
             self._config,
             collection=self._collection_name,
-            # `__init__` normalizes, so a leading slash on `prefix` collapses against the trailing
-            # slash on `_prefix` rather than producing an empty path segment.
+            # `__init__` normalizes, so a leading slash here does not produce an empty path segment.
             prefix=f"{self._prefix}{prefix}",
             ttl_seconds=self._ttl_seconds,
         )
+        # The SDK reads this sentinel to tell that a storage is already scoped. Without it, memory keys
+        # would land one level deeper here than on `LocalFileStorage`.
         scoped._namespaced = _NAMESPACED
         return scoped
 
     @_telemetry.traced("storage", "ensure_indexes")
     async def ensure_indexes(self) -> None:
-        """Create the indexes this collection needs, or report what is stopping that (``REQ-E-119``).
+        """Create the TTL index that makes ``ttl_seconds`` take effect, or verify it exists.
 
-        One index today: ``strands_expires_at_ttl`` over ``expires_at`` with ``expireAfterSeconds: 0``,
-        which is what makes ``ttl_seconds`` do anything at all. Without it a store with a TTL stamps the
-        field on every document and the documents stay forever, which is the reason this method exists.
+        The index is ``strands_expires_at_ttl`` over ``expires_at`` with ``expireAfterSeconds: 0``.
+        Without it, documents get an ``expires_at`` stamp but are never deleted.
 
-        **Explicit on purpose, and called by nothing inside this package** (``REQ-E-121``). The five
-        protocol methods are one round trip each by design, and an ``Agent`` builds its storage
-        in a code path the user never sees, so provisioning folded into the constructor or the first
-        ``write`` would be DDL issued by a process whose operator did not ask for it and may not have
-        the rights for. Call it once at startup, from code that knows it is startup::
+        **Nothing in this package calls this method.** An ``Agent`` builds its storage in code the
+        operator does not see, and index creation there could run without the rights for it. Call it once
+        at startup::
 
             storage = MongoDBStorage(config, ttl_seconds=3600)
             await storage.ensure_indexes()
 
-        Idempotent, and safe to call concurrently: the warm path is a single ``index_information``
-        read, and the server accepts a repeated identical ``createIndexes`` (measured: 10 at once, one
-        index, no failures). There is no cached flag to go stale against a collection somebody dropped.
-
-        ``ensure_indexes`` in the config governs this the way it governs
-        ``MongoDBMemoryStore.initialize()``: ``False`` means verify rather than skip (``REQ-E-061``), so
-        a missing index raises with the ``createIndexes`` command that resolves it rather than leaving
-        a caller to discover the absence as documents that never expire.
-
-        Existing documents are not a problem. A TTL index acts on whatever is already in the
-        collection, so rows written before this call expire once it returns.
+        Idempotent and safe to call concurrently. With ``ensure_indexes: False`` in the config it only
+        verifies: a missing index raises with the ``createIndexes`` command that would fix it. Documents
+        written before the index exists expire once it does.
 
         Raises:
-            StorageError: If an index over the same keys exists with different options, if the index is
-                absent and ``ensure_indexes`` is ``False``, or if the driver refuses the call. The
-                server's own code and message arrive chained.
+            StorageError: If the collection's default collation is not binary, if an index over the same
+                keys exists with different options, if the index is absent and ``ensure_indexes`` is
+                ``False``, or if a driver call fails. The server's own code and message arrive chained.
         """
-        # Before the index, and this is the one call where the collation is not about the keys: a TTL
-        # index over a date field is unaffected by it. It refuses anyway, because provisioning a
-        # collection that cannot hold this key space is work whose only outcome is a store that fails at
-        # its first write with the index in place.
+        # The collation does not affect a TTL index, but a collection that cannot hold this key space is
+        # not worth provisioning: it would only fail at its first write.
         await self._require_binary_keys()
-        # No `@_reporting`: that decorator names the method's second positional argument in its
-        # message and there is none here, so it would render an empty quoted key. `_indexes.ensure`
-        # already turns every driver error into a `StorageError` naming the operation and namespace.
+        # No `@_reporting`: there is no key argument for its message, and `_indexes.ensure` already turns
+        # driver errors into `StorageError`.
         await _indexes.ensure(
             self._collection(),
             ordinary=_indexes.storage_specs(),
@@ -603,32 +544,18 @@ class MongoDBStorage:
     async def _require_binary_keys(self) -> None:
         """Refuse a collection whose collation would not compare this instance's keys byte by byte.
 
-        ``REQ-E-170``, and the reasoning for refusing rather than overriding is on
-        :func:`_indexes.require_binary_comparison`. What this method owns is *when*: before the first
-        operation on a collection, once, rather than at construction or in ``ensure_indexes``.
+        The reason for refusing is on :func:`_indexes.require_binary_comparison`. This method decides
+        when: before the first operation on a collection, not at construction (``__init__`` is
+        synchronous and must not touch the network) and not in ``ensure_indexes`` (which callers may
+        never call).
 
-        Not at construction, because ``__init__`` is synchronous and a store is built in code paths the
-        SDK runs for the user -- making it do a round trip would put a network failure in a constructor
-        that today cannot make one. Not in ``ensure_indexes``, because nothing in this package calls that
-        (``REQ-E-121``) and a guard a caller has to opt into does not guard the caller who did not.
+        No lock: the check is a side-effect-free read, so two racing first operations each issue one
+        ``listCollections`` and reach the same answer.
 
-        Deliberately without the connection lock. What it protects is a read with no side effect, so two
-        stores racing on the first operation issue one ``listCollections`` each and reach the same answer,
-        which is cheaper than serialising every store's first operation behind a lock. Adding to a ``set``
-        is atomic, and the answer cannot differ between the two racers.
-
-        A refusal caches nothing, so every later operation asks again and refuses again. That is the
-        intended shape: the collection may be fixed while the process runs, and a store that had cached
-        the refusal would keep reporting a problem that no longer exists.
-
-        **An absent collection caches nothing either, and for the same reason** (``REQ-E-186``). It is
-        not a refusal and it is not a verification: ``listCollections`` reports a collection with no
-        collation and a collection that is not there identically, and caching the second as though it
-        were the first is how a namespace entered ``binary_keys`` having never been checked. Whoever
-        creates that collection next may give it any collation, and the cache would mean nobody ever
-        looked. So the asking continues, one ``listCollections`` per operation, until this store's own
-        first write creates the collection implicitly -- after which there is something to verify, it is
-        verified, and the asking stops.
+        Only a verified collection is cached. A refusal is not cached, so a collection fixed while the
+        process runs starts working. An absent collection is not cached either, because
+        ``listCollections`` cannot tell it apart from one with no collation, and whoever creates it may
+        give it any collation. The check repeats until this store's first write creates the collection.
 
         Raises:
             StorageError: If the collection's default collation is not binary, or if reading it fails.
@@ -642,35 +569,24 @@ class MongoDBStorage:
 
     @property
     def _target(self) -> str:
-        """The MongoDB namespace this instance writes to, for error messages.
+        """The ``database.collection`` this instance writes to, for error messages.
 
-        Named ``_target`` rather than ``_namespace`` because ``namespace()`` is a method on this class
-        and the two would read as the same thing while meaning a key prefix and a collection.
+        Not ``_namespace``, which would read like the ``namespace()`` key-prefix method.
         """
         return f"{self._database_name}.{self._collection_name}"
 
     @property
     def _connection(self) -> _client._Connection:
-        """The connection serving the running event loop (``REQ-E-017b``).
+        """The connection serving the running event loop.
 
-        A property, not an attribute set in ``__init__``. ``resolve`` returns the entry for the loop
-        that is running right now, and a reference stored at construction would keep handing out the
-        client bound to whichever loop built the instance. That matters because the SDK reaches this
-        package from more than one loop on its own: every synchronous entry point runs through
-        ``strands._async.run_async``, which calls ``asyncio.run`` on a fresh loop in a worker thread, so
-        a single ``invoke_async`` can touch two loops without the caller doing anything unusual.
-
-        Cheap enough to call per operation: a dict lookup on a hit, and a hit is the common case.
+        Resolved on each access, never stored: the SDK runs synchronous entry points through
+        ``asyncio.run`` on a fresh loop in a worker thread, so one instance can be used from several
+        loops, and a client is bound to one. A lookup hit is a dict access.
         """
         return _client.resolve(self._config)
 
     def _collection(self) -> AsyncCollection[dict[str, Any]]:
-        """Resolve the collection this instance operates on.
-
-        A method rather than a cached attribute, because the client behind it differs per event loop
-        (``REQ-E-017a``) and a collection captured at construction would outlive the loop its client is
-        bound to.
-        """
+        """Resolve the collection, through the running loop's client (see ``_connection``)."""
         collection: AsyncCollection[dict[str, Any]] = self._connection.client[self._database_name][
             self._collection_name
         ]
@@ -686,12 +602,11 @@ class MongoDBStorage:
             The ``_id`` to use.
 
         Raises:
-            StorageError: If the key is empty, contains a ``..`` segment, or encodes to more than
-                :data:`MAX_KEY_BYTES` bytes.
+            StorageError: If the key is empty, contains a backslash or a ``..`` segment, or encodes to
+                more than :data:`MAX_KEY_BYTES` bytes.
         """
         document_id = f"{self._prefix}{_normalize_key(key)}"
-        # The prefixed form, because that is what becomes an index entry. A scoped instance measuring
-        # only the caller's half would write the entries the ceiling exists to prevent.
+        # Measure the prefixed form, since that is what becomes the index entry.
         encoded = len(document_id.encode("utf-8"))
         if encoded > MAX_KEY_BYTES:
             raise StorageError(
@@ -704,9 +619,8 @@ class MongoDBStorage:
     def _range_for(self, query: str) -> dict[str, Any]:
         """Build the ``_id`` filter for a prefix, as a range rather than a regular expression.
 
-        A range is what an index can serve. ``{"_id": {"$regex": "^prefix"}}`` reads as the same query
-        and scans the whole collection unless the pattern is anchored in a way the planner recognises,
-        which is a difference no unit test would show and every large collection would.
+        The ``_id`` index serves a range. An ``{"$regex": "^prefix"}`` filter looks equivalent but scans
+        the whole collection unless the planner recognises the anchor, which no unit test would show.
 
         Args:
             query: The caller's prefix, before normalization.
@@ -715,7 +629,7 @@ class MongoDBStorage:
             A filter document, empty when the query and this instance's prefix are both empty.
 
         Raises:
-            StorageError: If the prefix contains a ``..`` segment.
+            StorageError: If the prefix contains a backslash or a ``..`` segment.
         """
         lower = f"{self._prefix}{_normalize_prefix(query)}"
         if not lower:
@@ -726,19 +640,13 @@ class MongoDBStorage:
         return {"_id": {"$gte": lower, "$lt": upper}}
 
     async def close(self) -> None:
-        """Release the MongoDB connection, closing the client only if this package built it.
+        """Release the MongoDB connection, closing the client only if this package created it.
 
-        Not part of the ``Storage`` protocol, which has no ``close()``. It exists because
-        ``REQ-E-011`` needs a way to release a client we opened, and it does nothing at all when the
-        caller injected their own (``REQ-E-010``).
+        Not part of the ``Storage`` protocol. Does nothing to a client you passed in through
+        ``config["client"]``. Idempotent.
 
-        Scoped to the **config**, not to this instance: the registry holds one entry per connection
-        identity, so this closes the pool every other instance built from the same config is using.
-        Call it once at process shutdown rather than in a per-request ``finally``. Idempotent.
-
-        A sibling that keeps working afterwards is not left holding the closed client. It resolves per
-        operation (``REQ-E-017b``), finds no entry, and opens a new pool, which nothing will close again.
-        That is the other half of the close contract and the reason the advice above is worth
-        following rather than merely noting.
+        **This closes the pool for every instance built from the same config**, not just this one. Call
+        it once at process shutdown, not per request. An instance used after the close opens a new pool,
+        which stays open until ``close()`` is called again.
         """
         await _client.close(self._config)

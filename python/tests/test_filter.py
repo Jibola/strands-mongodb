@@ -161,9 +161,9 @@ class TestOperatorKeysAreRejectedAtAnyDepth:
         """``REQ-E-050`` has no allow-list, so ``$gt`` goes the way of ``$where``.
 
         Pinned as a test because it is the constraint most likely to be "fixed" by someone who reads
-        the rejection as overzealous. A caller filter in v0.1.0 is a flat map of path to exact value.
-        Widening it to a comparison-operator allow-list is a v0.2.0 decision with its own threat model,
-        and this test is what makes that a decision rather than a drive-by.
+        the rejection as overzealous. A caller filter is a flat map of path to exact value. Widening it to
+        a comparison-operator allow-list would be a decision with its own threat model, and this test is
+        what makes it a decision rather than a drive-by.
         """
         with pytest.raises(ValueError, match=r"\$gt"):
             _filter.validate({"age": {"$gt": 5}}, declared_fields=("age",))

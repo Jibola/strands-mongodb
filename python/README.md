@@ -339,7 +339,7 @@ and behave as they do for any store, with one exception noted below.
 | `filter` | `dict[str, Any]` | no | | Extra search predicate, composed as a narrowing conjunction. It cannot widen what this store can read. Paths must appear in `filter_fields`. |
 | `min_score` | `float` | no | | Relevance floor. Applied after the search, so it drops results without changing their order. |
 | `max_score` | `float` | no | | Relevance ceiling. Mutually exclusive with `min_score`. |
-| `ttl_seconds` | `int` | no | | How long a memory lives, measured from its own `created_at`. Absent means it never expires and stamps no field; `0` means "at the next sweep" and is a real value, not a disabled one. Set on insert, so re-remembering a fact does not extend it. Needs no `ensure_indexes()` call here — `initialize()` already creates the TTL index. |
+| `ttl_seconds` | `int` | no | | How long a memory lives, measured from its own `created_at`. Absent means it never expires and stamps no field; `0` means "at the next sweep" and is a real value, not a disabled one; a negative value raises `ValueError`. Set on insert, so re-remembering a fact does not extend it. Needs no `ensure_indexes()` call here — `initialize()` already creates the TTL index. |
 
 ### `MongoDBSearchQuery`
 
@@ -367,7 +367,7 @@ and positionally, and can be the same object a memory store holds.
 | `config` | `MongoDBConfig` | | The connection. Only the connection keys matter here; the search keys are memory-only. |
 | `collection` | `str` | `storage` | Collection holding this instance's documents. |
 | `prefix` | `str` | `""` | Prepended to every key, scoping this instance inside the collection. Normalized to end in one `/`. |
-| `ttl_seconds` | `int \| None` | `None` | Lifetime of the documents this instance writes. Needs the TTL index; see Limits. |
+| `ttl_seconds` | `int \| None` | `None` | Lifetime of the documents this instance writes. Needs the TTL index; see Limits. A negative value raises `ValueError`. |
 
 ### What the methods return
 
@@ -395,7 +395,6 @@ is a `ValueError` raised before anything is sent.
 | `VectorSimilarity` | `strands_mongodb.types` | The metrics `similarity` accepts |
 | `RESERVED_METADATA_KEYS` | `strands_mongodb.types` | The four metadata keys this package owns |
 | `UNSCOPED` | `strands_mongodb.memory_store` | The scope stamped and filtered on when a store names none |
-| `MongoDBVectorSearchStrategy` | `strands_mongodb` | Declared for a later release, and raises when constructed |
 | `__version__` | `strands_mongodb` | The installed version |
 
 ## Search: what answers a query
@@ -611,7 +610,7 @@ know whether the indexes are there, and what happens when one is absent depends 
 | Index kind | `True` (default) does | `False`, and it is missing |
 |---|---|---|
 | Ordinary and TTL | Creates what is missing, one `createIndexes` call per collection | Raises. The message is the list of `createIndexes` commands that fix it, one line each |
-| Search, under `search_type: "auto"` | Creates it, then polls until it is queryable | A warning naming the index, and that tier is dropped. The store starts and answers from the tier that is left; if neither is left it raises |
+| Search, under `search_type: "auto"` | Creates it, then polls until it is queryable | A warning naming the index, and that tier is skipped. The store starts and answers from the tier that is left, and tries the skipped one again later; if neither is left it raises |
 | Search, under a named `search_type`: `"vector"`, `"text"` or `"hybrid"` | Creates it, then polls until it is queryable | Raises. There is no second tier to fall back to, and answering from one you did not ask for changes what matches |
 
 So verify mode is not a quiet mode. A missing ordinary index stops startup with a work order, because the
@@ -627,9 +626,10 @@ there raises with the command for `strands_expires_at_ttl` and creates nothing.
 
 Waiting is bounded. `initialize()` polls a new search index every 0.5 s for up to 300 s per index, and
 past that the index counts as unavailable. Under a named `search_type` that raises `StorageError`, and
-calling `initialize()` again keeps waiting. Under `"auto"` the tier is dropped with a warning, as a
-missing one is, and that store instance does not try it again; a store built after the index reports
-`READY` picks it up.
+calling `initialize()` again keeps waiting. Under `"auto"` the tier is skipped with a warning, as a
+missing one is, and the store tries it again on a later operation: first after 60 s, then after twice the
+previous delay each time it is still missing, up to an hour. A retry reads the index status and does not
+wait for a build, so it never holds up the operation that triggers it.
 
 ### Privileges
 
@@ -701,7 +701,7 @@ not so it can be imported.
 | Results per search | 10 by default. Raise `max_search_results` on the store, or `limit` on a single query. | `DEFAULT_MAX_SEARCH_RESULTS` |
 | Vector candidates considered | 10 per result requested. Raise `oversampling_factor` for recall, lower it for latency. | `DEFAULT_OVERSAMPLING_FACTOR` |
 | Vector candidates per query | 10000, the server's `numCandidates` ceiling. A `limit` times `oversampling_factor` above it raises `ValueError` before the query is sent. Lower one of the two. | `MAX_NUM_CANDIDATES` |
-| Waiting for a search index | 300 s per index. Past that, `initialize()` raises `StorageError` under a named `search_type`, and under `"auto"` drops the tier with a warning for the life of that store instance. The index keeps building either way. Set `index_ready_timeout` to change it. | `READY_TIMEOUT_SECONDS` |
+| Waiting for a search index | 300 s per index. Past that, `initialize()` raises `StorageError` under a named `search_type`, and under `"auto"` skips the tier with a warning and tries it again later, from 60 s up to an hour apart. The index keeps building either way. Set `index_ready_timeout` to change it. | `READY_TIMEOUT_SECONDS` |
 
 ## Observability
 

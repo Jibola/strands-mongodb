@@ -27,8 +27,8 @@ one repository start disagreeing.
 ## Where the reasoning lives, and the order work happens in
 
 Requirements are numbered in EARS form (`REQ-E-nnn`), each paired with the acceptance test that proves it
-(`AT-nnn`). The code and the tests cite those ids, and they are the stable handle for anything a docstring
-or a comment here refers to.
+(`AT-nnn`). The tests cite those ids. The library's own docstrings and comments do not, because the package
+ships without the documents that define them.
 
 **The requirement changes before the code.** If the behaviour you are about to write has no requirement,
 write one first, give it an id, and say what would falsify it. This is not ceremony: it is the only reason

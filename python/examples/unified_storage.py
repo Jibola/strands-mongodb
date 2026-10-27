@@ -1,29 +1,27 @@
 """Three SDK subsystems, one MongoDB collection, and a session that survives the process that made it.
 
-Two commands, two processes:
+Run the two steps as separate commands:
 
     python examples/unified_storage.py run
     python examples/unified_storage.py resume
 
-``Agent(storage=...)`` takes one backend and hands it to every subsystem that does not bring its own. So
-one ``MongoDBStorage`` ends up serving three writers at once, each under its own key prefix:
+Agent(storage=...) takes one backend and hands it to every subsystem that does not bring its own, so one
+MongoDBStorage serves three writers, each under its own key prefix:
 
     session/    conversation snapshots, from SnapshotSessionManager
     offloader/  an oversized tool result, moved out of context by ContextOffloader
     memory/     a knowledge file, from FileMemoryStore(storage=...)
 
-The first step runs a turn that produces all three, then prints a census of the collection: every
-top-level prefix with a document count and a byte total, read back from MongoDB rather than from a list
-in this file. The second step starts a new interpreter, restores the session from ``session/`` alone, and
-prints how many messages came back.
+The run step runs a turn that writes all three, then prints a census of the collection read back from
+MongoDB: each top-level prefix with its document count and byte total. The resume step, in a new
+process, restores the session from session/ and prints how many messages came back.
 
-One thing worth saying out loud, because the key names invite the opposite conclusion: the ``memory/``
-documents here are not vector memory. ``Storage`` moves opaque bytes under a string key, and
-``FileMemoryStore``'s recall is token overlap over the key space. ``MongoDBMemoryStore``, which
-``memory_recall.py`` demonstrates, is a different collection with typed fields and a vector index.
+The memory/ documents are not vector memory. Storage holds opaque bytes under a string key, and on this
+backend FileMemoryStore recalls by token overlap over the keys alone. MongoDBMemoryStore, shown in
+memory_recall.py, uses a separate collection with typed fields and a vector index.
 
-Requires ``MONGODB_URI`` and a plain ``mongod`` is enough; nothing here needs Atlas Search. Pass
-``--dry-run`` to see what a step would do before pointing it at your own cluster.
+Needs MONGODB_URI. Any MongoDB deployment works; Atlas Search is not needed. Pass --dry-run to see what
+a step would do without connecting.
 """
 
 from __future__ import annotations
@@ -57,8 +55,8 @@ from strands_mongodb import MongoDBStorage
 SCRIPT = "unified_storage.py"
 STEPS = ("run", "resume")
 
-#: Low on purpose. The SDK's default is 2500 tokens, which no honest example tool result reaches, so
-#: the offloading path would never fire and the ``offloader/`` prefix would never appear.
+#: Far below the SDK's default of 2500 tokens, so the example tool result is offloaded and ``offloader/``
+#: appears.
 MAX_RESULT_TOKENS = 60
 PREVIEW_TOKENS = 20
 
@@ -68,8 +66,8 @@ KNOWLEDGE = (
     "for ten minutes before setting the alarm."
 )
 
-#: Reply one calls the tool, so ``ContextOffloader``'s after-tool hook has an oversized result to move.
-#: Reply two ends the turn, which is what the event loop asks for once the tool result is back.
+#: The first reply calls the tool, giving ``ContextOffloader`` an oversized result to move. The second
+#: ends the turn.
 REPLIES: list[dict[str, Any]] = [
     {
         "role": "assistant",
@@ -87,12 +85,11 @@ PROMPT = "Pull up tonight's reservation book and file the closing checklist."
 def reservation_book(service: str) -> str:
     """Return every booking for one service, which is more text than a turn should carry.
 
-    Deliberately verbose. A tool that returns a sentence keeps the offloading path cold, and a cold
-    path is one nobody has seen work. Roughly 70 lines at about 45 characters each is a few thousand
-    characters, comfortably over the threshold this example sets.
+    The 70 lines come to a few thousand characters, well over :data:`MAX_RESULT_TOKENS`, so the
+    offloader moves the result out of context.
 
     Args:
-        service: Which service to list. Not branched on; the size is the point.
+        service: Which service to list. Only used in the heading.
 
     Returns:
         One line per booking.
@@ -108,8 +105,8 @@ def reservation_book(service: str) -> str:
 def build_storage(arguments: Any, uri: str) -> MongoDBStorage:
     """Build the one storage instance every subsystem in this example shares.
 
-    No ``prefix``, so the keys in the collection are the SDK's own and the census reads what the SDK
-    chose rather than what this script imposed. A real deployment usually does pass one, per tenant.
+    No ``prefix`` is set, so the census shows the SDK's own keys. A real application usually sets one
+    per tenant.
 
     Args:
         arguments: Parsed command line.
@@ -122,11 +119,10 @@ def build_storage(arguments: Any, uri: str) -> MongoDBStorage:
 
 
 async def census_lines(arguments: Any, uri: str) -> list[dict[str, Any]]:
-    """Read the prefix census with a plain driver, and say each line.
+    """Read the prefix census with a separate driver client, and print each line.
 
-    A second client, rather than reaching into the storage instance, because it makes the honest point:
-    these are ordinary documents in an ordinary collection, and anything that speaks MongoDB can read
-    them. ``mongosh`` would give the same answer.
+    A plain client shows that these are ordinary documents that any MongoDB tool, ``mongosh`` included,
+    can read.
 
     Args:
         arguments: Parsed command line.
@@ -152,16 +148,15 @@ async def census_lines(arguments: Any, uri: str) -> list[dict[str, Any]]:
 def build_agent(arguments: Any, storage: MongoDBStorage) -> tuple[Agent, SnapshotSessionManager]:
     """Assemble the agent and the session manager that shares its storage.
 
-    Neither the session manager nor the offloader is given a backend of its own. They resolve
-    ``agent.storage``, which is the arrangement worth showing: one connection pool, one collection, and
-    the subsystems telling themselves apart by key prefix rather than by configuration.
+    Neither the session manager nor the offloader gets a backend of its own. Both use ``agent.storage``:
+    one connection pool, one collection, and the subsystems kept apart by key prefix.
 
     Args:
         arguments: Parsed command line.
         storage: The shared backend.
 
     Returns:
-        The agent and the session manager, which is needed again for the explicit snapshot.
+        The agent and the session manager, which ``run`` uses again to save a snapshot.
     """
     sessions = SnapshotSessionManager(session_id=arguments.session_id)
     offloader = ContextOffloader(max_result_tokens=MAX_RESULT_TOKENS, preview_tokens=PREVIEW_TOKENS)
@@ -186,18 +181,14 @@ async def run(arguments: Any, uri: str) -> dict[str, Any]:
         The summary payload.
     """
     storage = build_storage(arguments, uri)
-    # `type: ignore[abstract]`, and not because of anything this package does. `FileMemoryStore` inherits
-    # the `MemoryStore` Protocol explicitly and implements five of its eight members, so mypy treats
-    # `add_messages`, `get_tools` and `initialize` as abstract and refuses to instantiate it. At runtime
-    # `__abstractmethods__` is empty and the class works; the SDK feature-detects those three rather than
-    # requiring them. Anyone type checking a `FileMemoryStore` call hits this, so it is reported upstream
-    # rather than worked around by not using the class.
+    # `FileMemoryStore` subclasses the SDK's `MemoryStore` Protocol without implementing `add_messages`,
+    # `get_tools` or `initialize`, so mypy calls it abstract. At runtime it works, because the SDK
+    # detects those methods rather than requiring them. Any type-checked caller needs this ignore.
     knowledge = FileMemoryStore(name=MEMORY_STORE, storage=storage)  # type: ignore[abstract]
 
     try:
-        # Constructing the Agent restores any existing session, and it does that from a synchronous
-        # hook, which the SDK serves by running the read on a fresh event loop in a worker thread.
-        # That is the per-loop client `REQ-E-017a` provides, exercised here without asking for it.
+        # Constructing the Agent restores any existing session from a synchronous hook, which the SDK runs
+        # on a new event loop in a worker thread. `MongoDBStorage` keeps one client per event loop for this.
         agent, sessions = build_agent(arguments, storage)
         say(f"session {arguments.session_id!r} opened with {len(agent.messages)} message(s) in context")
 
@@ -235,7 +226,7 @@ async def run(arguments: Any, uri: str) -> dict[str, Any]:
 
 
 async def resume(arguments: Any, uri: str) -> dict[str, Any]:
-    """Restore the session in a process that has never run a turn.
+    """Restore the session in a fresh process that has run no turn.
 
     Args:
         arguments: Parsed command line.

@@ -205,7 +205,7 @@ class TestTheVectorIndexDefinition:
 
 
 class TestTheFullTextIndexDefinition:
-    """The tier-3 fallback, and the text branch of hybrid in v0.2.0."""
+    """The full-text index: the text tier, and the text branch of the hybrid tier."""
 
     def test_it_maps_the_content_field_as_a_string_and_nothing_else(self) -> None:
         definition = _indexes.text_index_definition()

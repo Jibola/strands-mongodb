@@ -1,28 +1,20 @@
-"""Search stage construction over ``pymongo_search_utils``' pure builders (``REQ-E-070``).
+"""Aggregation stages for the vector, text and hybrid search tiers.
 
-Pure functions over plain dicts, like ``_filter``: no client, no I/O, nothing that needs a deployment.
-Everything here is checkable in the unit tier, which matters because the two mistakes this module
-exists to prevent are both shape mistakes that a live query answers with results rather than an error.
+Pure functions over plain dicts: no client and no I/O, so every shape is testable without a deployment.
+That matters because the mistakes this module prevents are shape mistakes a live query can answer with
+wrong results rather than an error.
 
-The library's own builders are the source of every stage. What this module adds is the three things
-they leave to a caller, all of which are decisions rather than plumbing:
+Every search stage comes from ``pymongo_search_utils``' builders. This module adds what they leave to the
+caller:
 
-* **One return type.** ``vector_search_stage`` returns a single dict and ``text_search_stage`` returns
-  a list of up to four stages. Every function here returns ``list[dict]`` so the two tiers compose the
-  same way.
-* **Which builder, and which path.** Both follow ``VectorMode``: the ``autoEmbed`` index declares the
-  *text* field as its vector field, so the AutoEmbeddings query paths at ``content`` while the manual
-  query paths at ``embedding``. Crossing them is code 8 rather than a wrong answer, measured, but only
-  after a round trip.
-* **The score projection.** The vector builders emit no score, because hybrid ranks by reciprocal rank
-  instead. ``$meta`` names differ per tier and are not interchangeable: measured, each errors on the
-  other tier.
-
-Hybrid is deliberately absent. ``combine_pipelines``, ``reciprocal_rank_stage`` and
-``final_hybrid_stage`` are the three exports v0.1.0 does not call: they are phase-2 surface.
-
-Private, like ``_client`` and ``_filter``. The emitted stages are a promise pinned by ``AT-070``; these
-signatures are not.
+* **One return type.** Every function returns ``list[dict]``, so the tiers compose the same way.
+* **Which builder, and which path.** Both follow ``VectorMode``. The ``autoEmbed`` index declares the
+  text field as its vector field, so the AutoEmbeddings query paths at ``content`` and the manual query
+  paths at ``embedding``. Crossing them fails with code 8, but only after a round trip.
+* **The score projection.** The vector builders emit no score. The three ``$meta`` names (vector, text,
+  fused) are not interchangeable.
+* **The hybrid tier.** :func:`hybrid_stages` wraps the vector and text pipelines in one server-side
+  ``$rankFusion`` (MongoDB 8.0+). The library's client-side fusion builders are not used.
 """
 
 from __future__ import annotations
@@ -39,7 +31,7 @@ try:
         text_search_stage,
         vector_search_stage,
     )
-except ImportError as error:  # pragma: no cover - exercised by AT-006b in the extras tier
+except ImportError as error:  # pragma: no cover - exercised in the extras tier
     missing_extra("memory", error, module=__name__)
 
 if TYPE_CHECKING:
@@ -60,74 +52,54 @@ __all__ = [
 ]
 
 RANK_FUSION_PENALTY: Final[int] = 60
-"""Rank constant the server adds inside ``$rankFusion``, fixed and not configurable here.
+"""Rank constant the server applies inside ``$rankFusion``. This package never sends it.
 
-The reason this is a named constant in a package that never sends it: it sets the *scale* of every
-score the hybrid tier returns, and that scale is nothing like the other two tiers'. A fused score is
-``sum over the tiers that ranked it of weight x 1/(rank + 60)``, so a document first in one tier scores
-about ``1/61``, or ``0.016``, and one first in both about ``0.033``, while ``cosine``
-similarity and BM25 both land in roughly 0 to 1. A ``min_score`` chosen against either of those and
-applied to a fused score filters out every result and looks exactly like an empty collection
-(``REQ-E-145``).
-
-So the number is here to be *quoted*: the config docstring and the README operator reference both
-resolve their stated range against this constant rather than against a remembered 60, which is what
-``AT-151`` asserts.
+It sets the scale of every hybrid score. A fused score is the sum, over the tiers that ranked a document,
+of ``weight / (rank + 60)``. A document first in one tier scores about ``1/61`` (0.016) and one first in
+both about 0.033, while cosine similarity and BM25 land roughly between 0 and 1. A ``min_score`` chosen
+for those scales empties every hybrid result. The config docstring and the README quote this constant.
 """
 
 MAX_NUM_CANDIDATES: Final[int] = 10000
 """Upper bound the server enforces on ``numCandidates``.
 
-Measured on mongot 8.3.8: outside ``[1..10000]`` is code 8, *"numCandidates" must be within bounds
-[1..10000]*. Read off a server and written down here, which is the same kind of claim
-``_indexes.MAX_DIMENSIONS`` makes and goes stale the same way, so ``AT-072b`` re-reads it from a real
-deployment rather than trusting this line.
+Outside ``[1..10000]`` the server returns code 8, *"numCandidates" must be within bounds [1..10000]*
+(measured on mongot 8.3.8). An integration test re-reads it from a real deployment.
 """
 
 VECTOR_SCORE_META: Final[str] = "vectorSearchScore"
-"""``$meta`` name carrying a ``$vectorSearch`` score. Not interchangeable with the text one."""
+"""``$meta`` name for a ``$vectorSearch`` score. Not interchangeable with the other two."""
 
 FUSION_SCORE_META: Final[str] = "score"
-"""``$meta`` name carrying a ``$rankFusion`` score, and the third name that is not interchangeable.
+"""``$meta`` name for a ``$rankFusion`` score. Not interchangeable with the other two.
 
-The plainest of the three, and the one most likely to be mistaken for a field rather than metadata:
-``{"$meta": "score"}`` reads almost like ``"$score"`` and means something else entirely. It is also the
-only one of the three whose stage does *not* project it for you -- ``$rankFusion`` emits the fused
-documents with no score field at all, so without the ``$set`` this module appends outside the stage,
-every hybrid result would arrive scoring ``0.0`` and any ``min_score`` would empty the result list.
-That failure is silent and looks exactly like an empty collection, with nothing to say the score was at fault.
-
-Available since 8.0, the same floor as the stage itself (:data:`_indexes.RANK_FUSION_MIN_MAJOR`).
+``{"$meta": "score"}`` is metadata, not the ``"$score"`` field. ``$rankFusion`` returns documents with no
+score field, so without the ``$set`` appended after it every hybrid result would score ``0.0`` and any
+``min_score`` would silently empty the result list. Available from MongoDB 8.0, the same floor as the
+stage (:data:`_indexes.RANK_FUSION_MIN_MAJOR`).
 """
 
 TEXT_SCORE_META: Final[str] = "searchScore"
-"""``$meta`` name carrying a ``$search`` score.
+"""``$meta`` name for a ``$search`` score. Not interchangeable with the other two.
 
-Not interchangeable with the vector one, and crossing them is not reliably loud. Measured on mongot
-8.3.8, asking for this one on a ``$vectorSearch`` pipeline is *"query requires $search score metadata,
-but it is not available"*. Measured on Atlas 8.0.30, the same pipeline is accepted and every document
-comes back with no score field, which the caller in ``memory_store`` reads as ``0.0``. So these two
-constants are the guard rather than the server, and ``AT-070c`` asserts the invariant that holds on
-either deployment.
+Crossing it with the vector name is not reliably an error. On mongot 8.3.8, asking for it on a
+``$vectorSearch`` pipeline fails with *"query requires $search score metadata, but it is not available"*.
+On Atlas 8.0.30 the same pipeline succeeds and returns no score field, which ``memory_store`` reads as
+``0.0``. So these constants are the guard, not the server.
 
-Both names yield a ``float`` where they belong, but on different scales, which is why ``_search_type``
-travels in the result metadata and ``min_score`` is not comparable across tiers.
+The tiers score on different scales, which is why ``_search_type`` travels in the result metadata and
+``min_score`` is not comparable across tiers.
 """
 
 SCORE_FIELD: Final[str] = "score"
-"""Field the score is projected into, on both tiers, so a reader does not branch on the tier."""
+"""Field every tier projects its score into, so a reader does not branch on the tier."""
 
 
 def candidate_count(limit: int, oversampling_factor: int = DEFAULT_OVERSAMPLING_FACTOR) -> int:
-    """Derive ``numCandidates`` from a resolved limit and validate it (``REQ-E-072``).
+    """Derive ``numCandidates`` from a resolved limit and validate it.
 
-    Derived rather than passed as a constant, so a caller who raises their limit gets a candidate pool
-    that grew with it. ``MongoDBSearchQuery`` carries ``oversampling_factor`` rather than
-    ``numCandidates`` for the same reason: the dial that matters is the ratio, and exposing the product
-    directly is how a query ends up asking for 10,000 candidates to return 5 results.
-
-    ``pymongo_search_utils`` computes the same product inside its builders. It does not validate it,
-    and the two bounds the server enforces are separate checks with separate codes.
+    Derived from the limit so the candidate pool grows with it. ``pymongo_search_utils`` computes the
+    same product but does not validate it.
 
     Args:
         limit: Resolved result ceiling for this query. Must be positive.
@@ -138,12 +110,12 @@ def candidate_count(limit: int, oversampling_factor: int = DEFAULT_OVERSAMPLING_
 
     Raises:
         ValueError: If ``limit`` is not positive, if the factor is not positive, or if the product
-            exceeds :data:`MAX_NUM_CANDIDATES`. Both numbers are named, because either one is the one
-            the caller can lower and only they know which.
+            exceeds :data:`MAX_NUM_CANDIDATES`. The message names both numbers, since either can be
+            lowered.
     """
     if limit < 1:
-        # Measured as code 7912700 on 8.0 and 65137 on 9.0, from a different layer than the
-        # `numCandidates` checks below. Distinct enough to be worth its own message.
+        # The server rejects this from a different layer than the `numCandidates` checks: code 7912700
+        # on MongoDB 8.0 and 65137 on 9.0.
         raise ValueError(
             f"strands_mongodb: 'limit' is {limit} and a search limit must be at least 1. The server "
             f"rejects a non-positive limit outright."
@@ -167,15 +139,12 @@ def candidate_count(limit: int, oversampling_factor: int = DEFAULT_OVERSAMPLING_
 
 
 def check_candidate_count(*, limit: int, num_candidates: int) -> None:
-    """Reject a limit larger than the candidate pool (``REQ-E-072a``).
+    """Reject a limit larger than the candidate pool.
 
-    Separate from :func:`candidate_count` because the server enforces it separately: measured,
-    ``limit=5`` with ``numCandidates=4`` is code 8, *limit should be less than or equal to
-    numCandidates*, while ``limit=5`` with ``numCandidates=5`` succeeds. The bound is ``<=``.
-
-    Unreachable through this module's own arithmetic, where the product of a positive limit and a
-    factor of 1 or more is never below the limit. Checked anyway, so the derivation can change without
-    the bound quietly going unchecked, and so a caller assembling a stage by hand hits it here.
+    The server checks this separately from the ``numCandidates`` bounds: ``limit=5`` with
+    ``numCandidates=4`` is code 8, *limit should be less than or equal to numCandidates*, and ``limit=5``
+    with ``numCandidates=5`` succeeds. :func:`candidate_count` cannot produce a violation today. The check
+    keeps the bound enforced if that derivation changes.
 
     Args:
         limit: Resolved result ceiling.
@@ -203,42 +172,38 @@ def vector_stages(
     oversampling_factor: int = DEFAULT_OVERSAMPLING_FACTOR,
     score: bool = True,
 ) -> list[dict[str, Any]]:
-    """Build the vector tier: one ``$vectorSearch`` and the score projection it does not include.
+    """Build the vector tier: one ``$vectorSearch`` plus the score projection it lacks.
 
-    ``REQ-E-070``, ``REQ-E-072``, ``REQ-E-074``. Which builder runs follows ``mode``, and so does
-    ``path``: the ``autoEmbed`` index definition declares the *text* field as the vector field, because the
-    deployment embeds it, while the manual definition declares the vector field the caller writes.
+    ``mode`` picks the builder and the ``path``. The ``autoEmbed`` index declares the text field as its
+    vector field, because the deployment embeds it. The manual index declares the field the caller writes.
 
-    No ``$limit`` stage. ``$vectorSearch`` carries its own ``limit`` and its ``filter`` is a pre-filter
-    applied during the search, so unlike the text tier there is nothing downstream that could shrink
-    the result set below the requested count.
+    There is no ``$limit`` stage. ``$vectorSearch`` carries its own ``limit``, and its ``filter`` is a
+    pre-filter, so nothing downstream can shrink the result set below the requested count.
 
     Args:
         mode: Resolved vector path, from ``_indexes.vector_mode``.
         index_name: Atlas Vector Search index to query.
         limit: Resolved result ceiling.
         query_text: Natural-language query, on the AutoEmbeddings path only.
-        query_vector: Pre-computed embedding, on the manual path only (``REQ-E-074``).
+        query_vector: Pre-computed embedding, on the manual path only.
         query_filter: Validated MQL pre-filter over declared filterable paths. Omitted from the stage
-            when empty, since ``{}`` and absent mean the same thing and look different to the planner.
+            when empty.
         oversampling_factor: Multiplier behind ``numCandidates``.
-        score: Whether to append the score projection. ``False`` only from :func:`hybrid_stages`, where
-            the stage would be both dead weight and illegal: ``$rankFusion`` ranks by position inside
-            each input pipeline and accepts only selection stages there (``REQ-E-142``).
+        score: Whether to append the score projection. :func:`hybrid_stages` passes ``False`` because
+            ``$rankFusion`` input pipelines may hold only selection stages.
 
     Returns:
         The search stage, and the ``$set`` projection when ``score``.
 
     Raises:
         ValueError: If the query's shape contradicts ``mode``, if neither or both query fields are
-            supplied (``REQ-E-074a``), or if the derived candidate count is out of bounds.
+            supplied, or if the derived candidate count is out of bounds.
     """
     _check_query_shape(mode, query_text=query_text, query_vector=query_vector)
 
     candidates = candidate_count(limit, oversampling_factor)
     check_candidate_count(limit=limit, num_candidates=candidates)
-    # `filter=None` and `filter={}` are both falsy to the builders, which drop the key. Passing the
-    # dict through rather than normalizing first keeps that decision in one place: theirs.
+    # The builders drop a falsy `filter`, so an empty one needs no normalizing here.
     shared: dict[str, Any] = {
         "search_field": CONTENT_FIELD if mode.auto_embed else VECTOR_FIELD,
         "index_name": index_name,
@@ -248,8 +213,7 @@ def vector_stages(
     }
 
     if mode.auto_embed:
-        # `query_text` is not None here: `_check_query_shape` rejects the alternative, and `mode.model`
-        # is likewise non-None whenever `auto_embed` is True.
+        # `_check_query_shape` guarantees `query_text`, and `auto_embed` guarantees `mode.model`.
         assert query_text is not None and mode.model is not None
         stage = autoembedding_vector_search_stage(query=query_text, model=mode.model, **shared)
     else:
@@ -267,34 +231,30 @@ def text_stages(
     query_filter: Mapping[str, Any] | None = None,
     score: bool = True,
 ) -> list[dict[str, Any]]:
-    """Build the full-text tier, in the order that makes a filtered query return its full count.
+    """Build the full-text tier, ordered so a filtered query still returns its full count.
 
-    ``REQ-E-070``, ``REQ-E-073``, ``REQ-E-073a``. Everything here comes from ``text_search_stage``,
-    including the ``$limit``, and the value of this function is that it adds nothing.
+    Every stage comes from ``text_search_stage``, including the ``$limit``.
 
-    ``$search`` filtering is a post-filter, so the ordering is load bearing. Measured over 200 documents
-    all matching the query with 10 of them in scope, asking for 5: the emitted order returns 5 and an
-    early ``$limit: 5`` returns 0. An over-fetch ahead of the ``$match``, which is the ordinary reading
-    of "over-fetch" and what ``REQ-E-073`` originally prescribed, returns between 0 and 5 depending on
-    the corpus, and on one where the filter anti-correlates with relevance every multiplier up to 38x
-    returns nothing. No fixed multiplier is safe: the smallest bound that always fills the limit is the
-    collection size.
+    ``$search`` filtering is a post-filter, so the filter ``$match`` must come before ``$limit``. Over 200
+    matching documents with 10 in scope, asking for 5, this order returns 5 and an early ``$limit: 5``
+    returns 0. No fixed over-fetch ahead of the ``$match`` is safe either: when the filter anti-correlates
+    with relevance, every multiplier up to 38x returned nothing, and only the collection size always fills
+    the limit.
 
-    Leaving the result set unbounded until after the filter is what works, and it is not a request for
-    the whole corpus. The aggregation pulls from mongot in batches of 101 growing by 1.5x and stops once
-    ``$limit`` is satisfied, so cost tracks how many documents survive the ``$match`` rather than the
-    limit or the collection size. A filter that anti-correlates with relevance still escalates to the
-    end, which ``REQ-E-073a`` accepts as the worst case.
+    Leaving the stream unbounded until the ``$match`` does not fetch the whole corpus. The aggregation pulls
+    from mongot in batches of 101, growing by 1.5x, and stops once ``$limit`` is satisfied, so cost tracks
+    how many documents survive the filter. A filter that anti-correlates with relevance can still read to
+    the end, the accepted worst case.
 
     Args:
-        query_text: Natural-language query, scored by Lucene's standard BM25 analyzer.
+        query_text: Natural-language query, scored with BM25 by Lucene's standard analyzer.
         index_name: Atlas Search index to query.
         limit: Resolved result ceiling, applied last.
         query_filter: Validated MQL predicate, applied as a ``$match`` before the limit. Dropped when
-            empty rather than emitted as ``{"$match": {}}``.
-        score: Whether to include the score projection, as ``include_scores`` on the builder. ``False``
-            only from :func:`hybrid_stages`. Note the projection is not last here -- ``$limit`` follows
-            it -- so dropping it is a keyword rather than a slice of the returned list.
+            empty.
+        score: Whether to include the score projection (the builder's ``include_scores``).
+            :func:`hybrid_stages` passes ``False``. The projection sits before ``$limit``, so it is
+            dropped by keyword rather than by slicing the list.
 
     Returns:
         ``$search``, ``$match`` when there is a filter, ``$set`` when ``score``, then ``$limit``.
@@ -322,49 +282,36 @@ def hybrid_stages(
     query_filter: Mapping[str, Any] | None = None,
     oversampling_factor: int = DEFAULT_OVERSAMPLING_FACTOR,
 ) -> list[dict[str, Any]]:
-    """Build the hybrid tier: one ``$rankFusion`` over the two pipelines this module already builds.
+    """Build the hybrid tier: one ``$rankFusion`` over the vector and text pipelines.
 
-    ``REQ-E-142``. The whole function is a wrapper, and that is the point of it. Reciprocal rank fusion
-    is not hard to write -- ``pymongo_search_utils.combine_pipelines`` writes it, over ``$unionWith``
-    and a ``$group``, and ``langchain-mongodb`` ships it -- but writing it makes this package the owner
-    of the weights, the penalties, the tie-breaking and the merge of documents that both tiers return.
-    The server owns all four in a stage that has existed since 8.0.
+    The server's ``$rankFusion`` (MongoDB 8.0+) owns the weights, the rank constant, tie-breaking and the
+    merge of documents both tiers return, so this package does not implement reciprocal rank fusion itself.
 
-    Both input pipelines are built with ``score=False``. ``$rankFusion`` ranks documents by their
-    **position** within each input pipeline, so a ``$meta`` projection inside one is read by nothing --
-    and an input pipeline may contain only selection stages, so the server rejects it rather than
-    ignoring it.
+    Both input pipelines are built with ``score=False``. ``$rankFusion`` ranks by position within each
+    input pipeline, and an input pipeline may hold only selection stages, so the server rejects a score
+    projection there. No weights are emitted (both default to 1) and no ``scoreDetails``.
 
-    No weights are emitted: both pipelines carry the server's default of 1, and ``{"vector": 1, "text":
-    1}`` is the same instruction spelled longer. No ``scoreDetails`` either, which is the per-tier
-    breakdown and not the score.
-
-    The score itself is a second stage, outside the fusion. ``$rankFusion`` returns fused documents
-    carrying no score field, so the ``$set`` reading ``{"$meta": "score"}`` is what makes ``min_score``
-    and ``_relevance_score`` mean anything on this tier -- see :data:`FUSION_SCORE_META` for what its
-    absence would look like, and :data:`RANK_FUSION_PENALTY` for the scale it lands on.
+    ``$rankFusion`` returns documents with no score field, so a ``$set`` after it projects the fused score.
+    See :data:`RANK_FUSION_PENALTY` for its scale. A final ``$limit`` follows, because the fused list is the
+    union of both branches and can hold up to twice ``limit`` documents.
 
     Args:
         mode: Resolved vector path, passed through to :func:`vector_stages`.
         vector_index_name: Atlas Vector Search index for the vector branch.
-        text_index_name: Atlas Search index for the text branch. Separate arguments because the two
-            tiers are separate indexes and a single ``index_name`` would silently query one twice.
-        query_text: Natural-language query. Required here, unlike on the vector path, because the text
-            branch has nothing else to search with -- which is why ``REQ-E-144`` makes a vector-only
-            query ineligible for this tier rather than degrading it.
-        limit: Resolved result ceiling, applied within each branch. The fusion returns at most the
-            union of the two, which is at most ``2 * limit`` before the caller's own limit applies.
+        text_index_name: Atlas Search index for the text branch.
+        query_text: Natural-language query. Required, because the text branch has nothing else to search
+            with.
+        limit: Resolved result ceiling, applied within each branch and again to the fused list.
         query_vector: Pre-computed embedding, on the manual path only.
-        query_filter: Validated MQL predicate. Goes to both branches, where each builder puts it where
-            its own tier needs it -- inside the stage for vector, in a ``$match`` for text.
+        query_filter: Validated MQL predicate. Each branch places it where its tier needs it: inside the
+            stage for vector, in a ``$match`` for text.
         oversampling_factor: Multiplier behind ``numCandidates`` on the vector branch.
 
     Returns:
-        Two stages: the ``$rankFusion`` and the ``$set`` projecting its fused score.
+        Three stages: the ``$rankFusion``, the ``$set`` projecting its fused score, and the ``$limit``.
 
     Raises:
-        ValueError: Whatever the two builders raise, unchanged. Validation is theirs, and reusing them
-            means reusing the rejections and not only the happy path.
+        ValueError: Whatever :func:`vector_stages` or :func:`text_stages` raises, unchanged.
     """
     vector = vector_stages(
         mode=mode,
@@ -380,15 +327,15 @@ def hybrid_stages(
         query_text=query_text, index_name=text_index_name, limit=limit, query_filter=query_filter, score=False
     )
     fusion = {"$rankFusion": {"input": {"pipelines": {"vector": vector, "text": text}}}}
-    return [fusion, _score_stage(FUSION_SCORE_META)]
+    # The fusion returns the union of both branches, up to twice `limit`.
+    return [fusion, _score_stage(FUSION_SCORE_META), {"$limit": limit}]
 
 
 def _score_stage(meta: str) -> dict[str, Any]:
-    """The projection both tiers need and only the text builder provides.
+    """Return the score projection the vector and hybrid tiers need.
 
     Args:
-        meta: ``$meta`` name for the tier. The two are not interchangeable and each errors on the
-            other tier, measured, so this is a name to get right rather than a preference.
+        meta: ``$meta`` name for the tier. The names are not interchangeable.
 
     Returns:
         A ``$set`` stage writing the score into :data:`SCORE_FIELD`.
@@ -399,22 +346,19 @@ def _score_stage(meta: str) -> dict[str, Any]:
 def check_query_keys(
     *, query_text: str | None, query_vector: list[float] | None, fusion_possible: bool = False
 ) -> None:
-    """Reject the two query shapes no tier can answer, without needing a mode (``REQ-E-074a``).
+    """Reject the two query shapes no tier can answer. Needs no vector mode.
 
-    Split out of :func:`_check_query_shape` so the memory store can run it before it knows which tier
-    will answer. The mode-dependent half below cannot run that early: ``embedding_dimensions`` selects
-    the manual vector path, and a query carrying ``text`` is wrong for the *vector* tier there while
-    still being exactly right for the text tier on the same store.
+    Separate from :func:`_check_query_shape` so the memory store can run it before choosing a tier. The
+    mode-dependent check cannot run that early: on a manual-vector store, a ``text`` query is wrong for the
+    vector tier but right for the text tier.
 
     Args:
         query_text: What the caller put in ``text``, if anything.
         query_vector: What the caller put in ``vector``, if anything.
-        fusion_possible: Whether this store's *configuration* could put both keys to work, which is the
-            manual-vector path with ``search_type`` left at ``auto`` or set to ``hybrid``
-            (``REQ-E-151``). Both-set stops being nonsense there: the fused tier reads ``text`` in one
-            input pipeline and ``vector`` in the other. Deliberately a fact about the config and not
-            about the deployment, so this stays the check that runs before the first round trip --
-            whether the server can actually fuse is settled later, by the tier list.
+        fusion_possible: Whether the store's configuration could use both keys: the manual-vector path
+            with ``search_type`` at ``auto`` or ``hybrid``, where the fused tier reads ``text`` in one
+            input pipeline and ``vector`` in the other. It depends on the config only, so this check runs
+            before any round trip. Whether the server can fuse is decided later, by the tier list.
 
     Raises:
         ValueError: If both query fields are set where nothing could use both, or if neither is.
@@ -435,13 +379,11 @@ def check_query_keys(
 
 
 def _check_query_shape(mode: VectorMode, *, query_text: str | None, query_vector: list[float] | None) -> None:
-    """Reject a query whose shape contradicts the configured vector path (``REQ-E-074a``).
+    """Reject a query whose shape contradicts the configured vector path.
 
-    One direction is measured loud: an AutoEmbeddings-shaped stage against a manual index is code 8,
-    ``queryVector must be present``. The other cannot be measured on any deployment CI reaches, because
-    an ``autoEmbed`` index needs a registered embedding model. Assuming it fails the same way
-    would be inventing behaviour, so both are rejected here, where the message can name the config key
-    that chose the path.
+    An AutoEmbeddings-shaped stage against a manual index fails with code 8, ``queryVector must be
+    present``. The reverse is untested, because an ``autoEmbed`` index needs a registered embedding model.
+    Both are rejected here, where the message can name the config key that chose the path.
 
     Args:
         mode: Resolved vector path.

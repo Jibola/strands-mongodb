@@ -572,3 +572,29 @@ class TestTheHooksThatMustStayAbsent:
 
         assert not hasattr(store, "add_messages")
         assert _has_method(store, "add_messages") is False
+
+
+class TestANegativeLifetimeIsRefused:
+    """AT-226 / ``REQ-E-218``. A negative ``ttl_seconds`` stamps an expiry in the past, so the TTL monitor
+    would delete every write within a minute. ``0`` is a valid request and stays accepted."""
+
+    def test_a_storage_refuses_a_negative_ttl(self) -> None:
+        with pytest.raises(ValueError, match="ttl_seconds"):
+            MongoDBStorage(_storage_config(), ttl_seconds=-1)
+
+    def test_a_memory_store_refuses_a_negative_ttl(self) -> None:
+        with pytest.raises(ValueError, match="ttl_seconds"):
+            MongoDBMemoryStore(**_store_config(ttl_seconds=-1))
+
+    def test_a_refused_config_registers_no_connection(self) -> None:
+        for build in (
+            lambda: MongoDBStorage(_storage_config(), ttl_seconds=-60),
+            lambda: MongoDBMemoryStore(**_store_config(ttl_seconds=-60)),
+        ):
+            with pytest.raises(ValueError):
+                build()
+        assert _client._REGISTRY == {}
+
+    def test_zero_is_still_accepted_on_both(self) -> None:
+        assert MongoDBStorage(_storage_config(), ttl_seconds=0)._ttl_seconds == 0
+        assert MongoDBMemoryStore(**_store_config(ttl_seconds=0)).ttl_seconds == 0

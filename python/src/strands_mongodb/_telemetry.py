@@ -1,18 +1,17 @@
-"""OpenTelemetry spans for both stores, and the one module in the package that imports OpenTelemetry.
+"""OpenTelemetry spans and structured log fields for both stores. The only module that imports OpenTelemetry.
 
-The package configures nothing: no provider, no exporter, no sampling. The tracer is looked up on every
-call, so an application that installs its provider after importing this package still gets spans, and one
-that installs none gets OpenTelemetry's no-op tracer and pays for a function call.
+The package configures no provider, exporter or sampling. The tracer is looked up on every call, so a
+provider installed after import still gets spans, and with none installed the no-op tracer costs a
+function call.
 
-What reaches a span is decided here and nowhere else. ``traced`` reads the instance and never the call's
-arguments, which is where keys, content, queries and filters live. Everything else arrives through
-``span``, ``annotate`` and ``event``, and their names are restricted to ``Attribute``: a ``Literal``, so ``mypy``
-rejects a name outside it, and a runtime check that drops one rather than raising, because a telemetry
-typo must never become a failed write.
+Only allow-listed attributes are recorded. No span carries caller data: keys, content, metadata, query
+text, filter values, scope or memory ids. ``traced`` reads the store instance, never the
+call's arguments. ``span``, ``annotate`` and ``event`` accept only names in ``Attribute``, checked by
+``mypy`` and again at runtime, where an unknown name is dropped rather than raised so a telemetry typo
+never fails a write.
 
-Exceptions are recorded as a status and a type name and never as a message. The messages this package
-raises name the key and the namespace on purpose, and a span is exported to a third party where a raised
-exception is not.
+Exceptions are recorded as a status and a type name, never a message. Raised messages name the key and
+the namespace, and spans are exported to third parties.
 """
 
 from __future__ import annotations
@@ -25,12 +24,11 @@ from typing import TYPE_CHECKING, Any, Final, Literal, ParamSpec, TypeVar, get_a
 from strands_mongodb import __version__
 from strands_mongodb._extras import missing_extra
 
-# Guarded like every other module that needs an extra. Both runtime extras bring `opentelemetry-api`, so
-# this fires only on a bare install, and it should name the extra that fixes it rather than a module name.
+# Both runtime extras bring `opentelemetry-api`, so this fires only on a bare install.
 try:
     from opentelemetry import trace
     from opentelemetry.trace import SpanKind, Status, StatusCode
-except ImportError as error:  # pragma: no cover - exercised in a subprocess by AT-008b
+except ImportError as error:  # pragma: no cover - exercised in a subprocess
     missing_extra("storage", error, module=__name__)
 
 if TYPE_CHECKING:
@@ -99,9 +97,8 @@ def traced(
 ) -> Callable[[Callable[_P, Coroutine[Any, Any, _R]]], Callable[_P, Coroutine[Any, Any, _R]]]:
     """Record one ``INTERNAL`` span named ``strands_mongodb.<surface>.<operation>`` around a store method.
 
-    Outermost on the method, above ``_reporting``, so the span sees the ``StorageError`` the caller sees
-    rather than the driver error underneath. ``Coroutine`` rather than ``Awaitable`` for the reason
-    ``_reporting`` gives: the protocols declare these methods ``async def``.
+    Apply it outermost, above ``_reporting``, so the span sees the ``StorageError`` the caller sees rather
+    than the driver error underneath.
 
     Args:
         surface: ``storage`` or ``memory``. A memory span also records the store's name.
@@ -119,8 +116,8 @@ def traced(
     def decorate(method: Callable[_P, Coroutine[Any, Any, _R]]) -> Callable[_P, Coroutine[Any, Any, _R]]:
         @functools.wraps(method)
         async def tracing(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-            # Bound through a local rather than indexed off `args` directly, which mypy rejects for a
-            # `ParamSpec`. Only `self` is read: the arguments are what this module must never see.
+            # A local because mypy rejects indexing `ParamSpec` args. Only `self` is read: the call's
+            # arguments carry caller data.
             positional: tuple[Any, ...] = args
             tracer = trace.get_tracer("strands_mongodb", __version__)
             with tracer.start_as_current_span(
@@ -133,13 +130,11 @@ def traced(
                 try:
                     return await method(*args, **kwargs)
                 except Exception as error:
-                    # `Exception`, not `BaseException`: a cancelled call ends its span with the status
-                    # unset, because cancelling is the caller's decision and not a store failure.
+                    # Not `BaseException`: a cancelled call is not a store failure, so its status stays unset.
                     _mark(span, error)
                     raise
 
-        # Stored on the wrapper rather than in a module-level registry, so the README test can list the
-        # spans a store class emits without seeing ones a test decorated for itself.
+        # On the wrapper, not in a registry, so a test can list a store class's spans without its own.
         tracing.__dict__["strands_mongodb_span"] = name
         return tracing
 
@@ -150,9 +145,9 @@ def traced(
 def span(name: SpanName, attributes: Mapping[Attribute, AttributeValue]) -> Iterator[None]:
     """Open an ``INTERNAL`` child span under the current one, for work a store operation causes.
 
-    The same rules as ``traced``: the tracer looked up on entry, attributes filtered through the allow-list,
-    and an exception recorded as a status and a type name and re-raised unchanged. Inside it, ``annotate``
-    sets attributes on this span rather than on the operation's.
+    Same rules as ``traced``: the tracer is looked up on entry, attributes pass through the allow-list, and
+    an exception is recorded as a status and a type name, then re-raised unchanged. Inside it, ``annotate``
+    sets attributes on this span rather than the operation's.
 
     Args:
         name: An index span name.
@@ -182,11 +177,11 @@ def span(name: SpanName, attributes: Mapping[Attribute, AttributeValue]) -> Iter
 
 
 def event_extra(event: LogEvent, *, namespace: str | None = None, tier: str | None = None) -> dict[str, str]:
-    """The ``extra`` mapping for one log record, so a JSON formatter can index it without parsing the message.
+    """Build the ``extra`` mapping for one log record, so a JSON formatter can index it without parsing.
 
-    Prefixed ``strands_mongodb_`` because ``logging`` raises ``KeyError`` for an ``extra`` key that collides
-    with a ``LogRecord`` attribute such as ``name`` or ``message``. A field that does not apply is omitted
-    rather than set to ``None``, so a formatter's output has no keys that never carry anything.
+    Keys are prefixed ``strands_mongodb_`` because ``logging`` raises ``KeyError`` for an ``extra`` key
+    that collides with a ``LogRecord`` attribute such as ``name``. A field that does not apply is omitted
+    rather than set to ``None``.
 
     Args:
         event: The record's stable name.
@@ -207,7 +202,7 @@ def event_extra(event: LogEvent, *, namespace: str | None = None, tier: str | No
 def annotate(name: Attribute, value: AttributeValue) -> None:
     """Set an outcome attribute on the current span, which inside a store method is the operation's own.
 
-    A no-op against the no-op tracer, so call sites carry no conditionals.
+    A no-op under the no-op tracer, so call sites need no conditionals.
 
     Args:
         name: An allow-listed attribute name.

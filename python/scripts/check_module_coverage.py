@@ -1,13 +1,8 @@
-"""Enforce a per-module coverage floor alongside the aggregate one.
+"""Fail if any single module falls below a coverage floor.
 
-``--cov-fail-under`` measures the whole package. A package can sit at 92% aggregate while one
-module sits at 0%, and the modules that end up at 0% are reliably the adapters nobody wants to
-test: index DDL, pipeline builders, the search strategy. Those are exactly the files where a
-mock-heavy suite provides no evidence at all.
-
-Reads ``coverage.json`` written by ``pytest --cov-report=json`` and exits non-zero if any module
-falls below the floor. Run after the aggregate check, not instead of it: the two catch different
-failures.
+``--cov-fail-under`` checks the package as a whole, which can pass while one module is untested. This
+reads the ``coverage.json`` written by ``pytest --cov-report=json`` and exits non-zero if any module is
+below the floor. Run it in addition to the aggregate check.
 
 Usage::
 
@@ -21,13 +16,11 @@ import json
 import sys
 from pathlib import Path
 
-# Per-module floor, deliberately lower than the 90% aggregate. A module can be thinner than the
-# package average for good reasons; 0% is never one of them, and that is what this catches.
+# Lower than the 90% aggregate floor: one module may trail the average, but not by this much.
 DEFAULT_FLOOR = 70.0
 
-# Modules exempt from the floor, each with the reason it is exempt. An empty dict is the goal
-# state. Adding an entry is a decision that belongs in review, which is why it lives in the
-# repository rather than in a CI flag.
+# Modules exempt from the floor, mapped to the reason. Kept in the repository, not a CI flag, so
+# adding one goes through review.
 EXEMPT: dict[str, str] = {}
 
 
@@ -35,7 +28,8 @@ def main() -> int:
     """Check every measured module against the floor.
 
     Returns:
-        ``0`` when every non-exempt module meets the floor, ``1`` otherwise.
+        ``0`` when every non-exempt module meets the floor. ``1`` when one does not, or when the report
+        is missing or measured no files.
     """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--floor", type=float, default=DEFAULT_FLOOR, help="minimum percent per module")

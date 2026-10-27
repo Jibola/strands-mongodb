@@ -1143,6 +1143,18 @@ class TestSearchIsOneAggregation:
         assert self._stages(collection) == ["$match", "$project", "$match", "$sort"]
         assert pipeline[0] == {"$match": {"_id": {"$gte": "tenant-a/", "$lt": "tenant-a0"}}}
 
+    async def test_a_namespaced_store_scores_keys_without_its_own_prefix(self) -> None:
+        """AT-229 / ``REQ-E-221``. The prefix is cut off before tokenizing, by code point, so a query naming
+        the namespace does not match every key in it."""
+        collection = FakeStorageCollection()
+
+        await unit_storage(collection, prefix="tenant-a").search("dark")
+
+        tokenized = collection.pipelines[0][1]["$project"]["score"]["$size"]["$setIntersection"][0]["$map"]
+        assert tokenized["input"]["$regexFindAll"]["input"] == {
+            "$toLower": {"$substrCP": ["$_id", len("tenant-a/"), {"$strLenCP": "$_id"}]}
+        }
+
     async def test_the_tokenizer_regex_is_the_unicode_property_form_not_backslash_w(self) -> None:
         """The finding that made this test exist. MongoDB's ``\\w`` is ASCII-only by default, so the
         obvious translation of the SDK's ``re.split(r"\\W+", ...)`` tokenizes ``café`` to ``caf`` and
@@ -2126,6 +2138,16 @@ class TestSearchAgainstARealDeployment:
         """Payloads large enough that a document fetch would be visible in ``docsExamined``."""
         for key in TestSearchAgainstARealDeployment.KEYS:
             await storage.write(key, b"x" * 400)
+
+    async def test_a_namespaced_store_does_not_match_its_own_prefix(self, contract_storage: MongoDBStorage) -> None:
+        """AT-229 / ``REQ-E-221``. On ``namespace("sessions")`` the query "sessions" matches no key, because
+        no key the caller wrote contains it, while a token in a key still matches."""
+        scoped = contract_storage.namespace("sessions")
+        await scoped.write("s1/state.json", b"{}")
+        await scoped.write("s2/dark-mode.json", b"{}")
+
+        assert await scoped.search("sessions") == []
+        assert [result.key for result in await scoped.search("dark")] == ["s2/dark-mode.json"]
 
     async def test_results_are_keys_and_scores_with_no_payload(self, contract_storage: MongoDBStorage) -> None:
         """``AT-032b`` (``REQ-E-032b``)."""

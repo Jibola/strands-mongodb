@@ -9,8 +9,8 @@ tiers by what each claim has to be observed against:
 * **contract** for writes, ordinary indexes, the dedup constraint and the no-search-support path. A
   plain ``mongod`` runs all of those, and answers no query at all (see ``conftest.py``), so nothing in
   this tier searches.
-* **integration** for every read, because v0.1.0 ships no search tier that runs without mongot
- and one of ``REQ-E-053a``'s three server error codes is what a query gets instead.
+* **integration** for every read, because no search tier runs without mongot and one of
+  ``REQ-E-053a``'s three server error codes is what a query gets instead.
 
 **Most of what this file claims needs a server, unlike ``test_storage.py`` and ``test_indexes.py``.**
 Both of those hand-write a fake collection because their claims are about the pipeline or the command
@@ -333,8 +333,8 @@ class TestTheHookThatReturnsNothing:
     (``memory_manager.py:252-254``): a present method returning ``[]`` extends the list by nothing.
 
     That is the asymmetry with ``add_messages``, whose presence decides *which extractor runs*. A
-    method whose presence changes routing is a hazard; one whose presence changes nothing is where
-    v0.2.0's tools go without a compatibility event.
+    method whose presence changes routing is a hazard; one whose presence changes nothing is where a
+    store's own tools can be added later without a compatibility event.
     """
 
     def test_get_tools_returns_an_empty_list(self) -> None:
@@ -420,24 +420,15 @@ class TestNoMethodStandsInForAbsence:
         ``_client.resolve`` and ``_indexes.ensure`` are both places where "not supported here" is a real
         condition, and both already answer it with ``ValueError`` or ``StorageError`` carrying the
         server's own message (``REQ-E-053a``). This fails the day one of them takes the shortcut.
-
-        One module is exempt, and the exemption is written to expire. ``search.py`` is ``REQ-E-075``'s
-        phase-2 placeholder: the class v0.2.0 publishes is declared and raises when constructed,
-        which is the opposite decision from ``add_messages`` and safe for the recorded reason,
-        that nothing in the SDK detects a ``SearchStrategy``. The second assertion below fails the day
-        that module stops raising, which is the day the exemption should be deleted rather than
-        inherited. How narrow the exemption is stays pinned in ``test_search.py``, which asserts the
-        raise appears in that class and nowhere else in the package.
         """
         sources = _package_sources()
         offenders = {
             name: sorted(_raised_names(source))
             for name, source in sources.items()
-            if name != "search.py" and "NotImplementedError" in _raised_names(source)
+            if "NotImplementedError" in _raised_names(source)
         }
 
         assert offenders == {}
-        assert "NotImplementedError" in _raised_names(sources["search.py"])
 
 
 class TestTheResultLimit:
@@ -560,22 +551,19 @@ class TestReservedMetadataKeysWin:
 class TestNoRegexTierIsReachable:
     """AT-055 / REQ-E-055 — a tripwire on a requirement that cannot be satisfied yet.
 
-    The requirement says ``re.escape`` applies *while the regex tier is active*, and v0.1.0 runs no such
-    tier: ``SearchType`` accepts ``auto``, ``vector`` and ``text``, and ``regex`` is scheduled for
-    v0.2.0. So the clause is vacuously true, which is not the same as satisfied. A contract
-    test of the escaping cannot exist without the tier, and a skipped placeholder asserts nothing while
-    looking like coverage.
+    The requirement says ``re.escape`` applies *while the regex tier is active*, and no such tier exists:
+    ``SearchType`` accepts ``auto``, ``vector``, ``text`` and ``hybrid``. So the clause is vacuously true,
+    which is not the same as satisfied. A contract test of the escaping cannot exist without the tier, and
+    a skipped placeholder asserts nothing while looking like coverage.
 
     What is testable is the vacuity. ``AT-056d`` pins that neither ``SearchType`` nor
     ``ResolvedSearchType`` admits ``regex``, so no config value and no result value selects the tier.
     These two add that no module emits the operator either, so there is no unselectable back door.
     ``REQ-E-050`` stops a caller from naming the operator through ``filter``, at any depth, and
     ``REQ-E-174`` stops the other route to the same matching: a native ``re.Pattern`` or ``bson.Regex``
-    *value*, which ``$match`` dispatches on exactly as it would the operator, without the operator ever
-    being written down. That second half was missing until ``AT-179``; the sentence that used to stand here
-    claimed ``REQ-E-050`` alone was enough, and it measurably was not.
+    *value*, which ``$match`` dispatches on exactly as it would the operator.
 
-    Both fail the day the regex tier lands, which is the day ``re.escape`` has to be there.
+    Both fail the day a regex tier is added, which is the day ``re.escape`` has to be there.
     """
 
     def test_no_module_emits_a_regex_match_operator(self) -> None:
@@ -2116,7 +2104,7 @@ class TestTheQueryShapeOnlyFusionCanRead:
 
         entries = await store.search({"text": "dark mode", "vector": QUERY_VECTOR})
 
-        assert [next(iter(stage)) for stage in collection.stages] == ["$rankFusion", "$set"]
+        assert [next(iter(stage)) for stage in collection.stages] == ["$rankFusion", "$set", "$limit"]
         assert _metadata(entries[0])["_search_type"] == "hybrid"
 
     async def test_a_manual_store_that_cannot_fuse_raises_rather_than_answering_from_one_key(
@@ -2248,7 +2236,7 @@ class TestAScoreBoundDeclinesTheBetterTier:
         entries = await store.search({"text": "dark mode", "vector": QUERY_VECTOR})
 
         assert [entry.content for entry in entries] == ["fact 0", "fact 1"]
-        assert [next(iter(stage)) for stage in collection.stages] == ["$rankFusion", "$set"]
+        assert [next(iter(stage)) for stage in collection.stages] == ["$rankFusion", "$set", "$limit"]
         assert _metadata(entries[0])["_search_type"] == "hybrid"
 
 
@@ -4593,3 +4581,90 @@ class TestTheScoreBoundDropsResults:
             )
         finally:
             await bounded.close()
+
+
+class TestASkippedTierIsTriedAgain:
+    """AT-227 / ``REQ-E-219``. Under ``auto`` a tier that failed at startup is retried with backoff.
+
+    The retry reads index status without waiting for a build, so it never holds a request for
+    ``index_ready_timeout``, and a retry that fails keeps the tiers the store already answers from.
+    Due-ness is forced through ``_tier_retry_at`` rather than by moving the clock, because patching
+    ``time.monotonic`` would also move the event loop's own clock.
+    """
+
+    async def test_the_tier_comes_back_once_the_retry_is_due(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _patch_setup(monkeypatch, failing=frozenset({"vector_index"}))
+        store = _store()
+        await store.initialize()
+        assert store._tiers == ("text",)
+
+        recorder.failing = frozenset()
+        store._tier_retry_at = 0.0
+        await store.initialize()
+
+        assert store._tiers == ("vector", "text")
+        assert store._tier_retry_at is None
+
+    async def test_nothing_is_retried_before_the_delay_has_passed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _patch_setup(monkeypatch, failing=frozenset({"vector_index"}))
+        store = _store()
+        await store.initialize()
+        calls = len(recorder.timeouts)
+
+        await store.initialize()
+
+        assert len(recorder.timeouts) == calls
+        assert store._tier_retry_at is not None
+        assert store._tier_retry_at > time.monotonic()
+
+    async def test_a_retry_does_not_wait_for_a_build(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _patch_setup(monkeypatch, failing=frozenset({"vector_index"}))
+        store = _store()
+        await store.initialize()
+        calls = len(recorder.timeouts)
+
+        store._tier_retry_at = 0.0
+        await store.initialize()
+
+        assert set(recorder.timeouts[calls:]) == {0}
+
+    async def test_a_failed_retry_keeps_the_tiers_and_doubles_the_delay(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from strands_mongodb.memory_store import TIER_RETRY_MAX_SECONDS, TIER_RETRY_SECONDS
+
+        recorder = _patch_setup(monkeypatch, failing=frozenset({"vector_index"}))
+        store = _store()
+        await store.initialize()
+        assert store._tier_retry_delay == TIER_RETRY_SECONDS
+
+        store._tier_retry_at = 0.0
+        await store.initialize()
+        assert store._tiers == ("text",)
+        assert store._tier_retry_delay == 2 * TIER_RETRY_SECONDS
+
+        # Every tier refusing on a retry is a raise inside the retry, and it still keeps what the store has.
+        recorder.failing = frozenset({"vector_index", "text_index"})
+        store._tier_retry_at = 0.0
+        await store.initialize()
+        assert store._tiers == ("text",)
+        assert store._tier_retry_delay == 4 * TIER_RETRY_SECONDS
+
+        store._tier_retry_delay = TIER_RETRY_MAX_SECONDS
+        store._tier_retry_at = 0.0
+        await store.initialize()
+        assert store._tier_retry_delay == TIER_RETRY_MAX_SECONDS
+
+    async def test_a_store_with_every_tier_schedules_no_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_setup(monkeypatch)
+        store = _store()
+        await store.initialize()
+
+        assert store._tiers == ("vector", "text")
+        assert store._tier_retry_at is None
+
+    async def test_a_named_search_type_schedules_no_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_setup(monkeypatch)
+        store = _store(config=_connection_config(search_type="text"))
+        await store.initialize()
+
+        assert store._tiers == ("text",)
+        assert store._tier_retry_at is None

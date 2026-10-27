@@ -33,10 +33,6 @@ if TYPE_CHECKING:
 LAZY_NAMES = [
     ("MongoDBStorage", "strands_mongodb.storage"),
     ("MongoDBMemoryStore", "strands_mongodb.memory_store"),
-    # Phase 2 (`REQ-E-075`). Included because every claim in this file is about resolving a *name*,
-    # and this one resolves like the other two: same identity, same `__module__`, same revealed type.
-    # None of these tests constructs anything, which is the only thing the placeholder refuses.
-    ("MongoDBVectorSearchStrategy", "strands_mongodb.search"),
 ]
 
 

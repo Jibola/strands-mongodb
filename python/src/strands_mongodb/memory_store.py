@@ -1,11 +1,11 @@
-"""``MongoDBMemoryStore`` -- Atlas Vector Search behind the Strands ``MemoryStore`` protocol.
+"""``MongoDBMemoryStore``: Atlas Vector Search behind the Strands ``MemoryStore`` protocol.
 
-Requires the ``memory`` extra, whose name does not match this module's::
+Requires the ``memory`` extra::
 
     pip install 'strands-mongodb[memory]'
 
-Registered with the SDK's ``MemoryManager`` alongside any other stores. The protocol requires
-only ``search``; ``add`` and ``add_messages`` are optional and feature-detected by the manager.
+Register the store with the SDK's ``MemoryManager`` alongside any other stores. The protocol requires
+only ``search``; the manager detects ``add`` and ``add_messages`` when they exist.
 """
 
 from __future__ import annotations
@@ -14,12 +14,13 @@ import datetime
 import functools
 import hashlib
 import logging
+import time
 from typing import TYPE_CHECKING, Any, Final, ParamSpec, TypeVar
 
 from ._extras import missing_extra
 
-# Imported for their side effect of proving the `memory` extra is installed: without it the
-# failure would otherwise surface deep inside a method call as a bare ModuleNotFoundError.
+# Imported to prove the `memory` extra is installed, so a missing extra fails here with a clear message
+# rather than as a bare ModuleNotFoundError inside a method call.
 try:
     import pymongo  # noqa: F401
     from pymongo_search_utils import __name__ as _pymongo_search_utils  # noqa: F401
@@ -48,7 +49,7 @@ if TYPE_CHECKING:
     from ._indexes import SearchIndexSpec, VectorMode
     from .types import MongoDBMemoryStoreConfig, MongoDBSearchQuery, ResolvedSearchType, SearchType
 
-__all__ = ["DEFAULT_COLLECTION", "UNSCOPED", "MongoDBMemoryStore"]
+__all__ = ["DEFAULT_COLLECTION", "TIER_RETRY_MAX_SECONDS", "TIER_RETRY_SECONDS", "UNSCOPED", "MongoDBMemoryStore"]
 
 logger = logging.getLogger(__name__)
 
@@ -58,23 +59,28 @@ _R = TypeVar("_R")
 DEFAULT_COLLECTION = "memory"
 """Collection this store uses when the config names none.
 
-Distinct from ``MongoDBStorage``'s ``"storage"`` on purpose. The two surfaces hold unrelated shapes:
-opaque bytes under an ``_id`` on one side, ``MemoryEntry`` text with a vector index over it on the
-other. One default for both would put session blobs in the collection whose index tries to embed
-them.
+Different from ``MongoDBStorage``'s ``"storage"`` on purpose: a shared default would put session blobs
+in the collection whose vector index tries to embed them.
 """
 
 UNSCOPED: Final[str] = "__unscoped__"
-"""Scope stamped and filtered on when the config names none (``REQ-E-048``).
+"""Scope stamped on writes and filtered on by reads when the config names none.
 
-A sentinel rather than ``None`` or ``""``, and rather than dropping the predicate. Dropping it would
-make the *unconfigured* store the one that reads every tenant's documents, which is the failure that
-looks like a relevance quirk instead of a leak. ``None`` fails the other way and matches nothing,
-because no document carries it. ``""`` is falsy, so every later ``if scope:`` would read it as unset.
-
-Double-underscored on both ends so it cannot collide with a scope somebody meant: a real tenant id
-that spells this is a tenant id chosen to collide.
+A sentinel rather than ``None``, ``""`` or no scope predicate at all. Dropping the predicate would let
+an unconfigured store read every tenant's documents. ``None`` would match nothing, and ``""`` is falsy,
+so an ``if scope:`` check would treat it as unset. The double underscores keep it from colliding with a
+real scope.
 """
+
+TIER_RETRY_SECONDS: Final[float] = 60.0
+"""Delay in seconds before a search tier skipped under ``auto`` is tried again.
+
+The retry runs inside the first store call after the delay. It reads index status without waiting for a
+build, and a retry that fails keeps the tiers the store already has.
+"""
+
+TIER_RETRY_MAX_SECONDS: Final[float] = 3600.0
+"""Ceiling in seconds on that delay, which doubles after each retry that still finds the tier missing."""
 
 _NO_SEARCH_SETUP = (
     "strands_mongodb: %s is on a deployment that does not run Atlas Search, so no search index was "
@@ -83,29 +89,24 @@ _NO_SEARCH_SETUP = (
     "and cannot read them back. Point 'connection_string' at MongoDB Atlas, or at a local Atlas "
     "deployment started with 'atlas deployments setup --type local', which runs the same search process."
 )
-"""Warning ``initialize()`` degrades with (``REQ-E-053a``). Emitted once per connection, not per store.
+"""Warning ``initialize()`` logs on a deployment without Atlas Search, once per connection.
 
-Names the code and what to connect to, and deliberately names neither a command to run nor an index
-status: on this deployment the search-index commands do not exist, so ``REQ-E-061``'s remedy block
-would be an afternoon spent on advice that cannot work (``AT-053a``).
-
-The code is interpolated rather than written in, which is the later half of this message. It carried the
-literal ``31082`` until then, and three of the four deployments since measured report something else, so
-on those it named a code absent from the reader's own log.
+It names the server's error code and what to connect to, but no command or index status: the
+search-index commands do not exist on this deployment, so that advice could not work. The code is
+interpolated because different deployments report different codes.
 """
 
 _NO_SEARCH_QUERY = (
     "strands_mongodb: cannot search %s because this deployment does not run Atlas Search. Its capability "
-    "probe came back with %s, and v0.1.0 ships no tier that answers without a search process, so "
+    "probe came back with %s, and this package has no tier that answers without a search process, so "
     "there is nothing to fall back to. Writes still work, which is why "
     "initialize() only warned. Point 'connection_string' at MongoDB Atlas, or at a local Atlas "
     "deployment started with 'atlas deployments setup --type local'."
 )
-"""What ``search`` raises on the same deployment (``REQ-E-053a``, ``AT-053c``).
+"""Raised by ``search`` on a deployment without Atlas Search.
 
-The split is deliberate: a capability probe may degrade, a query path may not.
-Returning zero
-results here would be an empty memory that reads as a store with nothing in it.
+Setup only warns, because writes still work. A query raises, because returning no results would look
+like an empty memory.
 """
 
 _TIER_UNAVAILABLE = (
@@ -113,11 +114,10 @@ _TIER_UNAVAILABLE = (
     "skipped rather than fatal and any remaining tier answers queries instead. The '_search_type' key "
     "on every returned entry reports which one did. The server's own reason: %s"
 )
-"""Per-tier warning under ``auto`` (``REQ-E-053b``).
+"""Warning for each tier skipped under ``auto``.
 
-The server's message is carried whole rather than paraphrased, because the reason is the one piece of
-information that says what to fix: on an Atlas CLI local deployment it is the list of registered
-embedding models, which is empty.
+The server's message is included whole because it says what to fix. On an Atlas CLI local deployment,
+for example, it reports that the embedding model is not registered.
 """
 
 _NO_TIER_PREPARED = (
@@ -125,26 +125,25 @@ _NO_TIER_PREPARED = (
     "can be answered. The last tier's failure is chained to this one and every tier's is logged above, "
     "each with the server's own reason."
 )
-"""``REQ-E-053b``'s floor: warn per tier, then raise once nothing is left."""
+"""Raised under ``auto`` when no search tier could be prepared, after each failure was logged."""
 
 _BELOW_VECTOR = (
     "strands_mongodb: 'search_type' is 'auto' and the vector tier is not available on %s, so queries "
     "resolve to the %s tier. Answers are lexical rather than semantic, which is a difference in what "
     "matches rather than only in ranking."
 )
-"""``REQ-E-053``'s "warn when it lands below vector", at most once per store."""
+"""Warning, at most once per store, when ``auto`` resolves to a tier below vector."""
 
 _NO_FUSION = (
     "strands_mongodb: 'search_type' is 'hybrid' but %s cannot run it. The hybrid tier is a $rankFusion "
     "over the vector and text pipelines, and that stage needs MongoDB 8.0 or later. Upgrade the "
     "deployment, or set 'search_type' to 'auto' to let this store resolve to the tiers it does have."
 )
-"""Raised where an explicit ``"hybrid"`` meets a deployment too old for the stage (``REQ-E-144``).
+"""Raised when ``search_type`` is ``"hybrid"`` and the deployment cannot run ``$rankFusion``.
 
-Fatal rather than a degrade, which is the rule a named ``search_type`` already follows: there is no
-second tier to fall through to, and answering from one the caller did not ask for changes what matches
-rather than only how it ranks. The remedy names both directions because only one of them is available
-to most readers -- an operator can upgrade, and an application author can only stop asking.
+Fatal, like any named ``search_type`` that cannot be prepared: answering from another tier would change
+what matches, not only the ranking. The remedy offers both an upgrade and ``auto``, because an
+application author often cannot upgrade the deployment.
 """
 
 _BOUND_DECLINED_FUSION = (
@@ -154,10 +153,10 @@ _BOUND_DECLINED_FUSION = (
     "roughly 0 to 1. Remove the bound to get fused ranking, or set 'search_type' to 'hybrid' to keep "
     "the bound and have it applied on the fusion's scale."
 )
-"""``REQ-E-145``'s log line, at most once per store, naming which bound was set.
+"""Warning, at most once per store, when a score bound keeps ``auto`` off the hybrid tier.
 
-Which bound and its value, not just that one exists: the remedy differs by one word between the two and
-neither is guessable from an empty result set, which is what the caller would otherwise see.
+It names the bound and its value, because the remedy depends on which bound is set and an empty result
+set would not reveal it.
 """
 
 _NO_FUSION_FOR_QUERY = (
@@ -165,12 +164,10 @@ _NO_FUSION_FOR_QUERY = (
     "the hybrid tier is not available on %s. The tiers that are: %s. Drop one of the two keys to use "
     "one of them, or see the initialization log for why the fused tier was not offered."
 )
-"""Raised where both query keys are set and nothing can fuse them (``REQ-E-151``).
+"""Raised when a query sets both ``text`` and ``vector`` and the hybrid tier is not available.
 
-The config allowed the shape and the deployment then did not deliver the tier that reads it, so this is
-the second half of a check whose first half runs before any round trip. Answering from a single tier
-instead would drop one of the two keys the caller supplied and report the tier that ran, which is a
-true answer to a question nobody asked.
+The config allowed the shape, so this is only known after ``initialize()``. Answering from one tier
+would silently ignore one of the two keys.
 """
 
 _NO_TIER_FOR_QUERY = (
@@ -178,7 +175,7 @@ _NO_TIER_FOR_QUERY = (
     "The text tier needs 'text' on the query. The vector tier needs %s, because %s. Supply that key, "
     "or set 'search_type' to a tier this query fits."
 )
-"""Raised when tiers exist and none of them fits the query's shape (``REQ-E-074a``)."""
+"""Raised when tiers are prepared but none of them fits the query's shape."""
 
 _NOT_WRITABLE = (
     "strands_mongodb: the memory store %r is not writable, so it does not accept %s. Set "
@@ -186,35 +183,33 @@ _NOT_WRITABLE = (
     "built for retrieval does not start accepting model-distilled extraction writes, or deletions, "
     "that nobody asked for."
 )
-"""``REQ-E-058``, and ``REQ-E-079`` for the two deletes.
+"""Raised by ``add``, ``delete`` and ``delete_all`` on a store that is not writable.
 
-Names the key, because a message saying only "not writable" sends a caller to source, and names the
-operation, because one hardcoding ``add()`` on a ``delete()`` call sends them to the wrong line.
+It names the config key to set and the operation that was refused.
 """
 
 _BAD_MEMORY_ID = (
     "strands_mongodb: 'memory_id' is %r, which is not a 24-character hex ObjectId. Pass the '_id' a "
     "search result carries in its metadata, which is where a deletable id comes from."
 )
-"""``REQ-E-076``'s rejection, naming the argument rather than the document it failed to name.
+"""Raised by ``delete`` when ``memory_id`` is not a valid ObjectId string.
 
-The id itself is rendered, and it is the one subject :func:`_reporting` would refuse: it is the caller's
-own argument rather than stored content, and a message repeating a mistyped id back is how the caller
-sees the typo.
+The id is rendered because it is the caller's own argument, not stored content, and repeating it back
+shows the typo.
 """
 
 _LIMIT_TOO_LOW = (
     "strands_mongodb: %r is %d, and a search limit must be at least 1. A limit below 1 cannot return "
     "anything, so it is rejected here rather than sent to a server that would reject it."
 )
-"""``REQ-E-041``'s floor, applied to any resolved or supplied value and naming which one was wrong."""
+"""Raised when any supplied or configured result limit is below 1, naming the key it came from."""
 
 _BOTH_SCORE_BOUNDS = (
     "strands_mongodb: 'min_score' is %r and 'max_score' is %r, and the two are mutually exclusive: a "
     "floor and a ceiling on one similarity score describe a band, and this package applies one bound "
     "rather than a range. Keep whichever one you meant and remove the other."
 )
-"""``REQ-E-059``'s pair, rejected in ``__init__`` rather than deferred to a query (``AT-059a``)."""
+"""Raised by ``__init__`` when both ``min_score`` and ``max_score`` are set."""
 
 _RESERVED_KEY_COLLISION = (
     "strands_mongodb: metadata key(s) %s on a document in the memory store %r collide with the keys "
@@ -222,32 +217,28 @@ _RESERVED_KEY_COLLISION = (
     "and this package's own value(s) kept. Rename them in whatever wrote them; a stored '_scope' that "
     "won would make a document report a scope it was not stored in."
 )
-"""``REQ-E-057``. One record per merge, listing every colliding key, and naming the store.
+"""Warning when stored metadata uses a key this package reserves. One record per result.
 
-A dropped value with no log line is indistinguishable from a value that never existed, and one process
-holds several stores over one collection, so the store name is what locates the writer.
+It lists every colliding key and names the store, because several stores can share one collection and
+the store is what locates the writer.
 """
 
 _SCORE_BOUND_APPLIED = "strands_mongodb: %s %r on %s kept %d of %d results (applied after the query)."
-"""``REQ-E-059``'s effect, at ``DEBUG`` with both counts (``AT-059b``).
+"""``DEBUG`` record when a score bound drops results.
 
-Both counts, because a message saying only that results were filtered tells the reader something
-happened without telling them how much, and on a bound set slightly too high that is the difference
-between a tuning problem and an empty memory.
+Both counts are included, so "kept 0 of 8" reads as a bound set too high rather than an empty memory.
 """
 
 
 def _resolve_limit(*, query: int | None, options: int | None, instance: int | None) -> int:
-    """Resolve the result ceiling from the four places it can come from (``REQ-E-041``).
+    """Resolve the result limit for one search.
 
-    ``query["limit"]`` sits above ``options`` because a ``MongoDBSearchQuery`` can only arrive on a
-    direct call: ``MemoryStore.search`` is declared ``query: str`` and both SDK call sites pass one, while
-    ``MemoryManager.search`` always passes ``options`` with ``max_search_results`` already resolved.
-    Below ``options`` the key would be unreachable rather than lower priority.
+    Priority, highest first: ``query``, ``options``, ``instance``, then ``DEFAULT_MAX_SEARCH_RESULTS``.
+    ``query`` ranks above ``options`` because a ``MongoDBSearchQuery`` only arrives on a direct call, while
+    ``MemoryManager.search`` always passes ``options``. Below it, the query's ``limit`` would never apply.
 
-    Every supplied value is checked, not only the one that wins, which is ``REQ-E-041``'s wording rather
-    than an extra. A caller who passes ``limit=5`` alongside ``max_search_results=0`` wrote one of those
-    two by mistake, and resolving to 5 silently keeps the mistake in their code.
+    Every supplied value is checked, not only the winner, so ``limit=5`` with ``max_search_results=0``
+    still raises.
 
     Args:
         query: ``limit`` from a ``MongoDBSearchQuery``, if one was passed.
@@ -255,12 +246,10 @@ def _resolve_limit(*, query: int | None, options: int | None, instance: int | No
         instance: The store's own ``max_search_results``.
 
     Returns:
-        The first value that was supplied, or ``DEFAULT_MAX_SEARCH_RESULTS``.
+        The highest-priority value supplied, or ``DEFAULT_MAX_SEARCH_RESULTS``.
 
     Raises:
-        ValueError: If any supplied value is below 1, naming the key it came from. ``limit`` and
-            ``max_search_results`` are different keys in different dicts, and a message naming the wrong
-            one sends the caller to the wrong line.
+        ValueError: If any supplied value is below 1. The message names the key it came from.
     """
     for name, value in (("limit", query), ("max_search_results", options), ("max_search_results", instance)):
         if value is not None and value < 1:
@@ -276,31 +265,23 @@ def _resolve_limit(*, query: int | None, options: int | None, instance: int | No
 
 
 def _object_id(memory_id: str) -> ObjectId:
-    """Parse the id ``search`` reported back into the type the ``_id`` field holds (``REQ-E-076``).
+    """Parse a ``memory_id`` string into the ``ObjectId`` stored in ``_id``.
 
-    Strict, with no fallback to matching the raw string when the parse fails. A delete that also tried
-    ``{"_id": memory_id}`` would return ``0`` for a typo, ``0`` for an already deleted memory and ``0``
-    for a caller who passed the wrong field entirely, and one answer for three causes is the signal a
-    wiring bug needs to be found by.
+    Strict, with no fallback to matching the raw string, so a malformed id raises instead of quietly
+    deleting nothing.
 
-    The type check is not the format check written twice. Measured on pymongo 4.17.0, ``ObjectId(None)``
-    returns a freshly generated id rather than failing, so a ``None`` reaching the driver composes into a
-    well-formed predicate that matches a document which has never existed, and the call reports a
-    truthful, useless ``0``. ``ObjectId(12)`` raises ``TypeError``, which is neither the driver error
-    :func:`_reporting` wraps nor the ``ValueError`` a caller mistake should arrive as.
+    The type check is needed as well as the parse: ``ObjectId(None)`` generates a new id instead of failing
+    (pymongo 4.17.0), which would match nothing and return ``0``, and ``ObjectId(12)`` raises ``TypeError``.
 
     Args:
-        memory_id: The ``_id`` string a ``search`` result carries in its metadata. Annotated ``str``
-            because that is what the read path emits, and checked anyway because an annotation is not
-            enforcement.
+        memory_id: The ``_id`` string a ``search`` result carries in its metadata.
 
     Returns:
         The parsed id.
 
     Raises:
-        ValueError: If it is not a string, or not a 24-character hex ObjectId. ``InvalidId`` is a
-            ``BSONError`` and not a ``ValueError``, so allowing it through would hand a caller mistake to
-            them in the driver's exception hierarchy.
+        ValueError: If it is not a string, or not a 24-character hex ObjectId. ``InvalidId`` is converted
+            because it is not a ``ValueError``.
     """
     if not isinstance(memory_id, str):
         raise ValueError(_BAD_MEMORY_ID % (memory_id,))
@@ -317,24 +298,16 @@ def _merge_metadata(
     store_name: str,
     namespace: str | None = None,
 ) -> dict[str, Any]:
-    """Merge caller metadata under this package's reserved keys (``REQ-E-040``, ``REQ-E-057``).
+    """Merge a document's stored metadata with this package's reserved keys, the reserved keys winning.
 
-    A function rather than an inline ``{**stored, **reserved}`` so the unit tier can assert the merge
-    without a deployment, which is the whole of ``AT-057``. The collision it defends against is not
-    hypothetical for one key in particular: a stored ``_scope`` that won would make a document report a
-    scope it was not stored in, and that reads as a leak rather than as a metadata quirk, which is the
-    failure this function exists to prevent.
-
-    One log record per merge, listing every colliding key. A record per key would turn a document with
-    four bad keys into four lines saying the same thing.
+    A stored ``_scope`` that won would make a document report a scope it was not stored in. Collisions
+    are logged in one record that lists every colliding key.
 
     Args:
         caller: ``metadata`` as the document carries it, or ``None`` when it carries none.
-        reserved: This package's four keys and their values for this result.
-        store_name: Named in the log record, because one process holds several stores over one
-            collection and the store is what locates whatever wrote the document.
-        namespace: The store's ``database.collection``, carried as a structured field like every other
-            event this module logs.
+        reserved: This package's reserved keys and their values for this result.
+        store_name: The store named in the log record.
+        namespace: The store's ``database.collection``, attached to the log record.
 
     Returns:
         A new dict. Neither argument is modified.
@@ -355,17 +328,14 @@ def _merge_metadata(
 def _reporting(
     verb: str,
 ) -> Callable[[Callable[_P, Coroutine[Any, Any, _R]]], Callable[_P, Coroutine[Any, Any, _R]]]:
-    """Turn any driver error out of the wrapped method into ``StorageError`` (``REQ-E-036``).
+    """Turn any driver error raised by the wrapped method into ``StorageError``.
 
-    ``MongoDBStorage``'s decorator of this name with one deliberate difference: it renders the key it was
-    operating on, and this one renders nothing but the namespace. A memory store's subject *is* the
-    memory, so a message naming it would put user content into an error string, a log line and every
-    traceback that reaches a ticket. The namespace is enough to locate the store, and ``REQ-E-014``'s
-    reasoning about connection strings applies with more force to what a user told an agent.
+    Unlike ``MongoDBStorage``'s decorator of the same name, the message names only the namespace. The
+    subject of a memory operation is user content, which must never reach an error, a log line or a
+    traceback.
 
-    ``Coroutine`` rather than ``Awaitable``, for the same reason as in ``storage.py``: the protocol
-    declares these with ``async def``, and widening them would leave the class satisfying ``MemoryStore``
-    at runtime and failing it under mypy.
+    The type is ``Coroutine`` rather than ``Awaitable`` because the protocol declares these methods
+    ``async def``, and a wider type would fail the ``MemoryStore`` check under mypy.
 
     Args:
         verb: What the method was doing, as a present participle.
@@ -380,8 +350,7 @@ def _reporting(
             try:
                 return await method(*args, **kwargs)
             except PyMongoError as error:
-                # Bound through a local rather than indexed off `args` directly, which mypy rejects for
-                # a `ParamSpec`.
+                # Through a local, because mypy rejects indexing a `ParamSpec`'s `args` directly.
                 positional: tuple[Any, ...] = args
                 store: MongoDBMemoryStore = positional[0]
                 raise StorageError(f"strands_mongodb: {verb} {store._target} failed: {error}") from error
@@ -392,75 +361,73 @@ def _reporting(
 
 
 class MongoDBMemoryStore:
-    """Atlas Vector Search implementation of ``strands.memory.MemoryStore``.
+    """Strands ``MemoryStore`` backed by MongoDB Atlas Vector Search and Atlas Search.
 
-    Satisfies the Protocol structurally and does not inherit it, unlike ``FileMemoryStore`` and
-    ``BedrockKnowledgeBaseStore``, which both do. Inheriting a ``Protocol`` makes every member the
-    subclass leaves out abstract, and mypy then refuses to instantiate the subclass at all: checking
-    ``FileMemoryStore(name="x")`` reports *Cannot instantiate abstract class "FileMemoryStore" with
-    abstract attributes "add_messages", "get_tools" and "initialize"*. Following the convention here
-    would hand every type-checked consumer an error on the constructor call with no way to fix it.
+    Stores memories as text documents and answers queries from a vector, text or hybrid search tier,
+    chosen by ``search_type`` and by what the deployment supports. Register it with the SDK's
+    ``MemoryManager``. Beyond the protocol it offers ``delete``, ``delete_all`` and ``close``.
 
-    ``add_messages`` is absent, and must stay absent rather than become a stub that raises:
-    ``AddMessagesContext`` carries no run-unique identifier, so no dedup token that survives a retry
-    can be built from it, while extraction writes are at-least-once. The manager feature-detects it
-    with ``_has_method`` and falls back to its own ``ModelExtractor`` feeding ``add``, which dedupes.
+    Every read, write and delete is limited to this store's ``scope`` and ``name``. The package stamps the
+    scope on each document and adds it to every query; it is never taken from caller input. A store with
+    no ``scope`` uses :data:`UNSCOPED`, so it still filters rather than reading every scope. MongoDB has
+    no server-side row filter, so this isolation is enforced by the package.
+
+    A store accepts writes only when ``writable`` is ``True``.
 
     Example:
         ```python
         connection: MongoDBConfig = {"database": "agents", "connection_string": "mongodb+srv://..."}
         store = MongoDBMemoryStore(name="preferences", config=connection, scope="user-abc")
         ```
-
-    Every read is scoped by this package rather than by the caller (``REQ-E-046``), and an unconfigured
-    scope resolves to :data:`UNSCOPED` rather than to no predicate at all. Isolation here is
-    application-enforced: MongoDB applies no server-side row filter, so a document lands in the right
-    scope only because ``add`` put it there and comes back only because ``search`` asked for it.
     """
 
-    def __init__(self, **config: Unpack[MongoDBMemoryStoreConfig]) -> None:
-        """Resolve the shared connection and record this store's identity, placement and bounds.
+    # Satisfies `MemoryStore` structurally instead of inheriting it: inheriting a `Protocol` makes every
+    # member this class leaves out abstract, and mypy then refuses to instantiate it.
+    #
+    # `add_messages` is deliberately absent, not a stub. `AddMessagesContext` has no run-unique id to
+    # deduplicate retried writes by, so the manager falls back to its own extractor, which writes through
+    # `add` and is deduplicated there.
 
-        Every check runs before ``_client.resolve``, so a config that fails validation leaves no
-        registered connection pool behind that nothing owns and no ``close()`` can reach.
+    def __init__(self, **config: Unpack[MongoDBMemoryStoreConfig]) -> None:
+        """Validate the configuration and register the shared connection.
+
+        Every check runs before the connection is registered, so a config that fails leaves no
+        connection pool behind.
 
         Args:
-            **config: See ``MongoDBMemoryStoreConfig``. The connection half is nested under
-                ``config``, following ``BedrockKnowledgeBaseStore``, so one ``MongoDBConfig`` can be
-                shared with a ``MongoDBStorage`` and with every other store in the process.
+            **config: See ``MongoDBMemoryStoreConfig``. The connection settings are nested under
+                ``config`` so one ``MongoDBConfig`` can be shared with ``MongoDBStorage`` and with every
+                other store in the process.
 
         Raises:
-            KeyError: If ``name`` or the nested ``config`` is absent, or if that config names no
-                ``database``. All three are ``Required`` keys, so mypy rejects a literal that omits
-                one.
-            ValueError: If the nested config supplies neither ``client`` nor ``connection_string``
-                (``REQ-E-015``); if ``max_search_results`` is below 1 (``REQ-E-041``); if both
-                ``min_score`` and ``max_score`` are set (``REQ-E-059``); if the configured ``filter``
-                names an operator key or an undeclared path (``REQ-E-049``, ``REQ-E-050``); or if the
-                vector configuration selects two paths at once (``REQ-E-067``). Notably **not** for a
-                ``ttl_seconds`` of ``0``, which is a request rather than a mistake (``REQ-E-148``).
+            KeyError: If ``name``, the nested ``config``, or that config's ``database`` is missing.
+            ValueError: If the nested config supplies neither ``client`` nor ``connection_string``; if
+                ``max_search_results`` is below 1; if both ``min_score`` and ``max_score`` are set; if the
+                configured ``filter`` names an operator key, a regex value or an undeclared path; if the
+                vector configuration selects two paths at once, sets only one of ``embedding_dimensions``
+                and ``similarity``, or gives either a value Atlas rejects; or if ``ttl_seconds`` is
+                negative. A ``ttl_seconds`` of ``0`` is accepted. Also raised by the driver for a
+                connection option it rejects, such as an out-of-range port.
+            pymongo.errors.ConfigurationError: If the driver cannot parse ``connection_string`` or
+                rejects a ``client_args`` key.
         """
         connection = config["config"]
         self.name = config["name"]
         self.description: str | None = config.get("description")
         self.max_search_results: int | None = config.get("max_search_results")
-        # `False` by default, unlike `FileMemoryStore`. `writable` is what gates automatic extraction, so
-        # the cost of the wrong default is a retrieval store that starts accepting model-distilled writes
-        # (`REQ-E-058`).
+        # `False` by default, unlike `FileMemoryStore`, because `writable` also gates automatic extraction.
         self.writable: bool = config.get("writable", False)
         self.extraction: ExtractionConfig | bool | None = config.get("extraction")
         self.scope: str = config.get("scope") or UNSCOPED
         self.filter: dict[str, Any] | None = config.get("filter")
         self.min_score: float | None = config.get("min_score")
         self.max_score: float | None = config.get("max_score")
-        # `.get` with no default, so absence stays `None` and is never confused with `0`. `0` is a
-        # request to expire at the next sweep and `None` is a request never to expire; they are the same
-        # falsy value in Python and opposite instructions to MongoDB, so every test of this attribute
-        # downstream is `is not None` rather than a truth test (`REQ-E-148`).
+        # `None` means never expire and `0` means expire at the next sweep, so every test of this is
+        # `is not None`, never a truth test.
         self.ttl_seconds: int | None = config.get("ttl_seconds")
+        _indexes.check_ttl(self.ttl_seconds)
 
-        # Rejected here rather than on the first query. A store whose ceiling is zero can never answer
-        # anything, and `BedrockKnowledgeBaseStore` raises in the same place for the same value.
+        # Checked here, as `BedrockKnowledgeBaseStore` does, because a limit below 1 can never return anything.
         _resolve_limit(query=None, options=None, instance=self.max_search_results)
         if self.min_score is not None and self.max_score is not None:
             raise ValueError(_BOTH_SCORE_BOUNDS % (self.min_score, self.max_score))
@@ -468,118 +435,109 @@ class MongoDBMemoryStore:
         self._database_name = connection["database"]
         self._collection_name = config.get("collection", DEFAULT_COLLECTION)
         self._ensure_indexes: bool = connection.get("ensure_indexes", True)
-        # Read once, at construction, and passed to every `_indexes.ensure` call this class makes
-        # (`REQ-E-122`). Only the search call waits on anything; the ordinary one is given the same
-        # value so the keyword has one meaning rather than two.
+        # Passed to every `_indexes.ensure` call. Only search index builds actually wait on it.
         self._index_ready_timeout: float = connection.get("index_ready_timeout", _indexes.READY_TIMEOUT_SECONDS)
         self._search_type: SearchType = connection.get("search_type") or "auto"
-        # The index definition is the single authority for what is filterable, so both the
-        # configured filter and every per-query one are checked against the same list.
+        # The index definition decides what is filterable, so the configured filter and every per-query
+        # filter are checked against the same list.
         self._declared_fields = _indexes.declared_filter_fields(connection.get("filter_fields") or ())
         if self.filter:
             _filter.validate(self.filter, declared_fields=self._declared_fields)
 
-        # Resolved once, in the constructor, because both raise `ValueError` on a contradictory config and
-        # a constructor is where a caller can still fix the dict. Deferring them to `initialize()` would
-        # surface a config mistake from inside whichever `add` or `search` happened to run first.
+        # Resolved here because both raise `ValueError` on a contradictory config, which should surface at
+        # construction rather than inside the first `add` or `search`.
         self._mode: VectorMode = _indexes.vector_mode(connection)
         vector_spec, text_spec = _indexes.memory_search_specs(connection)
         specs: tuple[tuple[ResolvedSearchType, SearchIndexSpec], ...] = (
             ("vector", vector_spec),
             ("text", text_spec),
         )
-        # Vector first, which is the preference order `auto` resolves down from. A named `search_type`
-        # narrows the list to one, so a store asking for `text` never creates a vector index it will not
-        # query, and one asking for `vector` fails rather than quietly answering lexically.
-        #
-        # `hybrid` is the exception, and it is the whole of `REQ-E-144` in one line: it names a tier
-        # built out of both of these, so the narrowing that serves the other named types would leave
-        # this store with no search index at all.
+        # Vector first, the order `auto` falls back through. A named `search_type` keeps only its own tier,
+        # so a `text` store never builds a vector index and a `vector` store fails rather than answering
+        # lexically. `hybrid` keeps both, because it is built from them.
         self._specs = (
             specs
             if self._search_type in ("auto", "hybrid")
             else tuple(pair for pair in specs if pair[0] == self._search_type)
         )
         self._index_names = {tier: spec.name for tier, spec in self._specs}
-        # Whether a query setting both 'text' and 'vector' could mean anything on this store, decided
-        # from the config alone so the check stays ahead of the first round trip (`REQ-E-151`). Only the
-        # manual-vector path: on the AutoEmbeddings path the fused tier reads `text` in both of its input
-        # pipelines, so a `vector` alongside it is as meaningless as it ever was.
+        # Whether a query may set both `text` and `vector`, decided from the config alone so the check runs
+        # before any round trip. Only on the manual-vector path: with AutoEmbeddings both hybrid pipelines
+        # read `text`, so `vector` has no meaning there.
         self._fusion_possible = not self._mode.auto_embed and self._search_type in ("auto", "hybrid")
 
         self._config = config
         self._connection_config = connection
         self._initialized = False
-        # Resolved by `initialize()`, in preference order, holding only the tiers that can actually
-        # answer. Empty means no tier could be prepared, which `search` reports and `add` does not care
-        # about.
+        # Set by `initialize()`: the tiers that can answer, in preference order. Empty after `initialize()`
+        # means the deployment has no Atlas Search, which fails `search` but not `add`.
         self._tiers: tuple[ResolvedSearchType, ...] = ()
         self._warned_below_vector = False
-        # Resolved and discarded, exactly as in `MongoDBStorage.__init__`: the connection an operation
-        # uses comes from the `_connection` property, per running event loop (`REQ-E-017b`). This call is
-        # here so a config supplying neither `client` nor `connection_string` raises at construction
-        # (`REQ-E-015`) instead of at the first `add`.
+        # When to retry a skipped tier, or `None` when none is skipped.
+        self._tier_retry_at: float | None = None
+        self._tier_retry_delay: float = TIER_RETRY_SECONDS
+        # From the first capability probe. Retries reuse it because they may run on another event loop's
+        # connection, where the probe has not run.
+        self._rank_fusion = False
+        # Called only to validate, so a config with neither `client` nor `connection_string` raises here.
+        # Operations get their connection from `_connection`, per running event loop.
         _client.resolve(connection)
 
     async def initialize(self) -> None:
-        """Probe the deployment and create this store's indexes, once (``REQ-E-052``, ``REQ-E-065``).
+        """Probe the deployment and create this store's indexes.
 
-        Idempotent and safe to call concurrently. ``search`` and ``add`` both call it rather than
-        requiring the caller to, because ``MemoryManager`` does not call it and a store that only works
-        after an undocumented setup step is a store that mostly does not work (``AT-045b``).
+        ``add``, ``search``, ``delete`` and ``delete_all`` call this themselves, so callers need not
+        (``MemoryManager`` never does). It is idempotent and safe to call concurrently. After the first
+        call it returns at once, unless a search tier skipped under ``auto`` is due for a retry.
 
-        The fast path is the unlocked ``_initialized`` check, which is what keeps this cheap enough to
-        call on every operation. The lock is taken only on the first call, and the flag is re-read inside
-        it, so N stores racing on one connection do the work once rather than N times.
+        Under ``auto`` a tier that cannot be prepared (an index still building, say) is skipped with a
+        warning. A later call retries it after :data:`TIER_RETRY_SECONDS`, and the delay doubles up to
+        :data:`TIER_RETRY_MAX_SECONDS` while the tier stays missing. A retry never waits for a build, and
+        a retry that fails keeps the tiers the store already has.
 
-        The capability probe is cached on the *connection*, not on the store: Atlas Search is a property
-        of the deployment, so ten stores on one database probe once between them (``AT-065b``). The
-        warning lives inside that branch for the same reason. A deployment with no search is worth one
-        line in the log, not ten.
-
-        A deployment that cannot search is a warning here and an error at query time (``REQ-E-066``).
-        Writes work on it, so failing construction or setup would take away the half that functions.
+        On a deployment without Atlas Search this logs a warning, once per connection, and ``search``
+        raises later. Writes still work there.
 
         Raises:
             StorageError: If a driver call fails, if the collection was created with a collation that
-                does not compare strings byte by byte (``REQ-E-170``), or if ``search_type`` names a tier
-                the deployment cannot prepare. Under ``auto`` a tier that cannot be prepared is skipped
-                instead, and only an empty result raises.
+                does not compare strings byte by byte, if an existing index conflicts with one this store
+                declares, if an index is missing and ``ensure_indexes`` is ``False``, or if ``search_type``
+                names a tier the deployment cannot prepare. Under ``auto`` a search tier that cannot be
+                prepared is skipped instead, and only an empty result raises.
         """
-        if self._initialized:
+        if self._initialized and not self._tier_retry_due():
             return
         await self._initialize()
+
+    def _tier_retry_due(self) -> bool:
+        """Whether a tier skipped under ``auto`` is due to be tried again."""
+        return self._tier_retry_at is not None and time.monotonic() >= self._tier_retry_at
 
     @_telemetry.traced("memory", "initialize")
     @_reporting("initializing")
     async def _initialize(self) -> None:
-        """The locked half of :meth:`initialize`, and the only half that records a span.
+        """Do the work of :meth:`initialize` under the connection's lock, recording a span.
 
-        Split from the fast path so a span costs nothing on the calls that do nothing: ``search`` and
-        ``add`` come through here on every request, and every one after the first returns above. A caller
-        that waited on the lock and found the work done records a short span, which is accurate. It spent
-        that time waiting.
+        Split from the unlocked fast path so calls that find the work done record no span. The flag is
+        re-read under the lock, so concurrent calls on one store do the work once. The capability probe is
+        cached on the connection, because search support belongs to the deployment, so stores sharing a
+        connection probe once.
         """
         _telemetry.annotate("strands_mongodb.search.requested", self._search_type)
-        # Bound once, not re-read through the property at each step. `_connection` resolves per running
-        # event loop and this whole block runs on one, so the three reads would return the same object
-        # anyway; binding says so, and keeps the lock, the probe and the cache write on one connection
-        # even if that ever stops being true.
+        # Bound once, so the lock, the probe and the cache write all use the same connection.
         connection = self._connection
         async with connection.get_lock():
             if self._initialized:
+                if self._tier_retry_due():
+                    await self._retry_search_tiers()
                 return
 
             collection = self._collection()
 
-            # Before any index is created, because provisioning a collection that cannot hold this
-            # store's scopes apart is pointless (``REQ-E-170``). `MongoDBStorage` reaches the same check
-            # through a helper; here it is inline and unguarded by any extra lock, because this block
-            # already holds the connection's. What is at stake on this surface is not `_id` but `scope`:
-            # `_filter.compose` pins `{"scope": self.scope, "store_name": self.name}` on every read,
-            # update and delete, so a collation that folds case makes `scope="tenant-b"` match documents
-            # written under `Tenant-B` -- a cross-scope read, arriving through the
-            # collection's own comparison rules rather than through a caller-supplied filter.
+            # Checked before any index is created. `_filter.compose` pins `scope` and `store_name` on every
+            # read, update and delete, so a case-folding collation would let `scope="tenant-b"` match
+            # documents written under `Tenant-B`: a cross-scope read. No extra lock is needed, because this
+            # block already holds the connection's.
             target = (self._database_name, self._collection_name)
             verified = target in connection.binary_keys
             if not verified:
@@ -589,13 +547,10 @@ class MongoDBMemoryStore:
 
             capabilities = connection.capabilities
             if capabilities is None:
-                # Through the module rather than through a direct import, so this stays one observable
-                # call per connection that `AT-065b`'s counting spy can see.
+                # Called through the module, not a direct import, so tests can count one probe per connection.
                 support = await _indexes.search_support(collection)
-                # Only where search exists. `REQ-E-144` makes hybrid need both search tiers, so on a
-                # deployment without mongot the version cannot change any outcome and the call is a
-                # round trip per connection for a value nothing reads. Not a hypothetical deployment:
-                # the CI contract tier is `mongo:8`, which reports 8.3.8 and has no search at all.
+                # Only where search exists: hybrid needs both search tiers, so without mongot the version
+                # changes nothing. A plain `mongo:8` server, for example, has no search at all.
                 fusion = await _indexes.rank_fusion_support(collection) if support.available else False
                 capabilities = _client.Capabilities(
                     search=support.available, no_search_code=support.code, rank_fusion=fusion
@@ -609,8 +564,8 @@ class MongoDBMemoryStore:
                         extra=_telemetry.event_extra("no_search_setup", namespace=self._target),
                     )
 
-            # Ordinary indexes first, and unconditionally. The uniqueness index behind `add`'s
-            # deduplication is one of them, and it is needed whether or not this deployment can search.
+            # Ordinary indexes always, search or not: they include the unique index behind `add`'s
+            # deduplication.
             await _indexes.ensure(
                 collection,
                 ordinary=_indexes.memory_specs(),
@@ -618,60 +573,76 @@ class MongoDBMemoryStore:
                 timeout=self._index_ready_timeout,
             )
 
+            self._rank_fusion = capabilities.rank_fusion
             self._tiers = (
-                await self._ensure_search_tiers(collection, rank_fusion=capabilities.rank_fusion)
+                await self._ensure_search_tiers(
+                    collection, rank_fusion=capabilities.rank_fusion, timeout=self._index_ready_timeout
+                )
                 if capabilities.search
                 else ()
             )
+            if self._missing_a_tier(self._tiers):
+                self._tier_retry_at = time.monotonic() + self._tier_retry_delay
 
-            # The second half of the preflight, and only when the first half had nothing to read
-            # (``REQ-E-186``). An absent collection cannot be verified and must not be cached as though
-            # it had been, but unlike `MongoDBStorage` this surface checks once and has no later
-            # operation to re-check from: `initialize()` returns early ever after. Ensuring the indexes
-            # above created the collection, so there is something to read now, and reading it here closes
-            # the window rather than leaving it open for the life of the store. A collation that appears
-            # in between is somebody else's and it fails this call, which is the right moment to fail:
-            # before `add` has written a single memory under it.
+            # The collation check above cannot verify a collection that does not exist yet. Creating the
+            # indexes created it, so check again now: this block never runs again for this store, and this
+            # still fails before `add` has written anything.
             if not verified and await _indexes.require_binary_comparison(collection):
                 connection.binary_keys.add(target)
 
-            # Comma-separated, and empty on a deployment with no search. The tiers that came up, which on an
-            # `auto` store is how a dashboard tells a degraded store from a healthy one.
+            # The tiers that came up, comma-separated and empty without search, so a dashboard can tell a
+            # degraded `auto` store from a healthy one.
             _telemetry.annotate("strands_mongodb.search.tiers", ",".join(self._tiers))
             self._initialized = True
 
+    async def _retry_search_tiers(self) -> None:
+        """Try the tiers ``initialize()`` skipped again, reading build status without waiting.
+
+        A retry that fails, or still finds a tier missing, keeps the tiers the store has and doubles the
+        delay before the next one, up to :data:`TIER_RETRY_MAX_SECONDS`.
+        """
+        try:
+            tiers = await self._ensure_search_tiers(self._collection(), rank_fusion=self._rank_fusion, timeout=0)
+        except StorageError:
+            tiers = None
+        if tiers is not None:
+            self._tiers = tiers
+        if tiers is None or self._missing_a_tier(tiers):
+            self._tier_retry_delay = min(self._tier_retry_delay * 2, TIER_RETRY_MAX_SECONDS)
+            self._tier_retry_at = time.monotonic() + self._tier_retry_delay
+        else:
+            self._tier_retry_at = None
+        _telemetry.annotate("strands_mongodb.search.tiers", ",".join(self._tiers))
+
+    def _missing_a_tier(self, tiers: tuple[ResolvedSearchType, ...]) -> bool:
+        """Whether ``auto`` skipped a configured tier, which is the only case a retry is for."""
+        return self._search_type == "auto" and any(tier not in tiers for tier, _ in self._specs)
+
     async def _ensure_search_tiers(
-        self, collection: AsyncCollection[dict[str, Any]], *, rank_fusion: bool = False
+        self, collection: AsyncCollection[dict[str, Any]], *, rank_fusion: bool = False, timeout: float
     ) -> tuple[ResolvedSearchType, ...]:
-        """Create each configured search index and return the tiers that came up (``REQ-E-067``).
+        """Create each configured search index and return the tiers that came up.
 
-        One ``ensure`` call per tier, deliberately, rather than one call carrying both specs. The vector
-        index is created first, and on a deployment with no registered embedding model its failure is
-        code 8 (measured on Atlas CLI local: *voyage-4-lite not registered yet*). In a single
-        combined call that failure would stop the text index from ever being created, so a store that
-        could have answered lexically would answer nothing.
+        One ``ensure`` call per tier, so a failing vector index does not stop the text index from being
+        created. On a deployment with no registered embedding model (such as an Atlas CLI local one) the
+        vector index fails with code 8, and the store can still answer lexically.
 
-        Under ``auto`` a tier that cannot be prepared is logged and skipped, and the server's own reason
-        travels into the message: it is the only part of the log line that says *why*, and it is the part
-        a reader can act on. Under a named ``search_type`` the same failure is fatal, because there is no
-        second tier to fall through to and answering from one the caller did not ask for would change
-        what matches rather than only how it ranks.
-
-        Args:
-            collection: This store's collection, already resolved.
+        Under ``auto`` a tier that fails is logged with the server's reason and skipped. Under a named
+        ``search_type`` the failure is raised, because answering from another tier would change what
+        matches.
 
         Args:
             collection: The collection to build indexes on.
-            rank_fusion: Whether the deployment can run ``$rankFusion``. Passed in rather than read off
-                the connection here, because this method's job is to decide from what it is given and
-                the probe belongs to ``initialize()``.
+            rank_fusion: Whether the deployment can run ``$rankFusion``.
+            timeout: Seconds to wait for a build. ``0`` on a retry, which reads status and never waits.
 
         Returns:
             The tiers that can answer, in preference order. Hybrid first where it is on offer, then
             vector, then text.
 
         Raises:
-            StorageError: If no tier could be prepared, or if a named ``search_type``'s own tier failed.
+            StorageError: If no tier could be prepared, if a named ``search_type``'s own tier failed, or if
+                ``search_type`` is ``"hybrid"`` and the deployment cannot run it.
         """
         available: list[ResolvedSearchType] = []
         refused: StorageError | None = None
@@ -681,7 +652,7 @@ class MongoDBMemoryStore:
                     collection,
                     search=(spec,),
                     create=self._ensure_indexes,
-                    timeout=self._index_ready_timeout,
+                    timeout=timeout,
                 )
             except StorageError as error:
                 if self._search_type != "auto":
@@ -698,28 +669,19 @@ class MongoDBMemoryStore:
             available.append(tier)
 
         if not available:
-            # Chained to the last tier's failure, not left to the log alone (`REQ-E-160`). The warnings
-            # above carry every reason, but only for a caller who configured logging at `WARNING`; the
-            # exception reaches everyone. The last tier rather than the first because it is the one the
-            # store fell all the way down to, and on a deployment where the whole search process is
-            # unreachable every reason is the same one anyway.
+            # Chained to the last failure so the reason reaches callers who do not log at `WARNING`.
             raise StorageError(_NO_TIER_PREPARED % self._target) from refused
 
         if self._hybrid_is_available(available, rank_fusion=rank_fusion):
-            # Instead of the other two under an explicit request, ahead of them under `auto`. The list
-            # is a fallback order for query *shapes*, so a manual-vector store on `auto` answering a
-            # text-only query needs the text tier still to be in it. A store that asked for `hybrid` by
-            # name has nothing to fall through to, by the same rule every other named `search_type`
-            # follows: falling back would answer lexically under a tier name that promises both.
+            # Under `auto`, hybrid goes ahead of the other two, which stay as fallbacks for queries that set
+            # only one key. A store that asked for `hybrid` gets only that tier, like any named type.
             if self._search_type == "hybrid":
                 return ("hybrid",)
             available.insert(0, "hybrid")
         elif self._search_type == "hybrid":
             raise StorageError(_NO_FUSION % self._target)
 
-        # Gated on `auto` as well as on the order, because the message says `auto` and a store configured
-        # `search_type='text'` has exactly one tier by its own request. Warning there would describe the
-        # caller's own configuration back to them as a degradation.
+        # Only under `auto`: a store configured for `text` asked for exactly this.
         if self._search_type == "auto" and available[0] not in ("hybrid", "vector") and not self._warned_below_vector:
             self._warned_below_vector = True
             logger.warning(
@@ -731,22 +693,15 @@ class MongoDBMemoryStore:
         return tuple(available)
 
     def _hybrid_is_available(self, available: list[ResolvedSearchType], *, rank_fusion: bool) -> bool:
-        """Decide whether the fused tier is on offer, and say so when a bound declined it.
+        """Decide whether the hybrid tier is on offer, and log when a score bound declined it.
 
-        Three conditions, and the third is the irregular one. The deployment must have the stage, both
-        single tiers must have come up (``REQ-E-144``), and no score bound may be configured
-        (``REQ-E-145``) — a tier resolution reading a key that has nothing to do with tiers.
+        Hybrid needs ``$rankFusion``, both single tiers, and, under ``auto``, no score bound. The bound
+        rule exists because a bound applies to whatever score the tier reports. Cosine scores land in
+        roughly 0 to 1, while fused scores sum ``weight / (rank + 60)`` terms and top out near 0.033, so a
+        ``min_score=0.7`` meant for the vector tier would silently empty every hybrid result. ``auto``
+        keeps the vector tier instead and logs why.
 
-        That third condition exists because the failure it prevents has no error in it. ``min_score`` and
-        ``max_score`` are applied to whatever score the tier that ran reports. Cosine scores land in
-        roughly 0 to 1; fused scores are a sum of ``weight / (rank + 60)`` terms and top out near 0.033.
-        A caller who set ``min_score=0.7`` for the vector tier, never touched ``search_type``, and
-        upgraded would get an empty list — no error, no warning, and identical to an empty collection.
-        So the better tier is the one declined, which is the inversion that makes a degradation safe, and
-        the reason is logged because it is not recoverable from the result.
-
-        Silent where fusion was never on offer at all: nothing was declined, and a warning naming a tier
-        the deployment cannot run would be advice its reader cannot take.
+        Nothing is logged when the deployment could not run hybrid anyway.
 
         Args:
             available: The tiers that came up, in preference order.
@@ -761,9 +716,7 @@ class MongoDBMemoryStore:
         bound = "min_score" if self.min_score is not None else "max_score" if self.max_score is not None else None
         if bound is None:
             return True
-        # Not for an explicit `search_type="hybrid"`: that is the caller's own request, applied to the
-        # fused score with the scale documented (`REQ-E-146`), and warning about it would describe their
-        # configuration back to them.
+        # An explicit `hybrid` applies the bound on the fused scale, as documented, so it needs no warning.
         if self._search_type == "hybrid":
             return True
         logger.warning(
@@ -778,73 +731,54 @@ class MongoDBMemoryStore:
     @_telemetry.traced("memory", "add")
     @_reporting("adding a memory to")
     async def add(self, content: str, metadata: Metadata | None = None) -> MongoDBAddResult:
-        """Store one memory, at most once per scope (``REQ-E-042``, ``REQ-E-043``).
+        """Store one memory in this store's scope, at most once.
 
-        Deduplicated on ``(scope, store_name, content_hash)`` by the unique partial index
-        ``strands_scope_store_content_hash_unique``, because extraction writes are at-least-once: the
-        SDK re-runs an extraction whose write failed, so the same fact arrives repeatedly by design and
-        an ordinary insert would grow the collection once per retry. The growth reads as the agent
-        remembering the same thing twice.
+        Writes are deduplicated on scope, store name and a SHA-256 hash of ``content`` alone, so storing
+        the same text again keeps one document. The SDK retries failed extraction writes, so the same
+        fact can arrive more than once. A duplicate keeps its original ``created_at`` and expiry. With
+        ``ttl_seconds`` set, a new document expires that many seconds after its ``created_at``.
 
-        The hash covers content and nothing else. Including ``created_at`` would make every regenerated
-        entry a fresh document, which is the same defect wearing a hash.
-
-        ``scope``, ``store_name`` and ``content_hash`` are named in the upsert *filter only*, and that is
-        the whole trick rather than a shortcut: the server copies a filter's equality fields onto the
-        document it inserts, so the stored shape comes out identical while no field is named in both halves
-        of the call, which is where a conflicting-update error would come from.
-
-        Caller metadata is nested under ``metadata`` rather than merged into the document root. A merge
-        would make ``{"scope": "tenant-b"}`` a one-line cross-scope write, and the
-        nested copy stays readable, so a legitimate key that merely shares a name with ours is not
-        silently dropped.
+        ``metadata`` is stored nested under the document's ``metadata`` field and returned by ``search``.
+        It cannot set ``scope`` or any other top-level field.
 
         Args:
-            content: The memory to store. Stored verbatim, and never rendered into an error or a log
-                line by this module.
-            metadata: Arbitrary caller metadata, stored nested and returned by ``search``.
+            content: The memory to store. Stored verbatim, and never included in an error or a log line.
+            metadata: Optional caller metadata.
 
         Returns:
-            The resolved document ids and the insert/duplicate split. A duplicate reports the existing
-            document's id, so a caller cannot distinguish a lost race from their own second write, and
-            ``duplicates`` is reported rather than hidden so a fact count below a write count has a
-            signal to read.
+            The document id and the insert/duplicate counts. A duplicate reports the existing document's id
+            with ``inserted=0`` and ``duplicates=1``.
 
         Raises:
-            ValueError: If this store is not writable (``REQ-E-058``). Raised before any network call,
-                and left as ``ValueError`` rather than wrapped, because it is a configuration mistake
-                rather than a storage failure.
-            StorageError: If a driver call fails.
+            ValueError: If this store is not writable. Raised before any network call.
+            StorageError: If :meth:`initialize` fails, or if a driver call fails.
         """
-        # First, and before `initialize()`. A read-only store must reject a write without having created
-        # an index or opened a connection to do it.
+        # Before `initialize()`, so a read-only store rejects a write without connecting or creating an index.
         if not self.writable:
             raise ValueError(_NOT_WRITABLE % (self.name, "add()"))
 
         await self.initialize()
 
+        # These fields appear only in the upsert filter. The server copies a filter's equality fields onto
+        # the inserted document, and naming them in the update as well would be a conflicting update. They
+        # are also the key of the unique index `strands_scope_store_content_hash_unique`.
         selector: dict[str, Any] = {
             "scope": self.scope,
             "store_name": self.name,
             "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         }
-        # `$setOnInsert`, not `$set`: a duplicate must leave the first-seen timestamp alone, or
-        # `strands_scope_store_created_at` sorts by "last extraction attempt" rather than by recency.
+        # `$setOnInsert`, not `$set`: a duplicate keeps its first-seen timestamp, so
+        # `strands_scope_store_created_at` sorts by recency rather than by last extraction attempt.
         created_at = datetime.datetime.now(datetime.timezone.utc)
         insert: dict[str, Any] = {
             _indexes.CONTENT_FIELD: content,
             "created_at": created_at,
         }
+        # Nested, never merged into the root, so a caller's `{"scope": ...}` cannot write into another scope.
         if metadata:
             insert["metadata"] = dict(metadata)
-        # Derived from the `created_at` above rather than from a second clock read, so the document's
-        # two timestamps are exactly `ttl_seconds` apart and a reader can verify the expiry against the
-        # document instead of against the wall clock at the moment it was written (`REQ-E-147`).
-        #
-        # Inside `$setOnInsert` for the same reason `created_at` is: a re-extracted fact is the fact
-        # this store already holds, and refreshing its expiry would turn a TTL into a last-seen window.
-        # Nobody asked for that, and `REQ-E-042`'s deduplication is the statement that the second write
-        # is not a new memory.
+        # Derived from `created_at`, not a second clock read, so the two timestamps are exactly
+        # `ttl_seconds` apart. In `$setOnInsert` too, so a duplicate does not extend the expiry.
         if self.ttl_seconds is not None:
             insert[_indexes.EXPIRES_FIELD] = created_at + datetime.timedelta(seconds=self.ttl_seconds)
 
@@ -852,9 +786,8 @@ class MongoDBMemoryStore:
         try:
             result = await collection.update_one(selector, {"$setOnInsert": insert}, upsert=True)
         except DuplicateKeyError:
-            # The narrow race `REQ-E-043` names: two upserts match nothing, both insert, and the loser
-            # lands here. The winner's document is the right answer, since an error would tell the caller
-            # their write was rejected when it was in fact already stored.
+            # Two concurrent upserts both matched nothing and inserted, and this one lost. The memory is
+            # stored, so report the winner's document rather than an error.
             return await self._existing(collection, selector)
 
         if result.upserted_id is None:
@@ -865,19 +798,17 @@ class MongoDBMemoryStore:
     async def _existing(
         self, collection: AsyncCollection[dict[str, Any]], selector: Mapping[str, Any]
     ) -> MongoDBAddResult:
-        """Report the document a duplicate write resolved to.
+        """Report the document a duplicate write matched.
 
-        Projected down to ``_id``, because the content is already in the caller's hand and reading it
-        back would pull a memory across the wire for no reason.
+        Projects only ``_id``, because the caller already has the content.
 
         Args:
             collection: The collection the write went to.
             selector: The upsert filter, which is also the unique index's key.
 
         Returns:
-            One id and ``duplicates=1``. An empty ``ids`` is possible only if the document was deleted
-            between the upsert and this read, which is reported as a duplicate with nothing to point at
-            rather than as an error.
+            One id and ``duplicates=1``, or no ids if the document was deleted between the upsert and this
+            read.
         """
         document = await collection.find_one(dict(selector), {"_id": 1})
         ids = [] if document is None else [str(document["_id"])]
@@ -887,43 +818,37 @@ class MongoDBMemoryStore:
     @_telemetry.traced("memory", "search")
     @_reporting("searching")
     async def search(self, query: str | MongoDBSearchQuery, options: SearchOptions | None = None) -> list[MemoryEntry]:
-        """Answer a query from whichever prepared tier fits it (``REQ-E-040``, ``REQ-E-041``).
+        """Return the memories that best match a query, most relevant first.
 
-        ``query`` is widened past the protocol's ``str``, which is safe because a method parameter is
-        contravariant: every caller that could pass a ``str`` still can. Both SDK call sites do pass a
-        ``str``, so the string form is the production path and the ``MongoDBSearchQuery`` form is the
-        extension a direct caller reaches for when they need a per-query filter, limit or embedding.
+        ``query`` is a string, as the protocol defines, or a ``MongoDBSearchQuery`` for a per-query
+        ``filter``, ``limit``, ``oversampling_factor`` or precomputed ``vector``. The store answers from the
+        first prepared tier, in preference order, that fits the query's keys.
 
-        Everything the caller can get wrong is checked before ``initialize()`` runs, so a bad limit or a
-        bad filter is a ``ValueError`` rather than a connection timeout against a deployment that was
-        never going to be asked anything. That ordering is asserted rather than incidental: two unit
-        tests point a store at a closed port and require ``ValueError``.
-
-        Scope is applied by :func:`_filter.compose`, not by the caller, and the returned ``_scope`` key
-        is read off this store rather than off the document. A document that could name its own scope
-        could name one it was not stored in.
+        Results are always limited to this store's scope and name, combined with the configured and
+        per-query filters; nothing in the query can change the scope. A configured ``min_score`` or
+        ``max_score`` is applied after the query. Input errors are raised before any network call.
 
         Args:
             query: A natural-language string, or a ``MongoDBSearchQuery`` carrying any of ``text``,
                 ``vector``, ``filter``, ``limit`` and ``oversampling_factor``. Never modified.
-            options: The SDK's per-call options. Only ``max_search_results`` is read, and it sits below
-                a query-level ``limit`` because a ``MongoDBSearchQuery`` can only arrive on a direct
-                call while ``MemoryManager.search`` always supplies ``options``.
+            options: The SDK's per-call options. Only ``max_search_results`` is read, and a query's
+                ``limit`` takes precedence over it.
 
         Returns:
-            Entries in descending relevance, each carrying the four reserved metadata keys beside
-            whatever the caller stored. Ordering comes from the search stage; the score bound only
-            drops.
+            Up to the resolved limit of entries, in descending relevance, on every tier including hybrid.
+            Each entry's metadata holds what the caller stored plus the reserved keys ``_id``,
+            ``_relevance_score``, ``_search_type`` (the tier that answered) and ``_scope``, which win over
+            stored keys of the same name.
 
         Raises:
-            ValueError: If the limit is below 1, if the query sets both or neither of ``text`` and
-                ``vector``, if the filter names an undeclared path or an operator key, or if no prepared
-                tier fits the query's shape.
-            StorageError: If the deployment cannot search at all, if no tier could be prepared, or if a
-                driver call fails.
+            ValueError: If the limit is below 1, if the query sets neither ``text`` nor ``vector`` (or
+                both, where the hybrid tier cannot answer), if the filter names an undeclared path, an
+                operator key or a regex value, if ``oversampling_factor`` is below 1 or ``limit`` times it
+                exceeds 10000 on the vector or hybrid tier, or if no prepared tier fits the query's shape.
+            StorageError: If the deployment cannot search at all, if no tier could be prepared, if
+                :meth:`initialize` fails, or if a driver call fails.
         """
-        # First, before anything that can raise, so a search that fails before reaching a tier still says
-        # what was asked for.
+        # First, so a search that fails early still records what was requested.
         _telemetry.annotate("strands_mongodb.search.requested", self._search_type)
         parts: MongoDBSearchQuery = {"text": query} if isinstance(query, str) else query
         query_text = parts.get("text")
@@ -935,10 +860,8 @@ class MongoDBMemoryStore:
             options=options.get("max_search_results") if options else None,
             instance=self.max_search_results,
         )
-        # The mode-independent half of the shape check only. The other half lives inside
-        # `_pipeline.vector_stages` and cannot run here: on a manual-vector store a plain string is wrong
-        # for the vector tier and exactly right for the text one, so rejecting it now would reject the
-        # query `auto` is about to answer.
+        # Only the mode-independent check. The rest runs in `_pipeline.vector_stages`: on a manual-vector
+        # store a plain string is wrong for the vector tier but right for the text tier `auto` may pick.
         _pipeline.check_query_keys(
             query_text=query_text, query_vector=query_vector, fusion_possible=self._fusion_possible
         )
@@ -950,8 +873,7 @@ class MongoDBMemoryStore:
         tier = self._pick_tier(query_text=query_text, query_vector=query_vector)
         _telemetry.annotate("strands_mongodb.search.tier", tier)
         if tier == "hybrid":
-            # Not None on this branch: `_pick_tier` returns "hybrid" only where both keys its two
-            # branches need are present.
+            # `_pick_tier` returns "hybrid" only when both keys its two branches need are present.
             assert query_text is not None
             stages = _pipeline.hybrid_stages(
                 mode=self._mode,
@@ -964,9 +886,8 @@ class MongoDBMemoryStore:
                 oversampling_factor=parts.get("oversampling_factor", DEFAULT_OVERSAMPLING_FACTOR),
             )
         elif tier == "vector":
-            # Both keys pass through. `check_query_keys` has already rejected both-set, and `_pick_tier`
-            # chose this tier only because the mode's own key is present, so the mode check inside
-            # `vector_stages` is satisfied either way and a conditional here would only duplicate it.
+            # Both keys pass through: `_pick_tier` chose this tier because the mode's own key is present,
+            # and `vector_stages` checks the mode itself.
             stages = _pipeline.vector_stages(
                 mode=self._mode,
                 index_name=self._index_names["vector"],
@@ -977,7 +898,7 @@ class MongoDBMemoryStore:
                 oversampling_factor=parts.get("oversampling_factor", DEFAULT_OVERSAMPLING_FACTOR),
             )
         else:
-            # Not None on this branch: `_pick_tier` returns "text" only where `query_text` is set.
+            # `_pick_tier` returns "text" only when `query_text` is set.
             assert query_text is not None
             stages = _pipeline.text_stages(
                 query_text=query_text,
@@ -989,9 +910,11 @@ class MongoDBMemoryStore:
         scored: list[tuple[float, MemoryEntry]] = []
         cursor = await self._collection().aggregate(stages)
         async for document in cursor:
-            # `or 0.0` rather than a default, because a stage that projected nothing yields `None` and a
-            # `None` score would break the bound comparison rather than sort last.
+            # `or 0.0`, not a `.get` default: a stage that projected nothing yields `None`, which would
+            # break the bound comparison.
             score = float(document.get(_pipeline.SCORE_FIELD) or 0.0)
+            # `_scope` comes from this store, never from the document, so a document cannot report a
+            # scope other than the one it was read from.
             entry = MemoryEntry(
                 content=str(document.get(_indexes.CONTENT_FIELD, "")),
                 store_name=self.name,
@@ -1014,12 +937,10 @@ class MongoDBMemoryStore:
         return results
 
     def _pick_tier(self, *, query_text: str | None, query_vector: list[float] | None) -> ResolvedSearchType:
-        """Choose the prepared tier that can answer this query (``REQ-E-054``, ``REQ-E-066``).
+        """Choose the first prepared tier, in preference order, that fits the query's keys.
 
-        Preference order comes from ``_tiers``, which ``initialize()`` built vector-first. The choice is
-        the query's *shape* rather than the caller's stated preference, which is why ``_search_type``
-        travels back in the result metadata: a store that reported the requested tier instead of the one
-        that ran would satisfy every assertion except the one that matters.
+        The choice follows the query's shape, not only ``search_type``, which is why each result reports
+        the tier that actually ran.
 
         Args:
             query_text: What the caller put in ``text``, if anything.
@@ -1029,34 +950,28 @@ class MongoDBMemoryStore:
             The tier to build stages for.
 
         Raises:
-            StorageError: If no tier is prepared at all. Two conditions with two remedies, so two
-                messages: a deployment that cannot search is not the same as one where index creation
-                failed, and advice naming ``createSearchIndexes`` is unusable on the first.
-            ValueError: If tiers exist but none fits this query's shape. A caller error, and the message
-                names the key to add.
+            StorageError: If no tier is prepared. The message differs between a deployment without Atlas
+                Search and one where index creation failed, because the remedies differ.
+            ValueError: If the query sets both ``text`` and ``vector`` and the hybrid tier is not
+                prepared, or if tiers exist but none fits this query's shape. The message names the key
+                to add.
         """
         if query_text is not None and query_vector is not None and "hybrid" not in self._tiers:
-            # Reached only where the config permitted both keys and the deployment then could not fuse:
-            # no `$rankFusion`, or one of the two tiers did not come up. Raised rather than answered,
-            # because every remaining tier reads exactly one of the two keys and would silently drop the
-            # other -- the text tier would answer this lexically and report `_search_type: "text"`,
-            # which is true and is not what was asked (`REQ-E-151`).
+            # Raised rather than answered from one tier, which would silently ignore one of the two keys.
             raise ValueError(_NO_FUSION_FOR_QUERY % (self._target, ", ".join(self._tiers) or "none"))
 
         if not self._tiers:
             capabilities = self._connection.capabilities
             if capabilities is None or not capabilities.search:
-                # A phrase rather than the bare code, because the `capabilities is None` branch has no
-                # code to name and "server error code None" would read as one the server sent.
+                # A phrase rather than a bare code, because with no cached probe there is no code to name.
                 code = capabilities.no_search_code if capabilities is not None else None
                 evidence = f"server error code {code}" if code is not None else "no probe result cached"
                 raise StorageError(_NO_SEARCH_QUERY % (self._target, evidence))
             raise StorageError(_NO_TIER_PREPARED % self._target)
 
         for tier in self._tiers:
-            # Both branches or nothing. `$search` has nothing to search with absent `text`, and the
-            # vector branch needs the key its own mode reads -- which on the AutoEmbeddings path is
-            # `text` again, so there a plain string fits the fused tier whole.
+            # Hybrid needs `text` for `$search` and the vector path's own key, which with AutoEmbeddings is
+            # `text` again, so there a plain string fits the hybrid tier.
             if tier == "hybrid" and query_text is not None and self._vector_key(query_text, query_vector) is not None:
                 return "hybrid"
             if tier == "text" and query_text is not None:
@@ -1074,10 +989,8 @@ class MongoDBMemoryStore:
     def _vector_key(self, query_text: str | None, query_vector: list[float] | None) -> Any:
         """Return whichever query key the vector tier reads on this store's path, or ``None``.
 
-        The vector tier's own key follows the configured path: AutoEmbeddings embeds ``text`` on the
-        deployment, and the manual path searches an embedding the caller computed. Extracted
-        because the hybrid tier asks the same question about the same key, and two spellings of one rule
-        is how the two tiers would drift apart.
+        AutoEmbeddings embeds ``text`` on the deployment, and the manual path searches an embedding the
+        caller computed. The vector and hybrid tiers share this so the rule has one definition.
 
         Args:
             query_text: What the caller put in ``text``, if anything.
@@ -1089,16 +1002,11 @@ class MongoDBMemoryStore:
         return query_text if self._mode.auto_embed else query_vector
 
     def _within_bounds(self, scored: list[tuple[float, MemoryEntry]]) -> list[MemoryEntry]:
-        """Apply the configured score bound, in Python, after the query (``REQ-E-059``).
+        """Apply the configured score bound, in Python, after the query.
 
-        The score travels alongside the entry rather than being read back out of
-        ``metadata["_relevance_score"]``, so the comparison uses the float the mapping computed instead
-        of re-parsing this package's own output.
-
-        In Python rather than as a ``$match`` on ``$meta``: the documents are already retrieved and paid
-        for either way, and a server-side bound would need a different expression per tier for scores
-        that are not on comparable scales. BM25's ``searchScore`` is unbounded and depends on corpus
-        statistics; cosine ``vectorSearchScore`` is normalised to ``[0, 1]``.
+        Client-side rather than a ``$match`` on ``$meta``, because the tiers' scores are on different
+        scales and a server-side bound would need a different expression per tier. BM25's ``searchScore``
+        is unbounded and depends on the corpus; cosine ``vectorSearchScore`` is in ``[0, 1]``.
 
         Args:
             scored: Every mapped entry with its score, in the order the search returned them.
@@ -1119,10 +1027,8 @@ class MongoDBMemoryStore:
         else:
             return [entry for _, entry in scored]
 
-        # Both counts, and only when the bound actually dropped something. A bound set slightly too high
-        # returns an empty list, and "kept 0 of 8" is the difference between reading that as a tuning
-        # problem and reading it as an empty memory. Silent on a no-op, so polling for a corpus that has
-        # not reached mongot yet does not fill the log.
+        # Logged only when the bound dropped something, so polling a corpus mongot has not indexed yet
+        # does not fill the log.
         if len(kept) != len(scored):
             logger.debug(
                 _SCORE_BOUND_APPLIED,
@@ -1138,40 +1044,29 @@ class MongoDBMemoryStore:
     @_telemetry.traced("memory", "delete")
     @_reporting("deleting a memory from")
     async def delete(self, memory_id: str) -> int:
-        """Remove one memory this store can see, named by the id ``search`` reported (``REQ-E-076``).
+        """Delete one memory, named by the ``_id`` a ``search`` result reported.
 
-        Not part of the SDK's ``MemoryStore`` protocol, which has no deletion member at all: this is the
-        package's own surface, added because a store that can accept a fact and never drop one cannot
-        answer a deletion request against the data it holds.
-
-        The predicate is :func:`_filter.compose`'s output with ``_id`` added, which is the read path's
-        call unchanged rather than a second predicate that happens to agree with it. That is the whole of
-        the isolation claim here (``REQ-E-078``): a store can delete only what it can read, so a
-        well-formed id belonging to another scope or another store name matches nothing.
+        Not part of the ``MemoryStore`` protocol. The delete matches on the same scope, store name and
+        configured ``filter`` as ``search``, plus the id, so a store can delete only what it can read.
 
         Three cases return ``0`` and are deliberately indistinguishable: the memory was already deleted,
         it belongs to another scope, or it belongs to another store in this scope. Telling them apart
-        would answer "does this id exist somewhere I cannot read?", which is a cross-scope existence
-        oracle built out of a delete.
+        would reveal whether an id exists in a scope the caller cannot read.
 
         Args:
-            memory_id: The ``_id`` string from a search result's metadata. The read path projects
-                ``str(document["_id"])``, so the id arrives here as a string and is parsed back.
+            memory_id: The ``_id`` string from a search result's metadata.
 
         Returns:
-            ``1`` if a document was removed, ``0`` if none matched. The server's count rather than a
-            constant, so a caller writing an erasure record has something that came from the deployment.
+            ``1`` if a document was deleted, ``0`` if none matched, as counted by the server.
 
         Raises:
-            ValueError: If this store is not writable (``REQ-E-079``), or if ``memory_id`` is not a
-                24-character hex ObjectId (``REQ-E-076``). Both are raised before any network call, and a
-                document whose ``_id`` is not an ``ObjectId`` is therefore unreachable through this
-                method, which is a limit rather than an oversight: this package writes no such document.
-            StorageError: If a driver call fails.
+            ValueError: If this store is not writable, or if ``memory_id`` is not a 24-character hex
+                ObjectId string. Both are raised before any network call. A document whose ``_id`` is not
+                an ``ObjectId`` cannot be deleted this way; this package never writes one.
+            StorageError: If :meth:`initialize` fails, or if a driver call fails.
         """
-        # Before the parse and before `initialize()`, in that order. A read-only store must turn a delete
-        # down without having opened a connection or created an index to do it, and it should say
-        # "not writable" rather than complain about an id it was never going to use.
+        # Writability first, before the id is parsed or anything connects, so a read-only store says
+        # "not writable" rather than complaining about the id.
         if not self.writable:
             raise ValueError(_NOT_WRITABLE % (self.name, "delete()"))
         object_id = _object_id(memory_id)
@@ -1185,23 +1080,19 @@ class MongoDBMemoryStore:
     @_telemetry.traced("memory", "delete_all")
     @_reporting("deleting every memory in")
     async def delete_all(self) -> int:
-        """Remove every memory this store can see (``REQ-E-077``).
+        """Delete every memory this store can read.
 
-        The same predicate :meth:`delete` and :meth:`search` build, with nothing added, so what this
-        empties is exactly what this store can read: one scope's documents under *this* store's name,
-        narrowed further by any configured ``filter``. Two stores over one collection in one scope are two
-        calls, and that is an open question rather than a settled design: a scope-wide erasure that took
-        one call would have to reach past ``store_name``, and reaching past the isolation predicate is the
-        one thing this method will not do without a requirement saying so.
+        Matches what :meth:`search` reads: this store's scope and name, narrowed by any configured
+        ``filter``. Other stores sharing the collection and scope keep their documents, so clearing a
+        whole scope takes one call per store.
 
         Returns:
-            How many documents the server removed. Worth reading rather than discarding: it is the only
-            number an erasure record can cite, and a ``0`` against a scope believed to hold facts says the
-            scope or the store name in the caller's configuration is not the one that was written to.
+            How many documents the server deleted. A ``0`` on a scope believed to hold memories usually
+            means the configured scope or store name differs from the one that was written to.
 
         Raises:
-            ValueError: If this store is not writable (``REQ-E-079``), raised before any network call.
-            StorageError: If a driver call fails.
+            ValueError: If this store is not writable. Raised before any network call.
+            StorageError: If :meth:`initialize` fails, or if a driver call fails.
         """
         if not self.writable:
             raise ValueError(_NOT_WRITABLE % (self.name, "delete_all()"))
@@ -1213,54 +1104,43 @@ class MongoDBMemoryStore:
         return result.deleted_count
 
     def get_tools(self) -> list[AgentTool]:
-        """Return this store's own agent tools, of which v0.1.0 has none (``REQ-E-052a``).
+        """Return the agent tools this store contributes, which is none.
 
-        Present and empty rather than absent. ``MemoryManager._build_tools`` reads
-        ``if _has_method(store, "get_tools"): tools.extend(store.get_tools())``, so a present method
-        returning ``[]`` extends the list by nothing and is indistinguishable from absence at runtime.
-        That is the opposite of ``add_messages``, whose presence decides which extractor runs, and it is
-        what lets v0.2.0 add a tool here without a compatibility event.
+        ``MemoryManager`` extends its tool list with the result, so an empty list adds nothing.
 
         Returns:
-            An empty ``list``. A ``list`` specifically, since the manager calls ``extend`` on it.
+            An empty ``list``.
         """
         return []
 
     @property
     def _target(self) -> str:
-        """The namespace this store operates on, for messages that must not name a memory.
+        """The ``database.collection`` namespace, the only subject errors and log messages name.
+
+        Messages never name a memory, because that would put user content into errors, logs and
+        tracebacks.
 
         Returns:
-            ``database.collection``. The only subject :func:`_reporting` renders, because the subject of
-            a memory operation is the memory itself and naming it would put user content into an error
-            string, a log line and every traceback that reaches a ticket.
+            ``database.collection``.
         """
         return f"{self._database_name}.{self._collection_name}"
 
     @property
     def _connection(self) -> _client._Connection:
-        """The connection serving the running event loop (``REQ-E-017b``).
+        """The connection serving the running event loop.
 
-        A property rather than an attribute, matching ``MongoDBStorage._connection`` and for the same
-        reason: ``resolve`` answers per loop (``REQ-E-017a``), and a reference captured in ``__init__``
-        would pin this store to the loop that constructed it. A store built once and used from two loops
-        is the ordinary case, not an exotic one, because the SDK's synchronous entry points run their
-        work on a fresh loop in a worker thread.
-
-        One consequence worth naming: ``capabilities`` is cached on the connection, and a second loop has
-        a second connection, so the first store to call ``initialize`` on it probes the deployment once
-        more. A store that already initialized on an earlier loop does not: ``_initialized`` is per store
-        instance and short-circuits before the probe, which is right, because indexes and search support
-        are properties of the deployment and do not change with the loop.
+        A property, not an attribute captured in ``__init__``, because connections are per event loop and
+        a store is often used from more than one: the SDK's synchronous entry points run on a fresh loop
+        in a worker thread. Capabilities are cached per connection, so a new loop probes again, but a
+        store that has already initialized skips the probe.
         """
         return _client.resolve(self._connection_config)
 
     def _collection(self) -> AsyncCollection[dict[str, Any]]:
-        """Resolve this store's collection from the shared connection.
+        """Resolve this store's collection from the running event loop's connection.
 
-        A method rather than a cached attribute, matching ``MongoDBStorage``. The client behind it
-        differs per event loop (``REQ-E-017a``), and a collection captured at construction would keep a
-        handle on a client bound to a loop that may already be closed.
+        Not cached, because a collection captured earlier would hold a client bound to another loop that
+        may already be closed.
 
         Returns:
             The collection, resolved fresh on every call.
@@ -1268,15 +1148,13 @@ class MongoDBMemoryStore:
         return self._connection.client[self._database_name][self._collection_name]
 
     async def close(self) -> None:
-        """Release the MongoDB connection, closing the client only if this package built it.
+        """Release the MongoDB connection, closing the client only if this package created it.
 
-        Not part of the ``MemoryStore`` protocol, so ``MemoryManager`` never calls it. Same scope as
-        ``MongoDBStorage.close``: per config rather than per store, because one registry entry serves
-        every store built from that config. Idempotent, and a no-op for an injected client
-        (``REQ-E-010``).
+        The connection is shared per config, so this affects every store built from the same config.
+        Idempotent, and an injected client is never closed. Not part of the ``MemoryStore`` protocol, so
+        ``MemoryManager`` never calls it.
 
-        A sibling store that keeps working afterwards opens a new pool rather than raising off the closed
-        client, because resolution is per operation (``REQ-E-017b``). Nothing closes that pool again, so
-        call this once at process shutdown.
+        A store that keeps working afterwards opens a new pool, and nothing closes that pool again, so call
+        this once, at process shutdown.
         """
         await _client.close(self._connection_config)
