@@ -1,4 +1,4 @@
-"""Index specs, idempotent ensure/verify and readiness polling: ``REQ-E-060`` through ``REQ-E-068``.
+"""Index specs, idempotent ensure and verify, and readiness polling.
 
 Three tiers, because the module has three kinds of claim and they are verifiable in different places.
 What the package *emits* is a dict and runs unmocked in the unit tier. What a **plain MongoDB** does
@@ -6,9 +6,9 @@ with an ordinary index runs in the contract tier. What **mongot** does with a se
 the asynchronous build that makes created and queryable two different states, runs in the integration
 tier.
 
-Nothing here re-probes the server for facts already settled. What was measured against MongoDB 8.3.8 is
-recorded in this suite, including the two earlier claims it contradicted, and the tests
-below assert the behaviour that follows from those measurements. The ones that do hit a deployment are
+Nothing here re-probes the server for facts already settled. The server behaviour these tests rely on
+was measured against MongoDB 8.3.8, and the tests below assert what follows from it. The ones that do
+hit a deployment are
 the ones where a passing mock would prove nothing: option conflicts, the missing-namespace asymmetry,
 and the build states.
 """
@@ -29,18 +29,18 @@ if TYPE_CHECKING:
 
     from strands_mongodb.types import MongoDBConfig, VectorSimilarity
 
-# Every index this package creates on the memory collection, by its row number in the index inventory.
+# The ordinary indexes this package creates on the memory collection: dedup, recency and TTL. Only counted.
 MEMORY_ROWS = ("3", "4", "7")
 
 
 class TestVectorModeIsResolvedFromTheConfig:
-    """AT-067 / REQ-E-067 — the two fields added to ``MongoDBConfig``, and the combinations that raise.
+    """AT-067 — ``embedding_dimensions`` and ``similarity`` select the manual vector mode, and conflicting
+    combinations raise.
 
     Mode selection mirrors ``pymongo_search_utils._check_param_config``'s exactly-one-mode rule without
-    importing it. The reason the manual mode has to be configurable at all is measured rather than
-    argued: an ``autoEmbed`` index is rejected at **creation** on Atlas local, so the path CI can test
-    is the manual one, and a manual vector index cannot be created without ``numDimensions`` and
-    ``similarity``.
+    importing it. The manual mode has to be configurable because an ``autoEmbed`` index is rejected at
+    **creation** on deployments without automated embedding, Atlas local among them, and a manual vector
+    index cannot be created without ``numDimensions`` and ``similarity``.
     """
 
     def test_an_empty_config_selects_autoembed_with_the_documented_default(self) -> None:
@@ -116,21 +116,18 @@ class TestVectorModeIsResolvedFromTheConfig:
 
     @pytest.mark.parametrize("dimensions", [0, -1, 8193])
     def test_dimensions_outside_the_atlas_bounds_are_rejected_here(self, dimensions: int) -> None:
-        """Measured: the server answers ``numDimensions`` outside ``[1..8192]`` with code 8. Same
-        reasoning as the similarity check, and ``-1`` specifically is the value some guides suggest."""
+        """The server answers ``numDimensions`` outside ``[1..8192]`` with code 8. Same reasoning as the
+        similarity check. ``-1`` is included because langchain-mongodb uses it as a placeholder."""
         with pytest.raises(ValueError, match=r"1\.\.8192"):
             _indexes.vector_mode({"database": "d", "embedding_dimensions": dimensions, "similarity": "cosine"})
 
 
 class TestTheVectorIndexDefinition:
-    """AT-071 / REQ-E-071 — filter fields are declared at creation time, in both modes.
+    """AT-071 — filter fields are declared at creation time, in both modes.
 
-    ``REQ-E-071`` is an availability requirement wearing an indexing hat, and it was first written as a
-    security one. It assumed a pre-filter over an undeclared path returns unfiltered results, meaning
-    another customer's memories. Measured on mongot 8.3.8, the server rejects it with code 8. So
-    failing to declare ``scope`` here breaks every scoped query rather than widening it, since this
-    package filters by ``scope`` on all of them. Declaring both fields is still required; what changes is
-    which way it fails. ``_filter.validate`` remains the guard that names the config key to edit.
+    The server rejects a pre-filter over an undeclared path with code 8 (mongot 8.3.8). This package
+    filters by ``scope`` on every query, so failing to declare ``scope`` here would break every scoped
+    query. ``_filter.validate`` is the guard that names the config key to edit.
     """
 
     def test_the_autoembed_definition_matches_the_confirmed_wire_shape(self) -> None:
@@ -157,9 +154,9 @@ class TestTheVectorIndexDefinition:
         }
 
     def test_no_definition_ever_emits_the_placeholder_dimension_count(self) -> None:
-        """Some guides describe ``numDimensions: -1`` for the server-side path. That is
-        langchain-mongodb's constructor validation, not a wire format: the server answers ``-1`` with
-        code 8. ``vector_mode`` cannot produce it, so this asserts the emitted dict as well."""
+        """langchain-mongodb uses ``numDimensions: -1`` as a placeholder for the server-side path. That
+        is its constructor validation, not a wire format: the server answers ``-1`` with code 8.
+        ``vector_mode`` cannot produce it, so this asserts the emitted dict as well."""
         configs: tuple[MongoDBConfig, ...] = ({"database": "d"}, {"database": "d", "embedding_model": "m"})
         for config in configs:
             definition = _indexes.vector_index_definition(_indexes.vector_mode(config))
@@ -193,8 +190,8 @@ class TestTheVectorIndexDefinition:
         assert filters == ["scope", "store_name", "owner"]
 
     def test_the_declared_paths_are_readable_without_rebuilding_the_definition(self) -> None:
-        """``_filter.validate`` needs the set this definition declared, and the definition
-        stays the single authority. That only holds if the set can be read back from here."""
+        """``_filter.validate`` needs the set this definition declared, and the definition is the single
+        authority on it. That only holds if the set can be read back from here."""
         assert _indexes.declared_filter_fields(["owner"]) == ("scope", "store_name", "owner")
 
     def test_the_filter_paths_and_the_filter_module_agree_on_the_baked_in_pair(self) -> None:
@@ -218,11 +215,11 @@ class TestTheFullTextIndexDefinition:
         assert _indexes.text_index_definition()["mappings"]["dynamic"] is False
 
 
-class TestTheInventoryMatchesPlanSection68:
-    """The seven-row index inventory, minus the two rows nothing creates.
+class TestTheIndexInventory:
+    """The ordinary index inventory, as the README's index table lists it.
 
-    Row 1 is ``_id_``, which the server creates. Rows 5 and 6 are search indexes and live in
-    :func:`memory_search_specs`. That leaves one ordinary index on ``storage`` and three on ``memory``.
+    The server creates ``_id_``, and the two search indexes live in :func:`memory_search_specs`. That
+    leaves one ordinary index on ``storage`` and three on ``memory``.
     """
 
     def test_the_storage_surface_declares_exactly_its_ttl_index(self) -> None:
@@ -235,9 +232,9 @@ class TestTheInventoryMatchesPlanSection68:
         assert len(_indexes.memory_specs()) == len(MEMORY_ROWS)
 
     def test_the_dedup_index_carries_the_options_it_exists_for(self) -> None:
-        """Row 3. The key list is not the point of this index; ``unique`` is. An ordinary compound
-        index over the same three fields satisfies a key-list check exactly and stops nothing, which is
-        a missing uniqueness guard with the index reported present."""
+        """The key list is not the point of the dedup index; ``unique`` is. An ordinary compound index
+        over the same three fields satisfies a key-list check exactly and stops nothing, so duplicates
+        would be written while the index is reported present."""
         spec = self._by_keys(("scope", 1), ("store_name", 1), ("content_hash", 1))
 
         assert spec.options == {
@@ -253,15 +250,15 @@ class TestTheInventoryMatchesPlanSection68:
         assert spec.options["partialFilterExpression"] == {"content_hash": {"$exists": True}}
 
     def test_the_recency_index_sorts_created_at_descending(self) -> None:
-        """Row 4. ``-1`` because every read of it is newest-first; an ascending index serves the same
+        """``-1`` because every read of it is newest-first; an ascending index serves the same
         sort, but the direction here is the one the queries use."""
         spec = self._by_keys(("scope", 1), ("store_name", 1), ("created_at", -1))
 
         assert spec.options == {}
 
     def test_the_memory_ttl_index_is_declared_unconditionally(self) -> None:
-        """The expiry index is optional and is created anyway. Conditional on a configured
-        ``ttl_seconds`` fails silently: a store that gains a TTL later stamps ``expires_at`` on every
+        """The memory TTL index is created whether or not ``ttl_seconds`` is configured. Creating it only
+        when one is configured fails silently: a store that gains a TTL later stamps ``expires_at`` on every
         document and nothing deletes them, with no error to read. A TTL index is inert for documents
         that carry no ``expires_at``, so the unconditional version costs nothing at rest."""
         spec = self._by_keys(("expires_at", 1))
@@ -269,7 +266,7 @@ class TestTheInventoryMatchesPlanSection68:
         assert spec.options == {"expireAfterSeconds": 0}
 
     def test_specs_take_no_arguments_so_the_inventory_cannot_vary_by_caller(self) -> None:
-        """``REQ-E-061`` hands a least-privilege operator the exact command list. That list is only
+        """A caller without DDL rights hands an operator the exact command list. That list is only
         useful if it is the same list every store asks for."""
         assert _indexes.storage_specs() == _indexes.storage_specs()
         assert _indexes.memory_specs() == _indexes.memory_specs()
@@ -291,7 +288,7 @@ class TestTheInventoryMatchesPlanSection68:
 
 
 class TestTheSearchIndexInventory:
-    """Both search indexes, built from the config because both names and one definition come from it."""
+    """The two search indexes, built from the config because both names and one definition come from it."""
 
     def test_both_search_indexes_are_declared(self) -> None:
         specs = _indexes.memory_search_specs({"database": "d"})
@@ -312,8 +309,8 @@ class TestTheSearchIndexInventory:
         assert [spec.name for spec in specs] == ["v", "t"]
 
     def test_the_config_filter_fields_reach_the_vector_definition(self) -> None:
-        """The path from ``MongoDBConfig`` to the index is the one ``REQ-E-071`` is about, and a
-        definition that is right in isolation and never receives the config is the same bug."""
+        """The path from ``MongoDBConfig`` to the index is what declares the caller's filter fields. A
+        definition that is right in isolation and never receives the config would leave them undeclared."""
         specs = _indexes.memory_search_specs({"database": "d", "filter_fields": ["owner"]})
 
         paths = [f["path"] for f in specs[0].definition["fields"] if f["type"] == "filter"]
@@ -327,10 +324,10 @@ class TestTheSearchIndexInventory:
 
 
 class TestTheCreationCommandsHandedToAnOperator:
-    """AT-061 / REQ-E-061 — the command a caller without DDL rights forwards to whoever has them.
+    """AT-061 — the command a caller without DDL rights forwards to whoever has them.
 
-    "Naming the index" is not enough on its own: the person who receives the message is not the person
-    who read the requirement, and they need something they can run.
+    Naming the index is not enough on its own: the person who receives the message is not the person who
+    configured the store, and they need something they can run.
 
     ``db.runCommand`` with the raw server command rather than a shell helper. That is the command
     pymongo itself sends, so it is verifiable from here rather than remembered: ``createIndexes`` and
@@ -378,7 +375,7 @@ class TestTheCreationCommandsHandedToAnOperator:
 
 
 class FakeSearchIndexCursor:
-    """The cursor ``list_search_indexes`` returns, which is async-iterable and not iterable (``MP-002``).
+    """The cursor ``list_search_indexes`` returns, which is async-iterable and not iterable.
 
     Stands in for ``AsyncCommandCursor``. Deliberately does **not** implement ``__iter__``: the real
     class does not either, and a fake that did would let a synchronous ``for`` loop pass here and fail
@@ -396,8 +393,8 @@ class FakeSearchIndexCursor:
 class FakeAsyncDatabase:
     """The database half of the fake, which exists for two calls: ``create_collection`` and ``command``.
 
-    ``command`` arrived with the ``$rankFusion`` probe (``REQ-E-143``) and counts its calls, because
-    "once per connection" is an assertion about a number and not about a return value (``AT-146``).
+    ``command`` serves the ``$rankFusion`` probe and counts its calls, because "once per connection" is
+    an assertion about a number and not about a return value.
     """
 
     def __init__(
@@ -434,9 +431,9 @@ class FakeAsyncDatabase:
 
 
 class FakeAsyncCollection:
-    """``AsyncCollection`` narrowed to the four methods this module calls (``MP-001``).
+    """``AsyncCollection`` narrowed to the four methods this module calls.
 
-    Every method is a coroutine function, which is the property ``MP-001`` checks against the real
+    Every method is a coroutine function, which ``TestTheFakesMatchTheDriver`` checks against the real
     class rather than assuming. The two ``__getattr__``-shaped traps the real class has are absent
     here on purpose: this fake raises ``AttributeError`` for an unknown attribute, so a typo in the
     module under test fails in the unit tier instead of resolving to a sub-collection.
@@ -468,7 +465,7 @@ class FakeAsyncCollection:
         for model in models:
             document = dict(model.document)
             # Two ways `IndexModel.document` differs from what `index_information` reports, both
-            # measured on 4.17.0 against a deployment rather than reasoned about: it holds `key` as a
+            # measured on pymongo 4.17.0 against a deployment: it holds `key` as a
             # `SON` where the server reports a list of tuples, and it carries the index name as a field
             # where the server uses it as the entry's key and drops it from the body. Normalised here so
             # a create followed by a verify reads the shape the server would have returned.
@@ -538,9 +535,9 @@ def existing(*keys: tuple[str, int], **options: Any) -> dict[str, Any]:
 
 
 class TestOrdinaryIndexesAgainstAFake:
-    """REQ-E-060, REQ-E-061, REQ-E-063, REQ-E-064 — the branch logic, without a deployment.
+    """Creating, verifying and reporting ordinary indexes: the branch logic, without a deployment.
 
-    The contract tier proves the server behaves as measured. These tests prove the
+    The contract tier proves the server behaves as these tests assume. These tests prove the
     module branches on it correctly, which is a different claim and much cheaper to make exhaustive.
     """
 
@@ -570,8 +567,8 @@ class TestOrdinaryIndexesAgainstAFake:
         assert collection.created_indexes == []
 
     async def test_matching_is_on_the_key_list_rather_than_the_name(self) -> None:
-        """Forced rather than preferred. Measured: creating a second index over keys that already
-        carry one returns code 85 whatever name is used, so a name-keyed check would try, fail, and
+        """Forced rather than preferred: creating a second index over keys that already carry one
+        returns code 85 whatever name is used, so a name-keyed check would try, fail, and
         report a conflict the caller cannot act on. The index above is named nothing like ours."""
         collection: Any = FakeAsyncCollection(indexes={"legacy_ttl": existing(("expires_at", 1), expireAfterSeconds=0)})
 
@@ -580,9 +577,9 @@ class TestOrdinaryIndexesAgainstAFake:
         assert collection.created_indexes == []
 
     async def test_a_matching_key_list_with_a_missing_option_raises(self) -> None:
-        """AT-063. The case that made this requirement change: an ordinary compound index over the
-        dedup keys satisfies a key-list check exactly and stops no duplicates, so accepting it ships
-        a missing uniqueness guard with every index reported present."""
+        """AT-063 — an index over the dedup keys that lacks ``unique`` is refused. It satisfies a
+        key-list check exactly and stops no duplicates, so accepting it would let duplicates through with
+        every index reported present."""
         from strands.types.exceptions import StorageError
 
         dedup = self._dedup_spec()
@@ -622,8 +619,8 @@ class TestOrdinaryIndexesAgainstAFake:
         assert collection.created_indexes == []
 
     async def test_a_differing_ttl_is_a_mismatch_rather_than_a_match(self) -> None:
-        """AT-064 / REQ-E-064. ``expireAfterSeconds`` stopped being a TTL special case once the
-        comparison covered every option we ask for: it is one option among four."""
+        """AT-064 — a differing ``expireAfterSeconds`` is a mismatch. It is not a TTL special case: the
+        comparison covers every option this package sets, and this is one of four."""
         from strands.types.exceptions import StorageError
 
         collection: Any = FakeAsyncCollection(
@@ -636,8 +633,8 @@ class TestOrdinaryIndexesAgainstAFake:
     async def test_the_conflict_message_names_the_value_the_index_actually_has(self) -> None:
         """Naming the option is not enough to act on. Whoever reads this has to decide whether the
         existing index is theirs and whether losing its setting matters, and that decision needs both
-        numbers. Found by mutation: replacing the rendered value with a fixed string left all 129 tests
-        passing, because every assertion here matched on the option's *name*."""
+        numbers. The other assertions here match on the option's *name*, so this is the one that fails
+        if the rendered value is replaced with a fixed string."""
         from strands.types.exceptions import StorageError
 
         collection: Any = FakeAsyncCollection(
@@ -652,8 +649,8 @@ class TestOrdinaryIndexesAgainstAFake:
     async def test_an_index_that_covers_the_keys_but_lacks_the_option_reads_as_absent(self) -> None:
         """A plain index on ``expires_at`` with no TTL at all is the likelier accident than a TTL set to
         the wrong number, and the message has a separate arm for it. Branch coverage cannot see this
-        arm: it is the false side of a conditional expression inside one statement, so the module read
-        as fully covered while half of this line had never run."""
+        arm: it is the false side of a conditional expression inside one statement, so it needs a test
+        of its own."""
         from strands.types.exceptions import StorageError
 
         collection: Any = FakeAsyncCollection(indexes={"someone_elses": existing(("expires_at", 1))})
@@ -676,7 +673,7 @@ class TestOrdinaryIndexesAgainstAFake:
         assert collection.created_indexes == []
 
     async def test_a_partial_expression_reported_as_a_son_still_compares_equal(self) -> None:
-        """``index_information`` returns ``partialFilterExpression`` as a ``bson.son.SON``. Measured:
+        """``index_information`` returns ``partialFilterExpression`` as a ``bson.son.SON``.
         ``SON`` subclasses ``dict`` and compares equal to the plain dict we sent, so the comparison
         needs no normalisation step. Asserted rather than trusted, because if it were false every
         deployment would report the dedup index as mismatched."""
@@ -698,7 +695,7 @@ class TestOrdinaryIndexesAgainstAFake:
         assert collection.created_indexes == []
 
     async def test_verify_only_creates_nothing_and_raises_on_the_missing_index(self) -> None:
-        """AT-061 / REQ-E-061."""
+        """AT-061 — verify-only mode creates nothing and raises on a missing index."""
         from strands.types.exceptions import StorageError
 
         collection: Any = FakeAsyncCollection()
@@ -759,29 +756,29 @@ class TestOrdinaryIndexesAgainstAFake:
 
 
 class TestAMatchedIndexWhoseCollationFoldsCaseIsRefused:
-    """AT-193 / ``REQ-E-187`` — the gap ``AT-176``'s collection-level preflight leaves open.
+    """AT-193 — a dedup index that matches on keys and options but folds case is refused, which the
+    ``AT-176`` collection-level preflight cannot see.
 
-    The preflight reads the *collection's* default collation, and an index carries its own: a collection
-    with none at all, which passes the preflight, can hold a unique index created
-    ``{locale: "en", strength: 2}``. That index is what the dedup rule is enforced by, so the rule it
-    enforces is the folded one -- ``Remember X`` and ``remember x`` hash to different values, match the
-    same index entry, and the second write is a duplicate of a memory it is not a duplicate of.
+    The collection-level collation preflight reads the *collection's* default collation, and an index
+    carries its own: a collection with none at all, which passes the preflight, can hold a unique index
+    created ``{locale: "en", strength: 2}``. The dedup rule is enforced by that index, so the rule it
+    enforces is the folded one: ``Remember X`` and ``remember x`` hash to different values, match the
+    same index entry, and the second write is treated as a duplicate of a memory it does not duplicate.
 
-    Measured on ``mongod`` 7.0.12 rather than reasoned: the second ``add`` came back
-    ``ids=[], inserted=0, duplicates=1`` with tenant A's content left in place and tenant B's never
-    stored. It is not a reporting quirk, because ``_existing()`` re-queries with the binary selector and
-    a collated index cannot serve that query -- so the caller is told the memory was already there and
-    nothing can find it.
+    On ``mongod`` 7.0.12 the second ``add`` returns ``ids=[], inserted=0, duplicates=1``, with the first
+    write's content left in place and the second's never stored. ``_existing()`` re-queries with the
+    binary selector and a collated index cannot serve that query, so the caller is told the memory was
+    already there and nothing can find it.
 
     The rule is checked here rather than added to ``IndexSpec.options`` because the server does not store
-    a simple collation (``AT-176`` measured that, and so does the contract tier): an ``options`` entry of
+    a simple collation (the contract tier asserts this): an ``options`` entry of
     ``{"collation": {"locale": "simple"}}`` would find ``collation`` absent on every correct index and
     refuse every deployment that has one.
     """
 
     @staticmethod
     def _dedup_spec() -> _indexes.IndexSpec:
-        """The unique partial index the dedup constraint rests on, which is what this finding is about."""
+        """The unique partial index the dedup constraint rests on."""
         return next(spec for spec in _indexes.memory_specs() if spec.options.get("unique"))
 
     def _matched(self, **collation: Any) -> Any:
@@ -790,7 +787,7 @@ class TestAMatchedIndexWhoseCollationFoldsCaseIsRefused:
         return FakeAsyncCollection(indexes={"theirs": existing(*dedup.keys, **dedup.options, **collation)})
 
     async def test_an_index_reporting_a_folding_collation_is_refused(self) -> None:
-        """The finding. Every option matches, so ``_check_options`` passes it, and it must still fail."""
+        """Every option matches, so ``_check_options`` passes it, and the folding collation still refuses it."""
         from strands.types.exceptions import StorageError
 
         collection = self._matched(collation={"locale": "en", "strength": 2})
@@ -816,10 +813,9 @@ class TestAMatchedIndexWhoseCollationFoldsCaseIsRefused:
         assert "dropIndex" in message
 
     async def test_nothing_is_created_on_the_way_to_the_refusal(self) -> None:
-        """``create=True`` cannot resolve this one either. Not because the server would refuse the
-        creation -- under a different collation it accepts it, which is ``REQ-E-190`` -- but because the
-        folded constraint would still be enforced beside it, and dropping somebody else's index is not
-        this package's decision (``REQ-E-063``'s standing rule)."""
+        """``create=True`` cannot resolve this one either. The server would accept a second index over the
+        same keys under a different collation, but the folded constraint would still be enforced beside it,
+        and dropping an index somebody else created is not this package's decision."""
         from strands.types.exceptions import StorageError
 
         collection = self._matched(collation={"locale": "en", "strength": 2})
@@ -841,7 +837,7 @@ class TestAMatchedIndexWhoseCollationFoldsCaseIsRefused:
     async def test_an_index_reporting_no_collation_at_all_is_accepted(self) -> None:
         """The second, and the one that matters most: this is what every correct index reports, because
         the server does not store a simple collation. A rule reading absence as a mismatch would refuse
-        every deployment in existence."""
+        every correct deployment."""
         collection = self._matched()
 
         await _indexes.ensure(collection, ordinary=[self._dedup_spec()], create=True)
@@ -859,18 +855,16 @@ class TestAMatchedIndexWhoseCollationFoldsCaseIsRefused:
 
 
 class TestAFoldedConstraintBehindACorrectIndexIsStillRefused:
-    """AT-196 / ``REQ-E-190`` — the half of ``REQ-E-187`` that looked at one index where there are several.
+    """AT-196 — a folding unique index is refused even when the declared dedup index is also present.
 
-    An index's identity on the server is its keys **and** its collation. Measured on 7.0.12: a second
-    index over the same keys under the same collation is refused whatever it is named, and a second index
-    over the same keys under a *different* collation is created. So a collection can carry the declared
-    dedup index and a folding unique index over the same three keys at once, both enforced.
+    An index's identity on the server is its keys **and** its collation. On 7.0.12, a second index over
+    the same keys under the same collation is refused whatever it is named, and a second index over the
+    same keys under a *different* collation is created. So a collection can carry the declared dedup index
+    and a folding unique index over the same three keys at once, both enforced.
 
-    ``by_keys`` was built by a dict comprehension, so the last entry per key list won and the rest were
-    never examined. Which one that is, is creation order -- and measured through the real ``ensure()``,
-    the identical deployment is accepted when the folding index was created first and refused when it was
-    created second. What makes the accepted case a defect rather than a cosmetic inconsistency is that the
-    server enforces both constraints regardless of which one this package read.
+    Every index over a key list is examined, not only one. Reading a single entry per key list would make
+    the answer depend on creation order, while the server enforces both constraints whichever one this
+    package read.
     """
 
     FOLDING: Final[dict[str, Any]] = {"locale": "en", "strength": 2}
@@ -885,7 +879,7 @@ class TestAFoldedConstraintBehindACorrectIndexIsStillRefused:
 
         Args:
             folding_first: Whether the folding index is the one ``index_information`` reports first.
-                This is the whole variable: it is what decided the answer before ``REQ-E-190``.
+                The answer must not depend on it.
 
         Returns:
             A :class:`FakeAsyncCollection` whose index mapping preserves that order.
@@ -897,8 +891,8 @@ class TestAFoldedConstraintBehindACorrectIndexIsStillRefused:
         return FakeAsyncCollection(indexes=dict(pair))
 
     async def test_a_folding_unique_index_behind_the_declared_one_is_refused(self) -> None:
-        """The finding. Every option of the declared index matches an index that is really there, and the
-        deployment must still be refused because the folded rule is enforced beside it."""
+        """Every option of the declared index matches an index that is really there, and the deployment is
+        still refused because the folded rule is enforced beside it."""
         from strands.types.exceptions import StorageError
 
         collection = self._both(folding_first=True)
@@ -909,7 +903,7 @@ class TestAFoldedConstraintBehindACorrectIndexIsStillRefused:
         assert "folding_unique" in str(caught.value)
 
     async def test_the_answer_does_not_depend_on_which_index_was_created_first(self) -> None:
-        """The defect stated as the property it violates. Two orderings, one deployment, one answer."""
+        """The answer does not depend on creation order: two orderings of one deployment, one answer."""
         from strands.types.exceptions import StorageError
 
         for folding_first in (True, False):
@@ -961,7 +955,7 @@ class TestAFoldedConstraintBehindACorrectIndexIsStillRefused:
     async def test_a_folding_index_enforcing_nothing_beside_a_correct_one_is_accepted(self) -> None:
         """The second, and the narrower one. What is refused is a folded *constraint*, not a folded index:
         a non-unique collated index over the same keys enforces no rule, so there is no rule to be wrong
-        about. A fix that refused every folding sibling would be ``REQ-E-191``'s mistake in reverse."""
+        about. A guard that refused every folding sibling would refuse deployments with nothing wrong."""
         dedup = self._dedup_spec()
         collection: Any = FakeAsyncCollection(
             indexes={
@@ -975,8 +969,8 @@ class TestAFoldedConstraintBehindACorrectIndexIsStillRefused:
         assert collection.created_indexes == []
 
     async def test_a_folding_index_enforcing_nothing_and_alone_is_still_refused(self) -> None:
-        """The third, guarding the guard above. Relaxing the folding-sibling rule must not relax
-        ``REQ-E-187``: alone, that index is the only one over those keys, this package's binary queries
+        """The third, guarding the guard above. Relaxing the folding-sibling rule must not relax the
+        single-index collation rule: alone, that index is the only one over those keys, this package's binary queries
         cannot use it, and it is refused for that reason rather than for a constraint it does not hold."""
         from strands.types.exceptions import StorageError
 
@@ -988,16 +982,16 @@ class TestAFoldedConstraintBehindACorrectIndexIsStillRefused:
 
 
 class TestADateOnlyIndexIsNotHeldToAStringRule:
-    """AT-197 / ``REQ-E-191`` — the other half, and a regression ``REQ-E-187`` introduced.
+    """AT-197 — a date-only index is exempt from the collation rule.
 
-    ``_check_collation`` ran for every ordinary spec. One of them is ``strands_expires_at_ttl``: keyed on
-    ``expires_at`` alone, non-unique, and holding a BSON date or nothing at all. A collation changes what
-    an index compares for strings, and that index will never hold one -- so the rule refused a working
-    deployment and told the operator to drop an index that does its job.
+    A collation changes how an index compares strings. ``strands_expires_at_ttl`` is keyed on
+    ``expires_at`` alone, is non-unique, and holds a BSON date or nothing at all, so it never compares a
+    string. Holding it to the collation rule would refuse a working deployment and tell the operator to
+    drop an index that does its job.
 
-    That it does its job was measured, not argued. Over a TTL index built ``{locale: "en", strength: 2}``
-    on 7.0.12, a document stamped an hour in the past was gone inside ten seconds and a document with
-    ``expires_at: null`` was left alone: the same two outcomes the binary TTL index produces.
+    A collated TTL index does its job: over a TTL index built ``{locale: "en", strength: 2}`` on 7.0.12,
+    a document stamped an hour in the past is removed and a document with ``expires_at: null`` is left
+    alone, the same two outcomes the binary TTL index produces.
     """
 
     FOLDING: Final[dict[str, Any]] = {"locale": "en", "strength": 2}
@@ -1008,7 +1002,7 @@ class TestADateOnlyIndexIsNotHeldToAStringRule:
         return _indexes.storage_specs()[0]
 
     async def test_a_collated_ttl_index_is_accepted(self) -> None:
-        """The regression. Nothing about this deployment is wrong and the previous revision refused it."""
+        """A collated TTL index is accepted, because nothing about this deployment is wrong."""
         spec = self._ttl_spec()
         collection: Any = FakeAsyncCollection(
             indexes={spec.name: existing(*spec.keys, **spec.options, collation=self.FOLDING)}
@@ -1019,8 +1013,8 @@ class TestADateOnlyIndexIsNotHeldToAStringRule:
         assert collection.created_indexes == []
 
     async def test_the_whole_memory_index_set_is_accepted_over_a_collated_ttl_index(self) -> None:
-        """The regression as it actually arrived: not one spec in isolation, but the call
-        ``MongoDBMemoryStore.initialize()`` makes, which refused outright and left the store unusable."""
+        """The same case through the call ``MongoDBMemoryStore.initialize()`` makes, with the whole memory
+        index set. Refusing here would leave the store unusable."""
         specs = _indexes.memory_specs()
         indexes: dict[str, Any] = {}
         for spec in specs:
@@ -1034,8 +1028,8 @@ class TestADateOnlyIndexIsNotHeldToAStringRule:
 
     async def test_the_exemption_is_declared_on_the_spec_rather_than_guessed(self) -> None:
         """Which specs are exempt is a fact about what this package writes into those fields, so it is
-        recorded where the other facts about a declared index live. Asserted because the alternative --
-        matching on a field name or an index name -- would be guessing about documents nothing has read."""
+        recorded where the other facts about a declared index live. Asserted because the alternative,
+        matching on a field name or an index name, would be guessing about documents nothing has read."""
         by_name = {spec.name: spec for spec in _indexes.memory_specs()}
 
         assert by_name["strands_expires_at_ttl"].date_only is True
@@ -1056,8 +1050,8 @@ class TestADateOnlyIndexIsNotHeldToAStringRule:
             await _indexes.ensure(collection, ordinary=[spec], create=True)
 
     async def test_the_dedup_index_is_not_exempt(self) -> None:
-        """The second vacuity guard. ``REQ-E-187``'s own case has to keep failing, or this change has
-        quietly removed the rule it is narrowing."""
+        """The second vacuity guard. A folding dedup index has to keep failing, or the exemption has
+        removed the rule it narrows."""
         from strands.types.exceptions import StorageError
 
         spec = next(s for s in _indexes.memory_specs() if s.options.get("unique"))
@@ -1101,10 +1095,11 @@ def search_states(name: str, *statuses: str, definition: Mapping[str, Any] | Non
 
 
 class TestSearchIndexesAgainstAFake:
-    """REQ-E-062, REQ-E-066, REQ-E-068 — the three states, the status vocabulary, and the swallow.
+    """Search indexes: the three build states, the status vocabulary, and the namespace errors swallowed.
 
     An asynchronous build is the one thing a fake models well: the states are just successive reads.
-    What a fake cannot show is that the states occur, which is what ``AT-062a/b/c`` go to Atlas for.
+    What a fake cannot show is that the states occur, which is what ``TestSearchIndexesAgainstAtlas``
+    goes to Atlas for.
     """
 
     async def test_a_missing_index_is_created_and_then_polled_to_ready(self) -> None:
@@ -1120,9 +1115,9 @@ class TestSearchIndexesAgainstAFake:
         assert len(collection.created_search_indexes) == 1
 
     async def test_the_collection_is_created_before_the_search_index(self) -> None:
-        """AT-068 / REQ-E-068. ``createSearchIndexes`` against a missing namespace is code 26, while
-        ``createIndexes`` creates the collection implicitly. The reference implementation's
-        otherwise odd list-then-create is required rather than defensive."""
+        """AT-068 — the collection is created first. ``createSearchIndexes`` against a missing namespace
+        is code 26, while ``createIndexes`` creates the collection implicitly. The reference
+        implementation's otherwise odd list-then-create is required rather than defensive."""
         collection: Any = FakeAsyncCollection(name="memory", search_states=search_states("vector_index", "", "READY"))
 
         await _indexes.ensure(
@@ -1202,11 +1197,10 @@ class TestSearchIndexesAgainstAFake:
 
     @pytest.mark.parametrize("status", ["PENDING", "BUILDING", "STAGED", "SOMETHING_NEW"])
     async def test_every_status_that_is_not_ready_or_failed_is_read_as_building(self, status: str) -> None:
-        """The mapping is written the other way round from its first draft, and that is the
-        finding: ``PENDING`` was observed on 8.3.8 and was not in the list. ``READY`` is ready,
-        ``FAILED`` is missing-with-detail, everything else waits. An unrecognised status read as
-        building costs one poll; read as ready it ships a silent failure, where search returns zero
-        documents and the user reads it as the agent forgetting. The server documents no full list."""
+        """Only the two terminal statuses are named, and everything else waits, because the server's full
+        status vocabulary is not pinned down: ``PENDING``, for one, occurs on 8.3.8. ``READY`` is ready,
+        ``FAILED`` is missing-with-detail. An unrecognised status read as building costs one poll; read
+        as ready, search returns zero documents and the user reads it as the agent forgetting."""
         collection: Any = FakeAsyncCollection(search_states=search_states("vector_index", status, "READY"))
 
         await _indexes.ensure(
@@ -1219,10 +1213,10 @@ class TestSearchIndexesAgainstAFake:
         assert collection.created_search_indexes == []
 
     async def test_a_failed_build_raises_with_the_failure_detail(self) -> None:
-        """AT-062a's sibling, and the one branch Atlas local would not produce. Reported rather than
-        recreated: an identical definition is accepted while a build is failed and does not restart it,
-        so a create here would wait out the whole timeout to learn what the status already said. The
-        remedy needs a drop, and dropping an index is not ours to do."""
+        """AT-062a's sibling: a failed build raises with its detail, a branch Atlas local does not
+        produce. Reported rather than recreated: an identical definition is accepted while a build is
+        failed and does not restart it, so a create here would wait out the whole timeout to learn what
+        the status already said. The remedy needs a drop, and dropping an index is not ours to do."""
         from strands.types.exceptions import StorageError
 
         states: dict[str, Sequence[list[dict[str, Any]]]] = {
@@ -1262,7 +1256,7 @@ class TestSearchIndexesAgainstAFake:
         a status that will not change.
 
         Which is why the call is ``bounded``: this test's name is a claim about *not* waiting, and
-        without a bound the version that waits still fails, two minutes later, on the default timeout.
+        without a bound the version that waits still fails, five minutes later, on the default timeout.
         """
         from strands.types.exceptions import StorageError
 
@@ -1334,7 +1328,7 @@ class TestSearchIndexesAgainstAFake:
         assert "'auto'" in message
 
     async def test_a_present_index_with_a_different_definition_raises(self) -> None:
-        """Measured: re-issuing a *different* definition under an existing name is code 68, *"already
+        """Re-issuing a *different* definition under an existing name is code 68, *"already
         exists with a different definition. Drop it first if needed."* That, and not the fact that
         re-creation fails, is what makes the reference's list-then-bail pattern worth keeping."""
         from strands.types.exceptions import StorageError
@@ -1366,7 +1360,7 @@ class TestSearchIndexesAgainstAFake:
         assert collection.created_search_indexes == []
 
     async def test_the_definition_mongot_rewrites_for_a_text_index_is_still_a_match(self) -> None:
-        """AT-069 / REQ-E-069, and the finding the whole requirement exists for.
+        """AT-069 — the definition mongot reports back for a text index still matches what was declared.
 
         The reported shape below is copied from mongot 8.3.8 rather than constructed: it collapses the
         one-element list we sent into the object it held and fills in three defaults nobody asked for.
@@ -1426,9 +1420,9 @@ class TestSearchIndexesAgainstAFake:
             await _indexes.ensure(collection, search=[spec], create=True, interval=0)
 
     async def test_a_missing_filter_path_is_a_mismatch(self) -> None:
-        """``REQ-E-071`` through the verify path. An index that never declared ``store_name`` filterable
-        returns *unfiltered* results for a query that filters on it, which on the memory
-        collection is another customer's memories. Present-but-underdeclared is the dangerous state."""
+        """The filter-path declaration, checked on the verify path. The server rejects a query that
+        filters on an undeclared path (code 8), so an index that never declared ``store_name`` filterable
+        fails every query this package issues. Refusing it at ``initialize()`` names the cause."""
         from strands.types.exceptions import StorageError
 
         spec = _indexes.memory_search_specs({"database": "d"})[0]
@@ -1508,7 +1502,8 @@ class TestSearchIndexesAgainstAFake:
 
     async def test_a_build_that_never_finishes_times_out_naming_the_last_status(self) -> None:
         """300 seconds of silence followed by a bare timeout tells the reader nothing. The status is
-        the actionable part: ``BUILDING`` at timeout is a slow build, and anything else is unexpected.
+        the actionable part: ``BUILDING`` at timeout is a slow build, and anything else is a status this
+        package does not recognise.
 
         The call goes through ``bounded`` for the reason recorded there: this is one of the two tests
         whose termination would otherwise depend on the deadline check it is testing.
@@ -1533,24 +1528,22 @@ class TestSearchIndexesAgainstAFake:
         assert "vector_index" in message
 
     async def test_the_default_timeout_is_measured_and_the_interval_matches_the_reference(self) -> None:
-        """AT-125 / ``REQ-E-123``. The interval is inherited; the budget is not, any more.
+        """AT-125 — the default readiness timeout is 300 seconds, and the poll interval is the reference's.
 
-        ``pymongo_search_utils`` polls with ``TIMEOUT = 120`` and ``INTERVAL = 0.5``, and reimplementing
-        those helpers against ``AsyncCollection`` (``REQ-E-066``) was never a reason to change how long a
-        caller waits. Two measurements against cloud Atlas are: 104.7s for two index builds on an idle
-        ``strands-dev`` on 2026-09-02, and a 120s timeout on one build on the same cluster with the
-        three-tier suite's collections beside it on 2026-09-15. 120 sits inside the observed range, which
-        is the one place a budget must not sit.
+        ``pymongo_search_utils`` polls with ``TIMEOUT = 120`` and ``INTERVAL = 0.5``. On cloud Atlas, two
+        index builds on an idle cluster take about 105 seconds, and one build on a cluster carrying other
+        collections has run past 120. That puts 120 inside the observed range, the one place a budget must
+        not sit, so the timeout is longer.
 
-        The interval is untouched. Raising a ceiling changes when a failure arrives and not when a
+        The interval is the reference's. Raising a ceiling changes when a failure arrives and not when a
         success does, and the poll frequency is what decides the latter.
         """
         assert _indexes.READY_TIMEOUT_SECONDS == 300
         assert _indexes.POLL_INTERVAL_SECONDS == 0.5
 
     async def test_polling_yields_to_the_event_loop_between_reads(self) -> None:
-        """``REQ-E-066``'s actual point. The reference helpers use a blocking ``time.sleep``, which in
-        an async agent stalls every other coroutine on the loop for up to two minutes."""
+        """Polling never blocks the event loop. The reference helpers use a blocking ``time.sleep``, which
+        in an async agent stalls every other coroutine on the loop for the whole wait."""
         collection: Any = FakeAsyncCollection(
             search_states=search_states("vector_index", "BUILDING", "BUILDING", "READY")
         )
@@ -1576,7 +1569,7 @@ class TestSearchIndexesAgainstAFake:
         assert ticks > 0
 
     async def test_a_read_against_a_collection_that_does_not_exist_reads_as_absent(self) -> None:
-        """The other half of ``REQ-E-068``'s asymmetry, on the read rather than the write.
+        """The other half of the missing-namespace asymmetry, on the read rather than the write.
 
         pymongo normalises code 26 for ordinary indexes itself: ``list_indexes`` passes
         ``allowable_errors=[26]``, so ``index_information()`` on a missing collection answers ``{}``.
@@ -1667,9 +1660,9 @@ class TestSearchIndexesAgainstAFake:
         assert collection.created_search_indexes == []
 
     async def test_an_object_reported_where_one_was_declared_is_a_mismatch(self) -> None:
-        """``REQ-E-069``'s comparison walks nested objects, so it has to answer for a reported value of
+        """The definition comparison walks nested objects, so it has to answer for a reported value of
         the wrong *kind* as well as the wrong value. Reachable in practice: mongot rewrites ``search``
-        definitions, as measured, so a future rewrite could flatten ``mappings`` into something that is not
+        definitions, so a future rewrite could flatten ``mappings`` into something that is not
         an object, and the comparison must say so rather than raise ``AttributeError``."""
         from strands.types.exceptions import StorageError
 
@@ -1715,33 +1708,29 @@ class TestSearchIndexesAgainstAFake:
 
 
 class TestReadinessIsAboutTheDefinitionAndNotOnlyTheStatus:
-    """AT-180 / ``REQ-E-175`` — the poll loop watched a name where it needed to watch a definition.
+    """AT-180 — an index that reports READY is checked against the declared definition, not only its status.
 
     ``_ensure_search`` checks each existing index's definition on its cold read, then hands whatever is
-    still building to ``_wait_until_ready``, which read ``status`` and nothing else. A production-readiness
-    review found that gap. Two ways through it, both measured against this fake before the recheck existed
-    and refused after it:
+    still building to ``_wait_until_ready``. Reading ``status`` alone there would accept two cases:
 
     * an index found BUILDING with a covering definition, dropped and recreated by another actor while
       this loop polls, reporting READY with a definition that no longer covers this package's. A search
-      index cannot be redefined in place, which is what the cold-path message says, but drop-and-recreate
-      is exactly the remedy that message *prints* -- so the racing actor is as likely to be an operator
-      following this package's own instructions as anything else;
-    * an index this package created itself one call earlier, whose build was never compared with what was
-      asked for at all. The cold read found nothing, so ``_ensure_search`` had no document to check, and
-      the only later document went to a branch that looked at ``status``.
+      index cannot be redefined in place, but drop-and-recreate is exactly the remedy the cold-path
+      message prints, so the other actor is as likely to be an operator following this package's own
+      instructions as anything else;
+    * an index this package created itself one call earlier. The cold read found nothing, so
+      ``_ensure_search`` had no document to check, and the only later document is the one the poll reads.
 
-    Accepting either is a silent empty result with its loudest symptom removed: every index reports READY,
-    ``initialize()`` returns, and searches quietly return nothing or the wrong thing. The cost of closing
-    it is one containment check over a document already in hand.
+    Accepting either would be a silent empty result: every index reports READY, ``initialize()`` returns,
+    and searches return nothing or the wrong thing. The recheck is one containment check over a document
+    already in hand.
 
-    No contract sibling is added, because two already cover the risk the recheck introduces. The recheck's
-    only way to be *wrong* is to be over-strict about what a real mongot reports back, and
+    There is no contract-tier sibling, because two Atlas tests already cover the recheck's only way to be
+    wrong, which is being over-strict about what a real mongot reports back.
     ``test_the_vector_definition_the_server_reports_back_is_the_one_we_sent`` and
     ``test_the_text_definition_is_covered_whether_or_not_the_server_rewrites_it`` both run ``ensure`` with
-    ``create=True`` against Atlas over a fresh collection -- which is to say both now poll a real build to
-    READY through this branch, and both fail if the containment rule stops covering the rewrite mongot 8.3.8
-    performs.
+    ``create=True`` over a fresh collection, so both poll a real build to READY through this branch, and
+    both fail if the containment rule stops covering the rewrite mongot 8.3.8 performs.
     """
 
     DRIFTED: Final[dict[str, Any]] = {
@@ -1751,8 +1740,7 @@ class TestReadinessIsAboutTheDefinitionAndNotOnlyTheStatus:
 
     Not an arbitrary edit. A cheaper model is the single most plausible thing somebody changes by hand,
     and dropping ``filter`` on ``scope`` is the change that makes ``$vectorSearch`` refuse the scope term
-    ``_filter.compose`` pins on every read -- which is to say the drift that matters is the drift that
-    silently un-scopes the store.
+    ``_filter.compose`` pins on every read.
     """
 
     @staticmethod
@@ -1761,7 +1749,7 @@ class TestReadinessIsAboutTheDefinitionAndNotOnlyTheStatus:
         return _indexes.memory_search_specs({"database": "d"})[0]
 
     async def test_a_definition_that_drifts_during_the_build_is_refused_when_it_reports_ready(self) -> None:
-        """The reviewer's case. Covering on the read before the poll, not covering on the read that ends it."""
+        """The definition covers on the read before the poll and does not cover on the read that ends it."""
         from strands.types.exceptions import StorageError
 
         spec = self._spec()
@@ -1783,8 +1771,8 @@ class TestReadinessIsAboutTheDefinitionAndNotOnlyTheStatus:
         """The second way in, and the one that needs no other actor at all.
 
         Absent on the cold read, so ``_ensure_search`` creates it and appends it to ``waiting`` with no
-        document to check. Everything known about that index afterwards arrives through the poll. Before
-        the recheck, nothing compared it with the model that was sent.
+        document to check. Everything known about that index afterwards arrives through the poll, so the
+        recheck is what compares it with the model that was sent.
         """
         from strands.types.exceptions import StorageError
 
@@ -1826,7 +1814,7 @@ class TestReadinessIsAboutTheDefinitionAndNotOnlyTheStatus:
 
     async def test_a_build_whose_definition_still_covers_is_accepted(self) -> None:
         """The vacuity guard. A recheck that refused every polled index would pass all three tests above
-        and make every asynchronous build unusable, which is most of what ``REQ-E-062`` is for."""
+        and make every asynchronous build unusable, which is most of what readiness polling is for."""
         spec = self._spec()
         collection: Any = FakeAsyncCollection(
             search_states=search_states(spec.name, "BUILDING", "READY", definition=spec.definition)
@@ -1839,8 +1827,8 @@ class TestReadinessIsAboutTheDefinitionAndNotOnlyTheStatus:
 
         mongot 8.3.8 sends it on every read, so this is a shape the fake produces more readily than a
         deployment does. It is still the right default: the alternative is a recheck that turns a field
-        this package does not control into a hard failure at the end of a 300 second build. ``REQ-E-069``
-        already made that choice for the cold path; the recheck inherits it rather than deciding again.
+        this package does not control into a hard failure at the end of a 300 second build. The cold-path
+        definition check makes the same choice, and the recheck inherits it rather than deciding again.
         """
         spec = self._spec()
         collection: Any = FakeAsyncCollection(search_states=search_states(spec.name, "BUILDING", "READY"))
@@ -1848,13 +1836,13 @@ class TestReadinessIsAboutTheDefinitionAndNotOnlyTheStatus:
         await _indexes.ensure(collection, search=[spec], create=False, interval=0)
 
     async def test_the_recheck_reads_nothing_the_poll_was_not_already_reading(self) -> None:
-        """The cost claim, asserted rather than asserted-in-a-comment.
+        """The recheck costs no extra reads.
 
         A recheck implemented as its own ``list_search_indexes`` would double the reads on every poll of
-        every build -- 1200 aggregations over a 300 second one. The document is already in hand from the
+        every build, to 1200 aggregations over a 300 second one. The document is already in hand from the
         status read, so the count is the count the loop had before: one per read of the index, and this
         script needs two of them. The cold read in ``_ensure_search`` finds BUILDING and the first poll
-        finds READY, which is also why the definition has to be rechecked at all -- the loop's own reads
+        finds READY, which is also why the definition has to be rechecked at all: the loop's own reads
         are the only ones that ever see the finished build.
         """
         spec = self._spec()
@@ -1864,8 +1852,8 @@ class TestReadinessIsAboutTheDefinitionAndNotOnlyTheStatus:
 
         await _indexes.ensure(collection, search=[spec], create=False, interval=0)
 
-        # The cold read consumes BUILDING, the first poll consumes READY. Measured, not predicted: the
-        # count is 2 and not 3, because `_ensure_search`'s read is one of the two rather than an extra one.
+        # The cold read consumes BUILDING, the first poll consumes READY. The count is 2 and not 3,
+        # because `_ensure_search`'s read is one of the two rather than an extra one.
         assert collection._search_reads[spec.name] == 2
 
     async def test_one_drifted_index_beside_one_clean_one_names_the_drifted_one(self) -> None:
@@ -1891,17 +1879,14 @@ class TestReadinessIsAboutTheDefinitionAndNotOnlyTheStatus:
 
 
 class TestTheCapabilityProbeAgainstAFake:
-    """AT-053d / ``REQ-E-053a`` — the three server codes that mean "this deployment has no Atlas Search".
+    """AT-053d — the three server codes that mean "this deployment has no Atlas Search".
 
-    Added after the probe was found to accept one code and raise on the other two. Until then
-    every assertion about it lived in the contract tier, so it was exercised against one deployment per
-    run and never against two in the same run, which is how a constant measured on `mongo:8` came to be
-    treated as the condition itself. These run against a fake, so all three codes and one unrecognised
-    code are driven through the probe in a run that needs no deployment at all.
+    Each deployment answers with one of the three, so the contract tier, which sees one deployment per
+    run, cannot show that the probe accepts all of them. These run against a fake, so all three codes and
+    one unrecognised code are driven through the probe in a run that needs no deployment at all.
 
-    The codes and the four deployments they were measured on are in `REQ-E-053a`. What each test below
-    asserts is the branch, not the number: `False` and the code for a deployment without search, `True`
-    for one with it, and `StorageError` for anything the set does not name.
+    What each test below asserts is the branch, not the number: `False` and the code for a deployment
+    without search, `True` for one with it, and `StorageError` for anything the set does not name.
     """
 
     async def test_a_deployment_that_lists_its_search_indexes_supports_search(self) -> None:
@@ -1918,7 +1903,7 @@ class TestTheCapabilityProbeAgainstAFake:
         """All three, because the deployment that answers 115 is as real as the one that answers 31082.
 
         The code comes back rather than being discarded, so the warning `initialize()` logs can name the
-        one in the operator's own log instead of the one this package happened to measure first.
+        one in the operator's own log instead of a fixed one.
         """
         collection: Any = FakeAsyncCollection()
         collection.list_search_indexes = raiser(operation_failure(code, "no search here"))
@@ -1981,13 +1966,12 @@ class TestTheCapabilityProbeAgainstAFake:
 
 
 class TestTheRankFusionProbeAgainstAFake:
-    """AT-145 / ``REQ-E-143`` — whether the deployment can run ``$rankFusion``, from its own version.
+    """AT-145 — whether the deployment can run ``$rankFusion``, from its own version.
 
     The opposite shape from the probe above, deliberately. ``search_support`` must be a *call* because
-    Atlas Search is mongot, a separate process no version number predicts -- this module records the
-    four measured deployments that prove it, including a 7.0.12 reporting ``modules: ['enterprise']``
-    with no search. ``$rankFusion`` is an aggregation stage inside ``mongod`` itself, so ``mongod``'s
-    own version is not merely adequate for it but authoritative.
+    Atlas Search is mongot, a separate process no version number predicts: a 7.0.12 deployment can report
+    ``modules: ['enterprise']`` and have no search. ``$rankFusion`` is an aggregation stage inside
+    ``mongod`` itself, so ``mongod``'s own version is not merely adequate for it but authoritative.
 
     ``versionArray`` rather than a parse of ``version``: the server computes the former as integers,
     and the latter is a string carrying things like ``"8.0.23-rc1"`` whose parsing this package would
@@ -2009,8 +1993,8 @@ class TestTheRankFusionProbeAgainstAFake:
         """8.0 is the floor, not 8.1. The MongoDB 8.0 manual states it in the stage's own compatibility
         note and permits ``$vectorSearch`` in an input pipeline, with a worked example.
 
-        8.0.23 is called out among these because it is what the target deployments report, and a floor
-        one minor version too high would have deferred this tier for a reason that does not exist.
+        8.0.23 is among these because it is what the target deployments report, and a floor one minor
+        version too high would turn the hybrid tier off there for no reason.
         """
         collection: Any = FakeAsyncCollection(database=FakeAsyncDatabase(version_array=version_array))
 
@@ -2060,11 +2044,10 @@ class TestTheRankFusionProbeAgainstAFake:
 
 
 class TestTheFakesMatchTheDriver:
-    """MP-001, MP-002 — the parity contract for both fakes in this file.
+    """The parity contract for both fakes in this file: awaitable where the driver is, iterable as it is.
 
-    This is the structural fix for the unawaited-coroutine class of bug: a fake that returns a value
-    where the driver returns a coroutine passes every test above and fails on first real traffic. The
-    check is mechanical on purpose, so it keeps holding as the module grows.
+    A fake that returns a value where the driver returns a coroutine passes every test above and fails on
+    first real traffic. The check is mechanical on purpose, so it keeps holding as the module grows.
     """
 
     # Every driver method this module calls, and the arguments it calls them with.
@@ -2081,7 +2064,7 @@ class TestTheFakesMatchTheDriver:
     def test_every_method_the_module_calls_is_a_coroutine_function_on_the_real_class(
         self, owner: str, method: str, args: tuple[Any, ...], kwargs: dict[str, Any]
     ) -> None:
-        """MP-001. ``async def`` on the fake is worth nothing unless it is ``async def`` upstream."""
+        """``async def`` on the fake is worth nothing unless it is ``async def`` upstream."""
         real = getattr(self._driver_class(owner), method)
 
         assert inspect.iscoroutinefunction(real), f"{owner}.{method} is not a coroutine function"
@@ -2106,20 +2089,20 @@ class TestTheFakesMatchTheDriver:
 
     def test_the_fake_collection_raises_for_an_unknown_attribute(self) -> None:
         """The real ``AsyncCollection.__getattr__`` resolves any unknown name to a sub-collection, so
-        ``getattr(collection, "typo")`` is truthy and never raises. That trap has already cost this
-        project twice. The fake is stricter than the driver here, deliberately: a typo in the module
-        under test fails in the unit tier rather than at 3am."""
+        ``getattr(collection, "typo")`` is truthy and never raises. The fake is stricter than the driver
+        here, deliberately: a typo in the module under test fails in the unit tier rather than on a
+        deployment."""
         with pytest.raises(AttributeError):
             FakeAsyncCollection().definitely_not_a_method  # type: ignore[attr-defined]  # noqa: B018
 
     def test_the_fake_cursor_is_async_iterable(self) -> None:
-        """MP-002."""
+        """The fake cursor is async-iterable, as the driver's is."""
         cursor = FakeSearchIndexCursor([{"name": "n", "status": "READY"}])
 
         assert hasattr(cursor, "__aiter__")
 
     def test_the_fake_cursor_is_not_synchronously_iterable(self) -> None:
-        """MP-002, and the half that matters. ``AsyncCommandCursor`` has no ``__iter__``, measured on
+        """The half that matters. ``AsyncCommandCursor`` has no ``__iter__``, measured on
         pymongo 4.17.0, so a fake that grew one would let ``for index in cursor`` pass here."""
         assert not hasattr(FakeSearchIndexCursor([]), "__iter__")
 
@@ -2149,17 +2132,15 @@ class TestTheFakesMatchTheDriver:
 
 @pytest.mark.contract
 class TestACollatedIndexAgainstARealDeployment:
-    """AT-193 / ``REQ-E-187`` — a real server over the wire. The premise, and what the refusal is refusing.
+    """AT-193 — against a real server: the premises of the collation refusal, and what it refuses.
 
-    Two things were assumptions when the finding arrived, and both are asserted here rather than
-    reasoned about: that ``index_information`` reports an index's own collation at all -- without which
-    the rule is unimplementable client-side and would need a round trip nobody has -- and that a folded
-    unique index does to the dedup rule what the refusal says it does.
+    Two premises are asserted here: that ``index_information`` reports an index's own collation at all,
+    without which the rule could not be checked client-side, and that a folded unique index does to the
+    dedup rule what the refusal says it does.
 
-    Measured from 7.0.12 while writing it. The collision is the whole finding: the second insert of a
-    key differing only in case is an ``E11000`` against an index that *should* hold both, and the binary
-    query that would find the existing one cannot use a collated index, so the caller is told the record
-    is already there and no later read can produce it.
+    On 7.0.12 the second insert of a key differing only in case is an ``E11000`` against an index that
+    *should* hold both, and the binary query that would find the existing one cannot use a collated
+    index, so the caller is told the record is already there and no later read can produce it.
     """
 
     FOLDING: Final[dict[str, Any]] = {"locale": "en", "strength": 2}
@@ -2195,7 +2176,7 @@ class TestACollatedIndexAgainstARealDeployment:
     async def test_ensure_refuses_the_folded_index_and_creates_nothing(
         self, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """The finding end to end: a real index the server built, and a refusal before any write."""
+        """End to end: a real index the server built, and a refusal before any write."""
         from pymongo import IndexModel
         from strands.types.exceptions import StorageError
 
@@ -2218,8 +2199,8 @@ class TestACollatedIndexAgainstARealDeployment:
         """What the refusal is refusing, in the driver rather than in a paragraph.
 
         The unique index is what stops a memory being stored twice. Built this way it also stops a
-        different memory being stored once, and the query that would have found the first one -- the
-        binary equality the package issues -- cannot use the index that rejected the second.
+        different memory being stored once, and the query that would have found the first one, the
+        binary equality the package issues, cannot use the index that rejected the second.
         """
         from pymongo import IndexModel
         from pymongo.errors import DuplicateKeyError
@@ -2243,7 +2224,7 @@ class TestACollatedIndexAgainstARealDeployment:
 class TestOrdinaryIndexesAgainstARealDeployment:
     """AT-060, AT-061, AT-063, AT-064 — the same branches, against a server that answers for itself.
 
-    The fake above encodes what was measured. These tests are what stop that encoding
+    The fake above encodes measured server behaviour. These tests are what stop that encoding
     from drifting away from the server: they assert outcomes rather than error codes, so a server
     upgrade that renumbers a conflict fails here rather than in production.
     """
@@ -2251,8 +2232,9 @@ class TestOrdinaryIndexesAgainstARealDeployment:
     async def test_ensure_creates_every_declared_index(
         self, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """AT-060 / REQ-E-060. Also shows ``createIndexes`` creating the collection implicitly: nothing
-        creates ``unique_collection_name`` first, and the search path is the only one that has to."""
+        """AT-060 — every declared index is created. Also shows ``createIndexes`` creating the
+        collection implicitly: nothing creates ``unique_collection_name`` first, and the search path is
+        the only one that has to."""
         collection = contract_database[unique_collection_name]
 
         await _indexes.ensure(collection, ordinary=_indexes.memory_specs(), create=True)
@@ -2276,7 +2258,7 @@ class TestOrdinaryIndexesAgainstARealDeployment:
     async def test_an_index_under_a_foreign_name_with_our_options_is_accepted(
         self, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """AT-063 / REQ-E-063, the positive half. Someone else's naming convention is not a reason to
+        """AT-063 — the positive half. Someone else's naming convention is not a reason to
         fail, and it is not a reason to try creating a second index over the same keys either."""
         from pymongo import IndexModel
 
@@ -2307,8 +2289,8 @@ class TestOrdinaryIndexesAgainstARealDeployment:
     async def test_an_index_missing_the_option_it_exists_for_is_reported(
         self, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """AT-063 / REQ-E-063, the half that changed the requirement. A plain compound index over the
-        dedup keys is what a well-meaning application developer adds for query performance, and it
+        """AT-063 — an index missing the option it exists for is reported. A plain compound index over
+        the dedup keys is what a well-meaning application developer adds for query performance, and it
         satisfies a key-list check exactly while stopping no duplicates."""
         from pymongo import IndexModel
         from strands.types.exceptions import StorageError
@@ -2326,8 +2308,9 @@ class TestOrdinaryIndexesAgainstARealDeployment:
     async def test_a_ttl_index_with_a_different_expiry_is_reported(
         self, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """AT-064 / REQ-E-064. The server rejects the re-creation too, with code 85 under either name.
-        This asserts the package names the reason before the server gets a chance to."""
+        """AT-064 — a TTL index with a different expiry is reported. The server rejects the re-creation
+        too, with code 85 under either name. This asserts the package names the reason before the server
+        gets a chance to."""
         from pymongo import IndexModel
         from strands.types.exceptions import StorageError
 
@@ -2341,8 +2324,9 @@ class TestOrdinaryIndexesAgainstARealDeployment:
     async def test_verify_only_creates_nothing_on_a_real_deployment(
         self, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """AT-061 / REQ-E-061. The collection is not created either, which matters: a verify-only run
-        is what a caller without DDL rights does, and it must not need any."""
+        """AT-061 — verify-only mode creates nothing on a real deployment. The collection is not created
+        either, which matters: a verify-only run is what a caller without DDL rights does, and it must not
+        need any."""
         from strands.types.exceptions import StorageError
 
         collection = contract_database[unique_collection_name]
@@ -2357,9 +2341,9 @@ class TestOrdinaryIndexesAgainstARealDeployment:
     async def test_the_commands_in_the_verify_only_error_actually_create_the_indexes(
         self, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """The point of ``REQ-E-061`` is that somebody runs what the message says.
+        """The commands in a verify-only error are meant to be run, so this test runs them.
 
-        So the test runs it. Every ``db.runCommand({...})`` is parsed straight out of the error text and
+        Every ``db.runCommand({...})`` is parsed straight out of the error text and
         executed against the deployment, and then the same verify that produced the message has to pass.
         A command that is merely well formed and does not produce the index the next verify wants is
         worse than no command at all: the operator runs it, the caller still fails, and neither of them
@@ -2388,14 +2372,13 @@ class TestOrdinaryIndexesAgainstARealDeployment:
         """AT-060's "tolerate a concurrent creator", and the index half of AT-065.
 
         No lock here, which is stronger than the locked version: this is the check-then-create window
-        left wide open, and it is benign. Measured directly first (10 concurrent identical
-        ``create_indexes`` calls: zero failures, one index), so the requirement is satisfied by the
-        server's own idempotency rather than by an ``except`` clause. Recorded because the alternative
-        reading is dangerous: swallowing the conflict codes to tolerate a racer would also swallow the
-        genuine option mismatch two tests up.
+        left wide open, and it is benign. Ten concurrent identical ``create_indexes`` calls produce zero
+        failures and one index, so tolerating a concurrent creator rests on the server's own idempotency
+        rather than on an ``except`` clause. That matters because the alternative is dangerous:
+        swallowing the conflict codes to tolerate a racer would also swallow the genuine option mismatch
+        two tests up.
 
-        ``initialize()`` belongs to the memory store, so the client half of AT-065 lands there, the way
-        AT-014 was completed in two places.
+        The ``initialize()`` half is ``TestTenStoresShareOneSetup`` in ``test_memory_store.py``.
         """
         collection = contract_database[unique_collection_name]
         specs = _indexes.memory_specs()
@@ -2412,7 +2395,7 @@ class TestOrdinaryIndexesAgainstARealDeployment:
     async def test_the_fake_and_the_driver_report_index_information_the_same_way(
         self, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """MP-001's behavioural half. The unit tier's ``existing()`` helper hard-codes a shape; this is
+        """The collection fake's behavioural check. The unit tier's ``existing()`` helper hard-codes a shape; this is
         the test that fails if the driver ever reports ``key`` as something other than a list of
         tuples, or drops the ``v`` the comparison has to ignore."""
         collection = contract_database[unique_collection_name]
@@ -2429,8 +2412,8 @@ class TestOrdinaryIndexesAgainstARealDeployment:
         assert type(real["key"]) is type(mocked["key"])
 
 
-# The manual-vector mode, which is the primary tested vector path because an `autoEmbed`
-# index is rejected at creation on every deployment CI can reach. Four dimensions because nothing here
+# The manual-vector mode, which the Atlas tier tests because an `autoEmbed` index is rejected at creation
+# on deployments without automated embedding, Atlas local among them. Four dimensions because nothing here
 # reads the vectors; the index only has to be real.
 MANUAL_VECTOR_CONFIG: MongoDBConfig = {
     "database": "unused",
@@ -2442,12 +2425,11 @@ MANUAL_VECTOR_CONFIG: MongoDBConfig = {
 def _reported_version(index: Mapping[str, Any]) -> int:
     """The definition version from a ``$listSearchIndexes`` document, under whichever key carries it.
 
-    The two deployments differ in the key *and* in the value shape, which the first version of this
-    helper got half right. An Atlas CLI local deployment sends ``latestVersion`` as a bare integer. Cloud
-    Atlas 8.0.30 sends ``latestDefinitionVersion`` as a subdocument,
-    ``{"createdAt": datetime(...), "version": 0}``, and neither sends the other's key.
-    Reading either one directly is a ``KeyError`` on the other cluster, and
-    reading the cloud one as a number is the ``TypeError`` that closed the 2026-09-01 run.
+    The two deployments differ in the key *and* in the value shape. An Atlas CLI local deployment sends
+    ``latestVersion`` as a bare integer. Cloud Atlas 8.0.30 sends ``latestDefinitionVersion`` as a
+    subdocument, ``{"createdAt": datetime(...), "version": 0}``, and neither sends the other's key.
+    Reading either one directly is a ``KeyError`` on the other cluster, and reading the cloud one as a
+    number is a ``TypeError``.
 
     Args:
         index: One document from ``list_search_indexes()``.
@@ -2490,7 +2472,7 @@ class TestSearchIndexesAgainstAtlas:
     async def test_createsearchindexes_needs_the_collection_to_exist(
         self, atlas_database: Any, unique_collection_name: str
     ) -> None:
-        """AT-068 / REQ-E-068, the half that makes the ordering load bearing rather than decorative.
+        """AT-068 — ``createSearchIndexes`` fails on a missing namespace, which is why the collection comes first.
 
         Issued as a raw driver call against a namespace nothing has created. ``createIndexes`` in the
         same position creates the collection implicitly, which is why this asymmetry is easy to miss and
@@ -2539,7 +2521,7 @@ class TestSearchIndexesAgainstAtlas:
     async def test_verify_only_reports_a_missing_search_index_with_its_command(
         self, atlas_database: Any, unique_collection_name: str
     ) -> None:
-        """AT-062a / REQ-E-061, REQ-E-062. *Missing* is the state whose remedy is to create, so the
+        """AT-062a — *Missing* is the state whose remedy is to create, so the
         message carries the creation command and the collection is left untouched."""
         from strands.types.exceptions import StorageError
 
@@ -2558,11 +2540,11 @@ class TestSearchIndexesAgainstAtlas:
     ) -> None:
         """AT-062b, the one that needs care: catching an index mid-build is a race.
 
-        Locally ``READY`` arrives in about 0.25s, and polling immediately after ``create_search_index``
-        reliably observes a non-ready status. Reliably is not always, so the whole scenario retries
-        three times on a fresh collection and then **skips with a reason** rather than failing. A flaky
-        assertion about a race teaches the reader to rerun the suite until it is green, which is worse
-        than an honest skip.
+        On an Atlas local deployment ``READY`` arrives within a fraction of a second, and polling
+        immediately after ``create_search_index`` reliably observes a non-ready status. Reliably is not
+        always, so the whole scenario retries three times on a fresh collection and then **skips with a
+        reason** rather than failing. A flaky assertion about a race teaches the reader to rerun the suite
+        until it is green, which is worse than a skip that says why.
         """
         for attempt in range(3):
             collection = atlas_database[f"{unique_collection_name}_{attempt}"]
@@ -2572,7 +2554,7 @@ class TestSearchIndexesAgainstAtlas:
 
             observed = [index["status"] async for index in await collection.list_search_indexes(spec.name)]
             if observed and observed[0] != "READY":
-                # The state the requirement is about, reached on a real deployment. The package must
+                # The building state, reached on a real deployment. The package must
                 # wait it out rather than reporting it as missing or as ready.
                 assert _indexes.readiness(observed[0]) == "building"
                 await _indexes.ensure(collection, search=[spec], create=False)
@@ -2586,10 +2568,10 @@ class TestSearchIndexesAgainstAtlas:
     async def test_polling_a_real_build_leaves_the_event_loop_running(
         self, atlas_database: Any, unique_collection_name: str
     ) -> None:
-        """AT-066 / REQ-E-066. The reference helpers poll with a blocking ``time.sleep``, which in an
-        agent process stalls every other coroutine on the loop for as long as the build takes. Asserted
-        against a real build rather than a programmed one, because the interval that matters is the one
-        the module chose and not the ``0`` the unit tier passes."""
+        """AT-066 — polling a real build leaves the event loop running. The reference helpers poll with
+        a blocking ``time.sleep``, which in an agent process stalls every other coroutine on the loop for
+        as long as the build takes. Asserted against a real build rather than a programmed one, because
+        the interval that matters is the one the module chose and not the ``0`` the unit tier passes."""
         collection = atlas_database[unique_collection_name]
         specs = _indexes.memory_search_specs(MANUAL_VECTOR_CONFIG)
         ticks = 0
@@ -2611,7 +2593,7 @@ class TestSearchIndexesAgainstAtlas:
     async def test_the_real_cursor_yields_the_keys_the_fake_promises(
         self, atlas_database: Any, unique_collection_name: str
     ) -> None:
-        """MP-002's behavioural half. The unit tier reads ``name``, ``status``, ``latestDefinition`` and
+        """The cursor fake's behavioural check. The unit tier reads ``name``, ``status``, ``latestDefinition`` and
         ``statusDetail`` off programmed dicts; this is what fails if the server stops sending them."""
         collection = atlas_database[unique_collection_name]
         specs = _indexes.memory_search_specs(MANUAL_VECTOR_CONFIG)
@@ -2643,14 +2625,12 @@ class TestSearchIndexesAgainstAtlas:
     async def test_the_text_definition_is_covered_whether_or_not_the_server_rewrites_it(
         self, atlas_database: Any, unique_collection_name: str
     ) -> None:
-        """The other half, and the reason ``REQ-E-069`` exists.
+        """The other half: a text definition may come back rewritten, so the comparison is containment.
 
-        This test began as one equality assertion over ``specs[0]`` and passed. The same assertion over
-        ``specs[1]`` failed on mongot 8.3.8, which collapses the one-element list into the object it held
-        and adds ``indexOptions``, ``store`` and ``norms``. Atlas 8.0.30 returns the same definition
-        verbatim, so the rewrite is a property of the deployment rather than of the index type,
-        and equality would pass on one cluster and fail on the other for
-        identical package code.
+        mongot 8.3.8 collapses the one-element list into the object it held and adds ``indexOptions``,
+        ``store`` and ``norms``. Atlas 8.0.30 returns the same definition verbatim, so the rewrite is a
+        property of the deployment rather than of the index type, and equality would pass on one cluster
+        and fail on the other for identical package code.
 
         Containment is therefore asserted unconditionally, because it is what ``ensure`` rests on. The
         rewrite is asserted in the branch where it happens, naming the three keys mongot adds, so a
@@ -2674,18 +2654,18 @@ class TestSearchIndexesAgainstAtlas:
 
 
 class TestEveryCallSitePassesTheConfiguredBudget:
-    """AT-126 / ``REQ-E-122`` — the completeness half, which no behavioural test can express.
+    """AT-126 — every ``_indexes.ensure`` call site passes the configured timeout, a completeness claim.
 
     ``test_storage.py`` and ``test_memory_store.py`` assert that the call sites they know about carry
-    ``timeout``. Neither can assert that those are *all* of them, and the premortem's row 3 is exactly
-    that failure: a fourth call site added later, defaulting silently to the module constant, so an
-    operator who raised ``index_ready_timeout`` for a shared Atlas project finds one build still giving
-    up at 300 seconds and nothing anywhere saying why.
+    ``timeout``. Neither can assert that those are *all* of them, and the failure that matters is exactly
+    that: a call site added later, defaulting silently to the module constant, so an operator who raised
+    ``index_ready_timeout`` for a shared Atlas project finds one build still giving up at 300 seconds and
+    nothing anywhere saying why.
 
     Source inspection rather than a runtime count, for the same reason ``test_conventions.py`` uses it:
-    a call site that no test reaches is precisely the one this has to see. The check is narrow — it
-    reads the keyword names of every ``_indexes.ensure(...)`` call in the package and nothing about
-    their values — so it stays true through any refactor that keeps the keyword.
+    a call site that no test reaches is precisely the one this has to see. The check is narrow: it reads
+    the keyword names of every ``_indexes.ensure(...)`` call in the package and nothing about their
+    values, so it stays true through any refactor that keeps the keyword.
     """
 
     @staticmethod
@@ -2726,21 +2706,21 @@ class TestEveryCallSitePassesTheConfiguredBudget:
 
         assert not missing, (
             f"these _indexes.ensure call sites pass no timeout=, so index_ready_timeout does not "
-            f"reach them and they wait out the module default instead (REQ-E-122): {missing}"
+            f"reach them and they wait out the module default instead: {missing}"
         )
 
 
 @pytest.mark.contract
 class TestCompetingIndexesAgainstARealDeployment:
-    """AT-196 / ``REQ-E-190`` — a real server over the wire. The premise the fake cannot assert.
+    """AT-196 — against a real server: the premise the fake cannot assert.
 
     Everything in the unit class above rests on one claim about the server: that a second index over the
     same keys under a *different* collation is created rather than refused. If that is wrong, a collection
-    cannot carry two competing indexes and the finding does not exist. The fake is built from that claim,
+    cannot carry two competing indexes and the check has nothing to find. The fake is built from that claim,
     so it cannot test it; this class builds the indexes and asks.
 
-    The remaining tests then show that the constraint the check now looks for is really enforced -- that
-    the folded rule refuses a write the binary index would have accepted, on a deployment where both
+    The remaining tests show that the constraint the check looks for is really enforced: the folded rule
+    refuses a write the binary index would have accepted, on a deployment where both
     indexes are present and the declared one is entirely correct.
     """
 
@@ -2787,8 +2767,8 @@ class TestCompetingIndexesAgainstARealDeployment:
     async def test_ensure_refuses_the_deployment_the_declared_index_is_correct_on(
         self, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """The finding. The declared index is present, correct, and matches every option -- and the
-        deployment is still refused, which is the whole difference from ``REQ-E-187``."""
+        """The declared index is present, correct, and matches every option, and the deployment is still
+        refused, because the folding unique index beside it is enforced too."""
         from strands.types.exceptions import StorageError
 
         collection = contract_database[unique_collection_name]
@@ -2833,17 +2813,17 @@ class TestCompetingIndexesAgainstARealDeployment:
 
 @pytest.mark.contract
 class TestACollatedTtlIndexAgainstARealDeployment:
-    """AT-197 / ``REQ-E-191`` — a real server over the wire. That the refused index worked, measured.
+    """AT-197 — against a real server: a collated TTL index works, and ``ensure`` accepts it.
 
     The exemption rests on a claim about the server: that a non-simple collation on a date-only TTL index
-    changes nothing about expiry. Reasoning gets you there -- a collation orders strings and a BSON date is
-    not one -- but the previous revision's refusal was also reasoned, so this asks instead.
+    changes nothing about expiry. A collation orders strings and a BSON date is not one, and this class
+    asks the server rather than relying on that reasoning.
 
     ``expireAfterSeconds`` is swept by a background task on its own schedule, roughly once a minute, which
     is longer than a test should wait. What is asserted here is what can be asserted promptly: the server
     accepts the index, reports the collation the check reads, and agrees the index is a TTL index. The
-    deletion itself was measured separately against ``mongod`` 7.0.12 -- a document stamped an hour in the
-    past was gone inside ten seconds of the sweep and an ``expires_at: null`` document was left in place.
+    deletion itself was checked separately against ``mongod`` 7.0.12: a document stamped an hour in the
+    past is removed by the sweep and an ``expires_at: null`` document is left in place.
     """
 
     FOLDING: Final[dict[str, Any]] = {"locale": "en", "strength": 2}
@@ -2868,8 +2848,8 @@ class TestACollatedTtlIndexAgainstARealDeployment:
     async def test_the_server_builds_a_collated_ttl_index_at_all(
         self, contract_database: Any, unique_collection_name: str
     ) -> None:
-        """The premise. If the server refused this combination the regression could not arise, and the
-        exemption would be code for a deployment that cannot exist."""
+        """The premise. If the server refused this combination, the exemption would be code for a
+        deployment that cannot exist."""
         collection = contract_database[unique_collection_name]
         spec = await self._collated_ttl(collection)
 
@@ -2879,8 +2859,8 @@ class TestACollatedTtlIndexAgainstARealDeployment:
         assert found.get("expireAfterSeconds") == 0
 
     async def test_ensure_accepts_it(self, contract_database: Any, unique_collection_name: str) -> None:
-        """The regression, against the server rather than the fake: this call raised in the previous
-        revision, which is ``ensure_indexes()`` failing on a deployment that expires documents correctly."""
+        """Against the server rather than the fake: ``ensure`` accepts the collated TTL index, so
+        ``ensure_indexes()`` does not fail on a deployment that expires documents correctly."""
         collection = contract_database[unique_collection_name]
         spec = await self._collated_ttl(collection)
         before = await collection.index_information()
@@ -2893,7 +2873,7 @@ class TestACollatedTtlIndexAgainstARealDeployment:
         self, contract_database: Any, unique_collection_name: str
     ) -> None:
         """The vacuity guard. The exemption is for the date-only index and nothing else, and an exemption
-        that leaked to the specs keying strings would undo ``REQ-E-187`` on a real deployment."""
+        that leaked to the index specs keying strings would undo the dedup collation rule on a real deployment."""
         from pymongo import IndexModel
         from strands.types.exceptions import StorageError
 

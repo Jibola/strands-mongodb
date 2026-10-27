@@ -1,0 +1,23 @@
+---
+title: What every memory write and read goes through
+---
+flowchart LR
+  subgraph write[Write: add]
+    direction LR
+    writable["Writable store?<br/>Otherwise ValueError"]
+    stamp["Stamp scope and store name<br/>Never taken from caller input"]
+    hash["SHA-256 of the content"]
+    seen{"Already stored<br/>in this scope and store?"}
+    insert["Insert<br/>expires_at set when ttl_seconds is set"]
+    noop["No-op<br/>Returns the existing id"]
+  end
+  subgraph read[Read: search, delete, delete_all]
+    direction LR
+    guard["Filter guard<br/>Declared fields, exact values"]
+    scope["Scope and store name<br/>Joined with $and"]
+    run["Query the chosen tier<br/>At most the result limit"]
+  end
+  writable --> stamp --> hash --> seen
+  seen -->|no| insert
+  seen -->|yes| noop
+  guard --> scope --> run

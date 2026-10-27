@@ -1,19 +1,19 @@
 """The contract checklist, written out as a table the run can be measured against.
 
-The checklist enumerates 29 behaviours "a user would notice if we got it wrong" and then names a subset
-as the release gate: items 1 to 9 and 16 to 19, with the remainder expected to exist but a single
-failure among them "a judgement call, not an automatic block". This file is what turns the checklist
-from a list into something CI can fail on.
+The checklist enumerates 29 behaviours a user would notice if they were wrong, and names a subset as the
+release gate: items 1 to 9 and 16 to 19. The remainder must each have a test, but a single failure among
+them is a judgement call rather than an automatic block. This file is what turns the checklist from a
+document into something CI can fail on.
 
 Two halves, and they fail for different reasons:
 
-* The static half runs with no backend at all. It asserts the table still matches the checklist (29
-  items, numbered once each, the gate subset exactly as drawn) and that every acceptance-test id it
-  names resolves to a test that was actually collected. **A checklist item with no test is a failure,
-  not a silence**, which is the one thing a suite of 640 passing tests cannot tell you about itself.
+* The static half runs with no backend at all. It asserts the table still has its shape (29 items,
+  numbered once each, the gate subset exactly as drawn) and that every acceptance-test id it names
+  resolves to a test that was actually collected. **A checklist item with no test is a failure, not a
+  silence**, which is something a suite of passing tests cannot tell you about itself.
 * The dynamic half needs the rest of the run. It reads what each gate item's tests did and refuses to
-  report a green gate when they skipped for want of a database, because a skipped release gate that
-  prints as a pass is worse than no gate.
+  report a green gate when they skipped for want of a database, because a skipped release gate must not
+  print as a pass.
 
 The link between an item and its tests is the acceptance-test id in the test's docstring, which is the
 convention the whole suite already follows, resolved against the tests pytest collected rather than
@@ -21,8 +21,8 @@ against the files on disk. ``conftest.py``'s ``ChecklistGate`` does the collecti
 id on a class docstring stands in for the tests inside it.
 
 One rule for anything written here: **no acceptance-test id may appear in a docstring in this file.**
-Ids in the table below are data. An id in a docstring would make this file its own evidence, and the
-gate would start answering yes because it asked itself.
+Ids in the table below are data. An id in a docstring would make this file its own evidence for the
+items it checks.
 """
 
 from __future__ import annotations
@@ -38,9 +38,9 @@ class Item(NamedTuple):
     """One numbered item from the contract checklist.
 
     Attributes:
-        number: The item's number, which is how the checklist refers to it.
-        gate: Whether the checklist puts it in the release gate.
-        behaviour: The behaviour, shortened from the checklist's own wording.
+        number: The item's number in the checklist.
+        gate: Whether the item is in the release gate.
+        behaviour: The behaviour, in short.
         ids: The acceptance-test ids covering it. More than one where the item has halves that live in
             different files, or where the covering id is declared on a class rather than a test.
     """
@@ -103,8 +103,8 @@ CHECKLIST: tuple[Item, ...] = (
     ),
 )
 
-# The checklist's own sentence: "items 1-9 and 16-19 are the release gate". Written out separately from the
-# table so a flag flipped by accident in one of them contradicts the other.
+# Items 1 to 9 and 16 to 19 are the release gate. Written out separately from the table so a flag
+# flipped by accident in one of them contradicts the other.
 RELEASE_GATE = frozenset(range(1, 10)) | frozenset(range(16, 20))
 
 
@@ -205,19 +205,19 @@ def _verdict(gate: ChecklistGate, items: Iterable[Item], narrowing: str) -> tupl
     return problems, unverified
 
 
-class TestTheTableStillMatchesTheChecklist:
-    """The table above is a transcription, and a transcription can drift from its source.
+class TestTheChecklistTableIsWhole:
+    """The table above keeps the checklist's shape.
 
-    Nothing here needs a database or the rest of the run. These are the assertions that would catch a
-    row deleted while rewording something, a number typed twice, or an item quietly promoted out of the
-    release gate, all of which would leave the gate green and narrower than the checklist.
+    Nothing here needs a database or the rest of the run. These are the assertions that catch a row
+    deleted while rewording something, a number typed twice, or an item moved out of the release gate,
+    all of which would leave the gate green and narrower than the checklist.
     """
 
-    def test_the_checklists_twenty_nine_items_are_each_here_once(self) -> None:
+    def test_the_plans_twenty_nine_items_are_each_here_once(self) -> None:
         assert [item.number for item in CHECKLIST] == list(range(1, 30))
 
-    def test_the_release_gate_subset_is_the_one_the_checklist_draws(self) -> None:
-        """Items 1 to 9 and 16 to 19, and the reason for the split is in this file's docstring."""
+    def test_the_release_gate_subset_is_the_one_the_plan_draws(self) -> None:
+        """Items 1 to 9 and 16 to 19; the reason for the split is in this file's docstring."""
         assert {item.number for item in CHECKLIST if item.gate} == RELEASE_GATE
 
     def test_every_item_names_a_test(self) -> None:
@@ -232,9 +232,9 @@ class TestTheTableStillMatchesTheChecklist:
 class TestEveryChecklistItemHasATestInThisRun:
     """Do the ids in the table resolve to tests pytest actually collected?
 
-    This is the half that catches the failure the checklist is written against: a checklist item nobody wrote a
-    test for. It runs with no backend configured, because collection does not need one, so it fails on a
-    laptop and in CI alike rather than only in the nightly job that has the databases.
+    This is the half that catches what the checklist exists to prevent: a checklist item with no test.
+    It runs with no backend configured, because collection does not need one, so it fails on a laptop
+    and in CI alike rather than only in the nightly job that has the databases.
 
     An id resolves through the docstrings of the collected tests. That means a test renamed or moved
     still counts, and a test deleted stops counting immediately.
@@ -271,12 +271,12 @@ class TestEveryChecklistItemHasATestInThisRun:
 class TestTheReleaseGate:
     """Did the release-gate items run, and did they pass?
 
-    The gate assertion the release requires, and the reason it is a test rather than a script: it has to
+    The release-gate assertion, and the reason it is a test rather than a script: it has to
     read the same run CI reads, including the skips. It is reordered to last by the plugin in
     ``conftest.py``, because a gate that ran before the tests it measures would report all of them as
     never having run.
 
-    Three outcomes, and the third is the one worth designing for:
+    Three outcomes:
 
     * A gate item with a failing test, or with a test that never ran, **fails** this test. So does an
       item with no test in a run that collected the whole suite.
@@ -314,10 +314,9 @@ class TestTheReleaseGate:
 class TestTheVerdictTheGateReaches:
     """The gate's own judgement, each branch arranged directly rather than by staging a whole session.
 
-    This is the same argument ``test_tier_gating.py`` makes about the tier gate, applied one level up. A
-    gate that cannot fail reports green forever, and a green run is the one nobody investigates. The
-    difference from the tier gate is that no nested session is needed here: the judgement is a function
-    of two dictionaries, so the cases can be built by hand.
+    This is the same check ``test_tier_gating.py`` makes of the tier gate, applied one level up: each
+    branch of the verdict is shown to fire. The difference from the tier gate is that no nested session is
+    needed here: the judgement is a function of two dictionaries, so the cases can be built by hand.
 
     The id below is deliberately not one this suite uses. It is data, never a docstring, so nothing here
     can register itself as evidence for a real checklist item.
@@ -375,7 +374,7 @@ class TestTheVerdictTheGateReaches:
         assert unverified == {1: ["no reason recorded"]}
 
     def test_an_item_with_no_test_fails_a_whole_run_and_skips_a_narrowed_one(self) -> None:
-        """The distinction the checklist turns on. Absence is the failure it is written against, but
+        """The distinction the checklist turns on. Absence is the failure the checklist exists to catch, but
         under ``-k`` or ``-m`` the same absence is the caller's own filter and must not be reported as a
         missing test."""
         gate = self._gate((), {})

@@ -26,9 +26,6 @@ way. If the request is about an API this package exposes, say which SDK surface 
 because both surfaces here implement protocols owned by the Strands Agents SDK and what they can do is
 bounded by those.
 
-Many things that look absent are deliberate rather than overlooked: they are open questions, or out of
-scope for v0.1.0, with the reasoning recorded against them.
-
 ## Setting up an environment
 
 You need Python 3.10 or newer and, for anything beyond the default tier, a MongoDB deployment.
@@ -59,9 +56,8 @@ Either way, every command runs from `python/`, not from the repository root.
 
 ## Running the tests
 
-Most of the suite needs no deployment at all: around 700 tests in roughly 50 seconds. The tiers that need
-one are gated on an environment variable and skip when it is empty, so a first run on a laptop with no
-cluster is green.
+Most of the suite needs no deployment at all. The tiers that need one are gated on an environment
+variable and skip when it is empty, so a first run on a laptop with no cluster is green.
 
 | Tier | Gate | Needs |
 |---|---|---|
@@ -76,8 +72,8 @@ paste a connection string into an issue, a test or a document: a test in the sui
 file in the repository looking for exactly that.
 
 Because `.env` is loaded automatically, a bare test run on a machine that has one starts the contract tier.
-`AGENTS.md` explains how to opt out, along with how long an index build and an embedding actually take, and
-those two figures are worth reading before you conclude that a cluster test has hung.
+`AGENTS.md` explains how to opt out, and how long an index build and an embedding can take, which is worth
+reading before you conclude that a cluster test has hung.
 
 ## What a pull request has to pass
 
@@ -96,31 +92,43 @@ starts the workflow by hand from the Actions tab:
 |---|---|
 | `Lint` | `hatch run format-check`, `hatch run lint`, `hatch run typecheck` |
 | `Test - Python <version>` | The default tier on 3.10, 3.11, 3.12, 3.13 and 3.14. No deployment, so no secrets |
-| `Contract tier (<deployment>)` | `hatch run test -m contract` twice, against a `mongo:8` service container and against a `mongodb/mongodb-atlas-local:8` one that carries a search process. No secret either time: the tier's definition is any real MongoDB, and a container is one |
+| `Contract tier (<deployment>)` | `hatch run test -m contract` twice, against a `mongo:8` service container and against a `mongodb/mongodb-atlas-local:8` one that carries a search process. The second leg also runs `hatch run test -m integration`, which needs that search process. No secret either time |
 | `Coverage floors` | `hatch run cov`: 90% aggregate and 70% per module, both enforced |
 | `Dependency floors` | Installs the oldest version of every dependency the manifest declares, on the oldest Python it claims, then runs the default tier against them |
 | `Latest SDK compatibility` | Weekly or on demand, against the newest published `strands-agents` rather than the pinned one. Typechecks, then runs `compat`, then runs `contract` |
-| `Atlas tiers` | Weekly, on demand, or on a merge to `main`. `hatch run test -m "integration or autoembed"` against two repository secrets |
+| `Atlas tiers` | Weekly, or on demand. Creates an Atlas cluster for the run, runs `hatch run test -m "integration or autoembed"` against it, and deletes it |
 
-The two tiers that need a cluster run on the schedule, or once your change has merged, rather than on the
-pull request itself, because a pull request from a fork receives no secret and the resulting skip would
-report as a pass. The other two routes both need write access for the same reason: starting the workflow by
-hand, and pushing to `main`. So none of the three hands a fork a credential, and none of them runs on your
-branch.
+![Where each test tier runs: the unit and contract tiers and the integration tier on every change, the Atlas tiers on a throwaway cluster weekly or on demand](docs/images/ci-tiers.svg)
 
-What does run on your branch is the contract tier's second leg, against a container that carries a search
-process. That covers index creation and which tier a deployment resolves to, on every change, from a fork as
-readily as from a branch. It does not cover what the two secret-bearing tiers cover: ranked results from a
-real `mongot`, and an embedding model registered on a real cluster. A pull request that touches either should
-say which tiers the author ran locally, with `MONGODB_URI` and `MONGODB_ATLAS_URI` pointing at a deployment of
-their own.
+Every change gets the `integration` tier, from a fork as readily as from a branch, because the Atlas local
+container carries the search process it needs. Only `autoembed` needs a real Atlas cluster: automated
+embedding runs on Atlas, on an M10 or larger with storage auto-scaling on. So the `Atlas tiers` job creates
+one for each run, on the newest MongoDB release, and deletes it when the run ends, pass or fail. It runs on
+the weekly cron and when a maintainer starts the workflow by hand, never on a pull request: a fork receives no
+secret, and every run is billed for the hour or so its cluster exists. A pull request that changes automated
+embedding should say whether the author ran `autoembed` locally.
+
+### The cluster the `Atlas tiers` job creates
+
+The job runs [`python/scripts/atlas_ci_cluster.py`](python/scripts/atlas_ci_cluster.py), which you can also
+run yourself. `up` creates an M10 named `strands-ci-<suffix>`, a database user and an access-list entry for
+the machine running it (both expire after three hours), waits until the search process answers, and prints
+the connection string. `down <name>` deletes the cluster and the user. `up` also deletes any `strands-ci-`
+cluster older than three hours, in case a run stopped before its teardown.
+
+It authenticates the way the Atlas CLI does: a logged-in `atlas auth login` session locally, and in CI a
+service account with the Project Owner role on one Atlas project, which is what creating a cluster takes. The
+workflow reads three repository secrets:
+
+- `ATLAS_CLIENT_ID`: the service account's client ID.
+- `ATLAS_CLIENT_SECRET`: its client secret.
+- `ATLAS_PROJECT_ID`: the project the cluster is created in.
 
 ## Sending the pull request
 
 1. Work against `main` and keep the change focused on one thing.
-2. **Add or update a test.** A change with no test is a change nobody will be able to keep.
-3. **Write the requirement down if behaviour changed.** `AGENTS.md` explains the order: the requirement
-   first, then the test that would falsify it, then the code.
+2. **Add or update a test** that fails without your change.
+3. **Update the documentation if behaviour changed.** `python/README.md` is the reference a user reads.
 4. Use a conventional commit subject: `feat:`, `fix:`, `docs:`, `test:`, `refactor:` or `chore:`.
 5. Run `hatch run prepare` and make sure it is clean.
 6. Open the pull request against `main`, describe what changed and why, and mention any issue it closes.
@@ -136,11 +144,11 @@ not in a pull request review, because neither is private and neither reaches any
 
 ## Security
 
-**Do not open a public issue for a security vulnerability.** A public report is a disclosure, and it reaches
-whoever is looking for one first.
+**Do not open a public issue for a security vulnerability.** A public report discloses the vulnerability
+before a fix exists.
 
 Report it privately to mongodb-partners@mongodb.com instead. [SECURITY.md](SECURITY.md) is the same address
-with the detail beside it: what to put in the report, what to expect back, and what is out of scope here —
+with the detail beside it: what to put in the report, what to expect back, and what is out of scope here,
 including MongoDB Server, Atlas and the drivers, which go through MongoDB's own process rather than through
 this repository.
 

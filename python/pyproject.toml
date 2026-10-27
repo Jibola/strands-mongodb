@@ -41,50 +41,26 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-# Floor rationale: strands-agents 1.54.0 is the first release that ships every module
-# `storage.py` imports at module scope. The binding one is `strands.storage.search.keyword`,
-# whose `tokenize` the lexical search path calls for parity with the SDK's own
-# `KeywordSearchStrategy`; that package does not exist before 1.54.0, so `import
-# strands_mongodb.storage` raises `ModuleNotFoundError` on anything older. `strands.storage`
-# itself and `StorageError` arrive earlier, at 1.48.0, and `strands.memory` earlier still at
-# 1.44.0 — a single shared floor is used so the extras stay mutually consistent and `[all]`
-# cannot resolve to a split pair.
+# strands-agents 1.54.0 is the first release with every module `storage.py` imports, including
+# `strands.storage.search.keyword`; older releases fail `import strands_mongodb.storage`. Both extras
+# share the floor so `[all]` cannot resolve to a split pair. The `Dependency floors` CI job installs
+# every floor and runs the suite against it.
 #
-# This floor read 1.48.0 for most of the package's life: the release that satisfies the two
-# `strands` modules somebody checked, rather than all four this one imports from. It was verified
-# by reading wheel contents for those two. It is now verified by installing it and running the suite,
-# which is what the `Dependency floors` job in ci-python.yml exists to keep doing (`REQ-E-168`),
-# because a floor checked by reading is a floor checked against what the reader remembered.
+# No upper bounds, matching strands-dynamodb-storage and the official extension template. A ceiling
+# would hide from users that a new SDK release broke the protocol this package claims to satisfy. The
+# weekly `sdk-compat` job and the test matrix both resolve the latest release to catch that instead.
 #
-# Upper bounds are deliberately omitted, matching strands-dynamodb-storage and the official
-# extension template. Confirmed as a decision on 2026-09-17 rather than left as an inheritance,
-# because this repository has evidence about what the absence costs: `strands-agents` 1.56.0
-# changed a protocol and turned five CI jobs red on a change this package had no part in, 26
-# minutes after publication. A ceiling would have held the matrix steady and would also have hidden
-# from every user resolving fresh that a published conformance claim had stopped being true. A
-# package whose whole argument is that a published name should not lie about what it satisfies
-# cannot buy quiet at that price. The cost is accepted, and two detectors watch for it instead: the
-# weekly `sdk-compat` canary and the ordinary test matrix, both resolving latest.
+# pymongo 4.14.0 added `AsyncMongoClient.append_metadata`, which `_client.py` calls on an injected
+# client. On older drivers the attribute resolves to a `Database` and the call raises.
 #
-# `pymongo` floors at 4.14.0, the release that added `AsyncMongoClient.append_metadata`, which
-# `_client.py` calls on an injected client. Below it that attribute resolves through
-# `__getattr__` to a `Database` of the same name, so the call raises rather than failing to
-# import: a floor is the honest way to require it, since the alternative is a runtime probe whose
-# only outcome is a log line about a caller's driver version. The floor was 4.12.0, inherited from
-# `pymongo-search-utils` 0.3.0 rather than chosen; 4.14.0 supports Python 3.9 upward and so clears
-# the 3.10 floor below.
-#
-# `typing-extensions` is named rather than inherited. `types.py` imports `Required` and
-# `TypedDict` from it directly, since `typing.Required` is 3.11+ and the floor here is 3.10.
-# strands-agents already pins it unconditionally, so this changes no resolution today; the
-# floor matches theirs. A dependency we import is one we declare, because a transitive pin
-# is a fact about their current release rather than a promise to us.
+# typing-extensions is declared because `types.py` imports `Required` from it (`typing.Required` is
+# 3.11+). The floor matches strands-agents', so no resolution changes.
 storage = [
     "strands-agents>=1.54.0",
     "pymongo>=4.14.0",
     "typing-extensions>=4.13.2",
-    # `_telemetry` imports it directly, so it is named rather than inherited from strands-agents. The floor
-    # is theirs, so no resolution changes. The SDK, and every exporter, stay the application's choice.
+    # `_telemetry` imports it directly. The floor is strands-agents'. The SDK and exporters stay the
+    # application's choice.
     "opentelemetry-api>=1.30.0",
 ]
 memory = [
@@ -99,48 +75,31 @@ memory = [
 all = ["strands-mongodb[memory,storage]"]
 dev = [
     "pytest>=8.0.0,<9.0.0",
-    # Floor at 1.0 because `filterwarnings` below turns a DeprecationWarning into an error, and 0.26
-    # calls `asyncio.get_event_loop_policy()` on every async test -- deprecated in 3.14, slated for
-    # removal in 3.16. Measured: the same suite under the same filter is 915 errors on 0.26.0 and 912
-    # passed on 1.4.0. The floor is load-bearing rather than tidy, which is why it is not just a ceiling
-    # raise: lowering it does not merely restore noise, it stops the suite running at all.
+    # Floor at 1.0: 0.26 calls `asyncio.get_event_loop_policy()` (deprecated in 3.14) on every async
+    # test, and `filterwarnings` below makes that an error, so the suite cannot run below 1.0.
     "pytest-asyncio>=1.0.0,<2.0.0",
-    # The 90% aggregate floor is a release gate. A gate no installed tool can
-    # measure is not a gate, and the scaffold declared the floor without declaring this.
+    # Measures the 90% aggregate coverage floor that `hatch run cov` enforces.
     "pytest-cov>=5.0.0,<8.0.0",
     "ruff>=0.11.0,<1.0.0",
     "mypy>=1.15.0,<2.0.0",
-    # tests/test_ci.py parses .github/workflows/ci-python.yml, and asserting on YAML as text is what
-    # AT-099 had to settle for. PyYAML is already importable in the development venv as a
-    # runtime dependency of strands-agents, which is not a reason to import it: they can drop it in any
-    # release, and the failure would be an ImportError in a test about workflow structure.
+    # The CI tests parse the workflow files. Declared even though strands-agents currently pulls it in,
+    # because the tests import it directly.
     "pyyaml>=6.0.0",
-    # PyYAML ships no inline annotations, so mypy reports `import-untyped` on `import yaml` without this.
-    # Declared rather than silenced with an override: the stubs are what let the workflow tests be checked
-    # at the same strictness as everything else.
+    # PyYAML ships no annotations; the stubs let mypy check the workflow tests at full strictness.
     "types-PyYAML>=6.0.0",
-    # The tests build a real span pipeline: test_client.py's password tripwire and test_telemetry.py's
-    # spans. The SDK is a test dependency only. The runtime extras name `opentelemetry-api`, which is the
-    # part the package imports; a provider, a processor and an exporter are the application's to choose.
+    # The tests build a real span pipeline. Test-only: the runtime extras name only `opentelemetry-api`.
     "opentelemetry-sdk>=1.30.0",
-    # Five test modules parse this file to check it against the workflow, the README and the examples.
-    # `tomllib` is 3.11+, so on the oldest interpreter the package supports those assertions were skipped
-    # -- 38 of them, which left the 3.10 job green for a different reason than the other four. `tomli` is
-    # the parser `tomllib` was adopted from and its 2.x API is `tomllib`'s, so the import sites read
-    # `import tomli as tomllib` and nothing downstream knows which one it got.
+    # Several tests parse this file, and `tomllib` is 3.11+, so 3.10 imports `tomli as tomllib`.
     #
-    # Deliberately NOT marked `python_version < '3.11'`, though the import only reaches it there. mypy is
-    # configured at `python_version = "3.10"`, so it reads the floor's branch of that import on every
-    # interpreter; with `tomli` absent and `ignore_missing_imports` on, the module resolves to `Any` and
-    # every `tomllib.load` call silently returns `Any` into a `dict[str, Any]`. A marker would make the
-    # type checker wrong everywhere to keep a 15 KiB pure-Python package off four interpreters that
-    # never import it. This is a dev extra: no user installs it.
+    # Deliberately NOT marked `python_version < '3.11'`. mypy runs at `python_version = "3.10"` and reads
+    # the `tomli` branch on every interpreter; without the package installed it resolves to `Any` and
+    # every `tomllib.load` result goes unchecked. This is a dev extra, so no user installs it.
     "tomli>=2.0.0",
 ]
 
 [project.urls]
-# The repository these point at is the one PyPI's trusted publisher is bound to, and the one a reader
-# lands on from the PyPI sidebar. `mongodb`, not `mongodb-labs`: the package is supported, not a lab.
+# The repository PyPI's trusted publisher is bound to. `mongodb`, not `mongodb-labs`: the package is
+# supported.
 Homepage = "https://github.com/mongodb/strands-mongodb"
 Repository = "https://github.com/mongodb/strands-mongodb"
 Issues = "https://github.com/mongodb/strands-mongodb/issues"
@@ -172,7 +131,7 @@ include = [
     "examples",
     "README.md",
     "MIGRATION.md",
-    # The reader this is for is holding a source download and deciding whether to upgrade. `AT-164`.
+    # So a source download says what changed between versions.
     "CHANGELOG.md",
     "LICENSE",
     "NOTICE",
@@ -195,15 +154,13 @@ dependencies = [
 
 [tool.hatch.envs.default.scripts]
 test = "pytest {args}"
-# No path arguments: an explicit path overrides `tool.ruff.include`, and the two drifted apart once
-# `scripts/` was added to one and not the other. One list, in `[tool.ruff]`, is the fix.
+# No path arguments: an explicit path overrides `tool.ruff.include`, which is the single list of files.
 lint = "ruff check"
 format = "ruff format"
 format-check = "ruff format --check"
 typecheck = "mypy"
-# The coverage floors are deliberately not part of `test`. `test` must stay runnable at any point
-# mid-task, and a floor that fails on a half-finished module trains everyone to pass --no-cov.
-# `cov` is the release gate, run in CI and at the end of a phase.
+# The coverage floors are deliberately not part of `test`, so `test` stays usable on work in progress.
+# `cov` is the gate CI and the release workflow run.
 cov = [
     "pytest --cov=strands_mongodb --cov-report=term-missing --cov-report=json --cov-fail-under=90 {args}",
     "python scripts/check_module_coverage.py",
@@ -212,8 +169,7 @@ prepare = ["format", "lint", "typecheck", "test"]
 
 [tool.ruff]
 line-length = 120
-# scripts/ is included because check_module_coverage.py gates a release. A release gate that ruff
-# never sees is a release gate nobody maintains.
+# scripts/ is included because check_module_coverage.py gates a release.
 include = ["src/**/*.py", "tests/**/*.py", "scripts/**/*.py", "examples/**/*.py"]
 
 [tool.ruff.lint]
@@ -222,9 +178,8 @@ select = [
     "F", # pyflakes
     "I", # isort
     "B", # flake8-bugbear
-    # The SDK's own enforcement for one house convention: %s placeholders in log calls, never an
-    # f-string, so a handler can format lazily and a log aggregator sees one message shape. All ten log
-    # calls in this package already passed it, which made a passing tree a coincidence rather than a gate.
+    # %s placeholders in log calls, never an f-string, so a handler formats lazily and a log aggregator
+    # sees one message shape. The SDK enforces the same rule.
     "G", # flake8-logging-format
 ]
 
@@ -240,32 +195,25 @@ python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
-# Tests are checked too. An unawaited coroutine or a fixture returning the wrong type is how a test
-# passes while asserting nothing, and `mypy src` alone never sees it. `scripts/` gates a release.
+# Tests are checked too: an unawaited coroutine or a mistyped fixture lets a test pass while asserting
+# nothing. `scripts/` gates a release.
 files = ["src", "tests", "scripts", "examples"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
-# Set explicitly rather than left to the default, which pytest-asyncio warns is changing. Function
-# scope is what the fixtures assume: each test gets its own client on its own loop, so the harness
-# never depends on the loop-rebinding behavior that REQ-E-017 exists to provide.
+# Set explicitly because pytest-asyncio warns the default is changing. Each test gets its own client on
+# its own loop, so the harness never relies on the client's own loop rebinding, which is under test.
 asyncio_default_fixture_loop_scope = "function"
-# A typo in a marker name silently produces a test that never runs under its tier and always runs
-# under none. Strict mode turns that into a collection error.
+# A typo in a marker name would silently move a test out of its tier. Strict mode makes it a collection
+# error.
 addopts = "--strict-markers --strict-config"
-# A deprecation is a deadline, and a deadline nobody reads is not a deadline. Until now the suite ended
-# `2269 warnings` and every one of them came from `pytest_asyncio` calling an API Python is removing in
-# 3.16, so a DeprecationWarning raised by this package would have arrived as line 2270 of a wall of text
-# nobody scrolls to. Erroring on the category is what makes the count meaningful: it is zero, and the
-# next one to appear is ours.
+# A DeprecationWarning fails the suite, so a deprecated API is replaced before it is removed.
 #
-# Only `DeprecationWarning`. Not `error` for everything, because the two other warnings on file are
-# neither ours nor fixable by anything this project pins: a `ResourceWarning` from a client whose loop
-# closed under it, and a `PytestUnraisableExceptionWarning` from pymongo's periodic executor running as
-# a weakref callback on a dead loop. A filter wide enough to catch those would redden the suite for
-# somebody else's finalizer, which is how a strict setting gets turned off again a week later.
+# Only `DeprecationWarning`, not every warning: the suite also sees a `ResourceWarning` from a client whose
+# loop closed under it and a `PytestUnraisableExceptionWarning` from pymongo's periodic executor on a dead
+# loop. Neither comes from this package, and nothing it pins can fix them.
 filterwarnings = ["error::DeprecationWarning"]
 markers = [
     "contract: needs a real MongoDB deployment of any kind. Gated on MONGODB_URI.",
@@ -280,10 +228,8 @@ markers = [
 [tool.coverage.run]
 source = ["strands_mongodb"]
 branch = true
-# Several tests assert on import-time behavior, which can only be observed in a fresh interpreter.
-# Without parallel mode their subprocesses are unmeasured, so the lines they exercise read as
-# uncovered and the per-module floor would fail on code that is in fact tested. pytest-cov sets
-# COVERAGE_PROCESS_START for child processes once this is on, and combines the data files after.
+# Some tests check import-time behavior in a fresh interpreter. Parallel mode measures those
+# subprocesses, so the per-module floor counts the lines they cover.
 parallel = true
 
 [tool.coverage.report]

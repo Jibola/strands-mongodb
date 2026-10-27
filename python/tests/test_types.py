@@ -1,21 +1,20 @@
 """Acceptance tests for the public configuration, query and result types.
 
-Covers ``AT-056`` (``REQ-E-056``) and ``AT-056a`` through ``AT-056e``, which hold the config surface
-that ``REQ-E-001`` and ``REQ-E-002`` are promises about.
+These types are the configuration surface a caller writes against: the store config, the connection
+config, the search query and the result of ``add``.
 
-Most of what ``types.py`` promises is unobservable at runtime, and that is not a gap in the tests. A
-``Required`` key and a narrow ``Literal`` are instructions to a type checker; the interpreter ignores
-both. So the tests split by who enforces the property: ``dataclasses.fields`` and ``__annotations__``
-for what the interpreter knows, and a real ``mypy`` run for what only it knows.
+Most of what ``types.py`` promises is unobservable at runtime. A ``Required`` key and a narrow ``Literal``
+are instructions to a type checker; the interpreter ignores both. So the tests split by who enforces the
+property: ``dataclasses.fields`` and ``__annotations__`` for what the interpreter knows, and a real
+``mypy`` run for what only it knows.
 
-The split is sharper here than anywhere else in the suite because of one measured fact. Under
-``from __future__ import annotations``, which this package and the SDK both use everywhere,
-``TypedDict`` cannot see ``Required`` at all: ``MemoryStoreConfig.__required_keys__`` is an **empty**
-frozenset on the installed 1.54.0, with ``name`` sitting in ``__optional_keys__`` despite being
-declared ``Required[str]``. Asserting ``"name" in __required_keys__`` would therefore fail against a
-correct implementation, and the obvious repair -- dropping the future import from our module -- would
-fix our own keys, leave the inherited ``name`` still unseen, and break the module on import (see
-``AT-056c``). The requirement is real and mypy is what enforces it.
+The split matters most for required keys. Under ``from __future__ import annotations``, which this package
+and the SDK both use everywhere, ``TypedDict`` cannot see ``Required`` at all: on ``strands-agents``
+1.54.0, ``MemoryStoreConfig.__required_keys__`` is an **empty** frozenset, with ``name`` in
+``__optional_keys__`` despite being declared ``Required[str]``. Asserting ``"name" in __required_keys__``
+would therefore fail against a correct implementation. Dropping the future import from this package's
+module would fix its own keys, leave the inherited ``name`` unseen, and break the module on import (see
+``TestTheModuleImportsWithoutADriver``). Mypy is what enforces required keys.
 """
 
 from __future__ import annotations
@@ -46,7 +45,7 @@ if TYPE_CHECKING:
 
 
 class TestAddResultReportsWhatTheWriteDid:
-    """AT-056 / REQ-E-056 — ``add`` returns a dataclass, not a bare count or an id list."""
+    """AT-056 — ``add`` returns a dataclass, not a bare count or an id list."""
 
     def test_it_is_a_dataclass_carrying_the_three_declared_fields_in_order(self) -> None:
         """Field order is part of the shape, because a dataclass is positionally constructible.
@@ -58,7 +57,7 @@ class TestAddResultReportsWhatTheWriteDid:
         assert [f.name for f in dataclasses.fields(MongoDBAddResult)] == ["ids", "inserted", "duplicates"]
 
     def test_it_round_trips_the_values_it_was_given(self) -> None:
-        """The literal from the task description, asserted as written."""
+        """The values a caller passes are the values the result reports."""
         result = MongoDBAddResult(ids=["6512", "6513"], inserted=1, duplicates=0)
 
         assert result.ids == ["6512", "6513"]
@@ -66,7 +65,7 @@ class TestAddResultReportsWhatTheWriteDid:
         assert result.duplicates == 0
 
     def test_duplicates_has_no_default_so_a_caller_cannot_be_told_zero_by_omission(self) -> None:
-        """``duplicates`` is the field ``REQ-E-042`` exists to surface.
+        """``duplicates`` is how ``add`` reports facts it skipped because the store already held them.
 
         A default of ``0`` would let a code path that never counted duplicates construct a result
         claiming there were none. Every construction site has to answer the question.
@@ -93,9 +92,9 @@ class TestMemoryStoreConfigExtendsTheSdkConfig:
     def test_it_adds_the_documented_mongodb_fields(self) -> None:
         """The seven fields beyond the SDK's, named so a rename is deliberate.
 
-        Six before ``ttl_seconds``. Widening this set is the expected way for the config to
-        grow and the assertion is written as equality anyway, so the widening is a line in a diff rather
-        than something a reviewer has to notice the absence of.
+        Widening this set is the expected way for the config to grow, and the assertion is written as
+        equality anyway, so a new field is a line in a diff rather than something a reviewer has to notice
+        the absence of.
         """
         added = set(MongoDBMemoryStoreConfig.__annotations__) - set(MemoryStoreConfig.__annotations__)
 
@@ -143,26 +142,22 @@ class TestMemoryStoreConfigExtendsTheSdkConfig:
 
 
 class TestDatabaseIsTheOneMandatoryConnectionField:
-    """AT-056b — the field set, as a test rather than a transcript."""
+    """AT-056b — ``database`` is the one connection field a config cannot omit."""
 
-    def test_the_config_declares_the_documented_ten_fields_plus_the_three_justified(self) -> None:
-        """The documented API fixes this field set, so it is asserted rather than left to review.
+    def test_the_config_declares_the_documented_fields(self) -> None:
+        """The connection config has exactly these thirteen keys, so any change to the set is deliberate.
 
-        The wording is that the config is reproduced verbatim, which makes any addition here a
-        deliberate departure rather than an oversight. A new key is cheap to add and impossible to
-        remove once a caller sets it, so the list is worth spelling out.
+        A new key is cheap to add and impossible to remove once a caller sets it, so the list is spelled out
+        here and each key beyond the ten core connection and index settings has its reason written down.
 
-        Two departures, both from ``REQ-E-067``. ``embedding_dimensions`` and ``similarity`` are what a
-        manual vector index needs at creation time, and the manual path is the primary
-        tested one because an ``autoEmbed`` index is rejected at creation on every deployment CI can
-        reach. Without them the package can build a working vector index nowhere.
+        ``embedding_dimensions`` and ``similarity`` are what a manual vector index needs at creation time.
+        An ``autoEmbed`` index is created only on deployments that run automated embedding, so without
+        these two keys the package could build no vector index anywhere else.
 
-        The third is from ``REQ-E-122``. ``index_ready_timeout`` is how long a caller waits for
-        a search index to become queryable, and it is a key rather than a constant because a measurement
-        found a first build on a shared cloud cluster running past the constant this package shipped:
-        a wait long enough for one deployment is a failure on another, and only the caller knows which
-        they have. This test is the departure's record, and adding a fourth key means writing the
-        paragraph that justifies it here.
+        ``index_ready_timeout`` is how long a caller waits for a search index to become queryable. It is a
+        key rather than a constant because a first build on a shared cloud cluster can take longer than
+        any fixed default: a wait long enough for one deployment is a failure on another, and only the
+        caller knows which they have. A further key needs its reason added here.
         """
         assert set(MongoDBConfig.__annotations__) == {
             "database",
@@ -260,8 +255,8 @@ class TestTheModuleImportsWithoutADriver:
         Moving ``AsyncMongoClient`` out of ``TYPE_CHECKING`` makes the guarded import fire and raises
         the ``missing_extra`` message. Dropping ``from __future__ import annotations`` raises
         ``NameError`` from the class body instead, because ``TypedDict`` evaluates its annotations
-        eagerly to compute ``__required_keys__`` -- measured on 3.14, where PEP 649 otherwise defers
-        annotations and would have hidden this.
+        eagerly to compute ``__required_keys__``. That holds on Python 3.14 too, where PEP 649 otherwise
+        defers annotations.
         """
         source = """
             import sys
@@ -296,12 +291,11 @@ class TestTheSearchTierVocabulary:
     """AT-056d — two literals, because asking for a tier and reporting one are different domains."""
 
     def test_the_requestable_tiers_are_the_four_that_run(self) -> None:
-        """``AT-141`` / ``REQ-E-141``. A ``Literal`` in the config is a promise the caller can
-        typecheck against, so it holds only values that actually run. ``hybrid`` runs as of the
-        hybrid tier's arrival; ``regex`` still does not, so it is still absent.
+        """AT-141 — a ``Literal`` in the config is a promise the caller can typecheck against, so it
+        holds only values that actually run. ``regex`` does not run, so it is absent.
 
-        This assertion widened rather than moved, which is the prediction this alias was written on:
-        every value that typechecked before still does, so no caller was broken by the widening.
+        Adding a tier widens this alias without removing a value, so every config that typechecked before
+        still does.
 
         Asserted against the named alias rather than the field annotation, which is a string under
         postponed annotations and would need resolving before ``get_args`` saw anything.
@@ -309,20 +303,18 @@ class TestTheSearchTierVocabulary:
         assert get_args(SearchType) == ("auto", "vector", "text", "hybrid")
 
     def test_the_reportable_tiers_are_the_three_that_can_answer_a_query(self) -> None:
-        """``AT-141`` / ``REQ-E-054``, ``REQ-E-141``. ``_search_type`` carries the answering tier so
-        a silent fallback is visible in the returned data.
+        """AT-141 — ``_search_type`` carries the answering tier, so a fallback is visible in the
+        returned data.
 
-        The two literals differ by ``auto`` alone, which is the distinction that justified separating
-        them: ``auto`` is a request and can never be an answer. They moved by different amounts here
-        -- three-to-four and two-to-three -- which is the demonstration that a single union would
-        have had to move by both at once.
+        The two literals differ by ``auto`` alone, which is why they are separate: ``auto`` is a request
+        and can never be an answer. A single union would let a result claim it was answered by ``auto``.
         """
         assert get_args(ResolvedSearchType) == ("vector", "text", "hybrid")
 
     def test_the_two_vocabularies_differ_by_auto_alone(self) -> None:
-        """``AT-141``. The property the split exists for, asserted directly rather than inferred from
-        the two tuples above -- so that a future widening that adds a value to one and forgets the
-        other fails here and names it.
+        """AT-141 — the property the split exists for, asserted directly rather than inferred from
+        the two tuples above, so that a widening that adds a value to one and forgets the other fails
+        here and names it.
         """
         assert set(get_args(SearchType)) - set(get_args(ResolvedSearchType)) == {"auto"}
         assert not set(get_args(ResolvedSearchType)) - set(get_args(SearchType))
@@ -330,11 +322,9 @@ class TestTheSearchTierVocabulary:
     def test_mypy_accepts_the_hybrid_tier_at_the_config_site(
         self, run_mypy: Callable[[str], subprocess.CompletedProcess[str]]
     ) -> None:
-        """``AT-142`` / ``REQ-E-141``, and the inversion of what this test used to assert.
+        """AT-142 — ``hybrid`` runs, so mypy accepts it as a config's ``search_type``.
 
-        It previously required ``hybrid`` to fail here, which was the correct assertion about a value
-        that did not run and is the wrong one about a value that does. The requirement it tested has
-        not changed -- the config rejects tiers that cannot answer -- only the membership has.
+        The config rejects tiers that cannot answer a query, and the next test checks that half.
         """
         result = run_mypy(
             """
@@ -349,8 +339,8 @@ class TestTheSearchTierVocabulary:
     def test_mypy_rejects_a_tier_that_still_does_not_run(
         self, run_mypy: Callable[[str], subprocess.CompletedProcess[str]]
     ) -> None:
-        """``AT-142``. The narrow-literal property survives the widening, which is the half that
-        would otherwise be lost: ``regex`` fails at the config site, not at query time.
+        """AT-142 — a tier that does not run is rejected by mypy at the config site, not at query
+        time. ``regex`` is that tier.
         """
         result = run_mypy(
             """
@@ -365,7 +355,7 @@ class TestTheSearchTierVocabulary:
 
 
 class TestTheSearchQueryWidensTheProtocolQuery:
-    """AT-056e — the pre-computed-vector path (``REQ-E-074``)."""
+    """AT-056e — the search query type carries a pre-computed vector as well as text."""
 
     def test_it_declares_the_fields_the_widened_query_carries(self) -> None:
         """`Storage.search` takes one argument, so anything a caller wants to say about a query has
@@ -380,7 +370,8 @@ class TestTheSearchQueryWidensTheProtocolQuery:
         }
 
     def test_every_field_is_optional_because_the_valid_combinations_are_not_expressible(self) -> None:
-        """A query needs ``text`` or ``vector`` and not both, which no ``TypedDict`` can say.
+        """A query needs ``text`` or ``vector``, and both only on the hybrid tier, which no ``TypedDict``
+        can say.
 
         Marking either ``Required`` would forbid the other path. The constraint is checked at runtime
         by the search implementation instead, and this pins that the type deliberately does not try.
@@ -390,7 +381,7 @@ class TestTheSearchQueryWidensTheProtocolQuery:
     def test_mypy_accepts_a_vector_only_query(
         self, run_mypy: Callable[[str], subprocess.CompletedProcess[str]]
     ) -> None:
-        """``REQ-E-074``'s entry point, checked at the type level."""
+        """A query carrying only a pre-computed vector typechecks."""
         result = run_mypy(
             """
             from strands_mongodb.types import MongoDBSearchQuery
@@ -406,13 +397,13 @@ class TestTheSharedConstants:
     """AT-056f — values other modules must not respell."""
 
     def test_the_four_reserved_metadata_keys_are_the_ones_the_readme_documents(self) -> None:
-        """``REQ-E-040`` returns them on every entry and ``REQ-E-057`` resolves collisions against
-        them, so the two requirements have to agree on one set.
+        """Search sets these keys on every returned entry and resolves metadata collisions against
+        them, so both behaviours have to agree on one set.
         """
         assert RESERVED_METADATA_KEYS == frozenset({"_relevance_score", "_id", "_search_type", "_scope"})
 
     def test_the_result_default_matches_both_shipped_stores(self) -> None:
-        """``FileMemoryStore`` and ``BedrockKnowledgeBaseStore`` both default to 10.
+        """``FileMemoryStore`` and ``BedrockKnowledgeBaseStore`` both default to 10 results.
 
         Behavioural parity across stores is the reason for the number, so it is asserted rather than
         left as a literal in ``search``.
@@ -423,8 +414,8 @@ class TestTheSharedConstants:
         """``pymongo_search_utils.vector_search_stage`` defaults ``oversampling_factor`` to 10 and
         computes ``numCandidates = top_k * oversampling_factor``.
 
-        ``REQ-E-072`` requires us to derive the candidate count rather than pass a constant. Matching
-        their default means our derived count equals theirs for a caller who sets nothing.
+        This package derives the candidate count the same way rather than passing a constant. Matching the
+        default means the derived count equals that library's for a caller who sets nothing.
         """
         assert DEFAULT_OVERSAMPLING_FACTOR == 10
 

@@ -1,19 +1,16 @@
 """Acceptance tests for the lazy top-level re-export.
 
-Covers ``AT-006a`` through ``AT-006f`` (``REQ-E-006``) and ``AT-007a``/``AT-007b`` (``REQ-E-007``),
-and stands at the lazy-import boundary: a name in the package root to a module imported on first access.
-
-Three constraints meet here and the scaffold treated them as irreconcilable, exporting nothing:
+A name in the package root resolves to a module imported on first access. Three constraints meet here:
 
 1. ``from strands_mongodb import MongoDBStorage`` should work, because that is what the extension
    template does and what a reader expects.
-2. Importing the package root must pull no driver, so a bare install can import it.
+2. Importing the package root must pull in no driver, so a bare install can import it.
 3. A ``[storage]``-only install must not execute the memory module, which fails on
    ``pymongo_search_utils``.
 
-PEP 562 module-level ``__getattr__`` satisfies all three. ``AT-006d`` is the test that makes that
-claim checkable rather than asserted: without its second half, an implementation that imported both
-modules on first access would pass every other test in this file.
+PEP 562 module-level ``__getattr__`` satisfies all three. ``TestAccessImportsOnlyWhatWasAsked`` makes
+that checkable: without its second half, an implementation that imported both modules on first access
+would pass every other test in this file.
 """
 
 from __future__ import annotations
@@ -63,13 +60,13 @@ class TestLazyNamesResolveFromThePackageRoot:
 
 
 class TestUnknownNamesRaiseAttributeError:
-    """AT-006c — the failure mode of a dict lookup, corrected."""
+    """AT-006c — an unknown name raises ``AttributeError``, not the ``KeyError`` of a dict lookup."""
 
     def test_unknown_attribute_raises_attribute_error_naming_module_and_attribute(self) -> None:
-        """``KeyError`` here would be wrong twice over.
+        """The error is ``AttributeError`` and names both the module and the attribute.
 
-        It reads as an internal defect rather than a typo, and it breaks the protocol every
-        introspection tool relies on. ``pytest.raises(AttributeError)`` is itself half the
+        A ``KeyError`` would read as an internal defect rather than a typo, and it breaks the protocol
+        every introspection tool relies on. ``pytest.raises(AttributeError)`` is itself half the
         assertion: a ``KeyError`` escapes it.
         """
         with pytest.raises(AttributeError) as caught:
@@ -89,7 +86,7 @@ class TestUnknownNamesRaiseAttributeError:
         ],
     )
     def test_hasattr_returns_false_for_the_names_tooling_probes(self, probe: str) -> None:
-        """The concrete reason ``AttributeError`` is not a style preference.
+        """Tooling that probes with ``hasattr`` gets ``False``.
 
         ``inspect``, ``copy``, ``pickle``, doctest collection and IPython display all probe modules
         for dunder attributes with ``hasattr``. ``hasattr`` converts ``AttributeError`` to ``False``
@@ -100,13 +97,13 @@ class TestUnknownNamesRaiseAttributeError:
 
 
 class TestAccessImportsOnlyWhatWasAsked:
-    """AT-006d / CH-004 — the load-bearing test."""
+    """AT-006d — resolving one lazy name imports only that backend's dependencies."""
 
     def test_importing_the_root_then_touching_storage_leaves_the_memory_dependency_alone(self) -> None:
         """Two phases in one subprocess, because the transition is what matters.
 
-        Phase one repeats ``CH-004``: a bare ``import strands_mongodb`` loads no driver. Phase two
-        is the part no other test covers: resolving ``MongoDBStorage`` must import ``pymongo`` and
+        Phase one repeats the bare-import guarantee: ``import strands_mongodb`` loads no driver. Phase
+        two is the part no other test covers: resolving ``MongoDBStorage`` must import ``pymongo`` and
         must **not** import ``pymongo_search_utils``. An implementation that eagerly walked the lazy
         table, or imported a shared module that pulled both, would pass phase one and fail here.
 
@@ -140,7 +137,7 @@ class TestAccessImportsOnlyWhatWasAsked:
         """The complement, so the test above cannot pass by importing nothing at all.
 
         Without this, an implementation that returned a stub for every name would satisfy both
-        halves of ``AT-006d``. This pins that the memory path does reach its own dependency.
+        halves of the test above. This pins that the memory path does reach its own dependency.
         """
         source = """
             import sys
@@ -212,12 +209,12 @@ class TestAMissingExtraSurfacesAsAnImportErrorNotAMissingName:
 
 
 class TestStarImportIsTheOneEagerPath:
-    """AT-006e — the cost of naming the lazy classes in ``__all__``, pinned rather than discovered later."""
+    """AT-006e — the cost of naming the lazy classes in ``__all__``, pinned."""
 
     def test_star_import_resolves_both_backends(self) -> None:
         """``from strands_mongodb import *`` walks ``__all__``, so it imports both modules.
 
-        This is the trade taken when the classes were added to ``__all__``: doc tooling and
+        This is the trade for listing the classes in ``__all__``: doc tooling and
         ``--no-implicit-reexport`` see the real public surface, and in exchange a star import on a
         ``[storage]``-only install fails. It fails with the ``missing_extra`` message naming the
         ``memory`` extra, which is wrong advice for someone who deliberately installed one surface.
@@ -244,7 +241,7 @@ class TestStarImportIsTheOneEagerPath:
 
 
 class TestTypeCheckersSeeTheRealClasses:
-    """AT-007a / AT-007b / REQ-E-007 — what the ``TYPE_CHECKING`` block buys."""
+    """AT-007a / AT-007b — what the ``TYPE_CHECKING`` block buys."""
 
     @pytest.mark.parametrize(("name", "module"), LAZY_NAMES)
     def test_revealed_type_is_the_class_not_any(
@@ -252,9 +249,8 @@ class TestTypeCheckersSeeTheRealClasses:
     ) -> None:
         """Without the ``TYPE_CHECKING`` declarations, mypy types both names ``Any``.
 
-        ``Any`` is worse than an error. Every downstream misuse of a lazily exported class would
-        silently type check, so the convenience import would come at the cost of type safety for
-        anyone who used it, and nothing would report that trade.
+        With ``Any``, every downstream misuse of a lazily exported class would silently type check, so
+        the convenience import would cost type safety for anyone who used it.
         """
         result = run_mypy(
             f"""
@@ -271,15 +267,14 @@ class TestTypeCheckersSeeTheRealClasses:
     def test_a_misspelled_lazy_name_is_object_so_misuse_fails_at_the_use_site(
         self, run_mypy: Callable[[str], subprocess.CompletedProcess[str]]
     ) -> None:
-        """The cost of PEP 562, bounded and recorded rather than papered over.
+        """The cost of PEP 562, bounded.
 
         A module-level ``__getattr__`` makes mypy accept **any** attribute on the module, typed as
-        the hook's return type. So the access itself does not error, and this test asserts that
-        honestly instead of pretending otherwise.
+        the hook's return type, so the access itself does not error.
 
-        What it does buy: the hook returns ``object``, not ``Any``, so the first real use of a
-        typo is rejected. Declaring ``-> Any`` would make the whole file below type check clean,
-        which is why the annotation is part of the requirement and not an implementation detail.
+        The hook returns ``object``, not ``Any``, so the first real use of a typo is rejected.
+        Declaring ``-> Any`` would make the whole file below type check clean, which is why the
+        annotation is part of the contract and not an implementation detail.
         """
         result = run_mypy(
             """

@@ -1,8 +1,7 @@
 """The two documents a contributor arrives at, read as claims about this repository.
 
-The conventions acceptance set, ``AT-112`` through ``AT-115`` (``REQ-E-111`` and
-``REQ-E-112``). ``AGENTS.md`` and ``CONTRIBUTING.md`` sit at the repository root and describe how to work
-here: the commands, the test tiers, the gates, the house conventions.
+``AGENTS.md`` and ``CONTRIBUTING.md`` sit at the repository root and describe how to work here: the
+commands, the test tiers, the gates, the house conventions.
 
 **Why these are tests and not prose.** A conventions document is copied from somewhere, and a copied
 document's failure mode is not bad writing. It is naming a command, an environment variable, a marker, a
@@ -13,17 +12,16 @@ against the file that owns it: ``hatch run <script>`` against ``pyproject.toml``
 ``requires-python`` and the matrix, a backticked path against the filesystem, a job name against the
 workflow.
 
-``AT-115`` goes the other way. It takes the nine conventions ``AGENTS.md`` states and checks the package
-obeys them, because a convention nothing measures is a preference. Two of the nine are review-only and
-say so. One is stated as a deviation from the SDK's own rule rather than as a copy of it, and the
-deviation is the decision recorded in ``REQ-E-112``, not an oversight this file should report.
+``TestTheHouseConventionsAreEnforcedNotDescribed`` goes the other way. It takes the nine conventions
+``AGENTS.md`` states and checks that the package obeys them, so each one is measured rather than assumed.
+Two of the nine are review-only and say so. One is stated as a deliberate deviation from the SDK's own
+rule, and the test checks that the deviation is written down rather than reporting it.
 
-``AT-181`` came later, when the two sections that had shipped as placeholders got their answers. It asks a
-different kind of question from the rest of the file: not whether a name resolves against this repository,
-but whether an address reaches the company that can act on the report.
+``TestTheCodeOfConductAndTheSecurityAddressResolve`` asks a different kind of question: not whether a name
+resolves against this repository, but whether an address reaches the company that can act on a report.
 
-What this file cannot tell you: whether the documents are *useful*. Every claim here is a resolvable
-reference, and a document can pass all of it while explaining nothing.
+What this file does not check is whether the documents are useful. It checks that every claim they make
+resolves.
 """
 
 from __future__ import annotations
@@ -72,8 +70,9 @@ _CONVENTION_DOCUMENTS: Final = (_AGENTS, _CONTRIBUTING)
 #: and cannot come from ``TIER_VARIABLES``.
 _BUILD_VARIABLE: Final = "STRANDS_MONGODB_BUILD_TIER"
 
-#: Directories the Markdown sweep does not enter: they hold copies of files this repository does not
-#: own, or working notes that are not part of the package.
+#: Directories the Markdown sweep does not enter. The working-notes directory, which is not published, is
+#: excluded on purpose and ``TestNoShippedDocumentCarriesACredential`` says why; the rest hold copies of files
+#: this repository does not own.
 _UNSWEPT_DIRECTORIES: Final = frozenset(
     {".git", ".venv", ".pytest_cache", ".mypy_cache", ".ruff_cache", "__pycache__", "node_modules"}
 )
@@ -102,7 +101,8 @@ _PATH_SHAPE = re.compile(r"^[\w.][\w./-]*/?$")
 _PATH_SUFFIXES: Final = frozenset({".md", ".py", ".toml", ".yml", ".yaml", ".cfg", ".txt", ".env", ".lock"})
 
 #: Paths the documents name that a clone does not contain, each one a thing a contributor creates. The
-#: exemption is checked rather than trusted: ``AT-113`` asserts ``.gitignore`` is the reason.
+#: exemption is checked rather than trusted: ``test_each_exempted_path_is_exempt_because_git_ignores_it``
+#: asserts ``.gitignore`` is the reason.
 _ABSENT_FROM_A_CLONE: Final = (".env", "python/.venv")
 
 #: The placeholders this repository has declared open. Empty of real ones today: the code of conduct and
@@ -120,7 +120,7 @@ _BACKTICKED = re.compile(r"`([^`\n]+)`")
 _HEADING = re.compile(r"^#{1,6}\s+(.*?)\s*#*$", re.MULTILINE)
 _TODO = re.compile(r"TODO\(([^)]*)\)")
 
-#: A mail address in a document. ``AT-181`` reads these to check which company a report would reach.
+#: A mail address in a document. The security-address tests read these to check which company a report would reach.
 _MAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 #: The one ``user@host`` in these documents that is not a mailbox: the SSH form of a git remote, which
@@ -129,7 +129,7 @@ _MAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 #: still be reported by the check below.
 _SSH_REMOTE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}:")
 
-#: The address the owner supplied on 2026-09-17 for a private security report (``REQ-E-176``).
+#: The address for a private security report.
 #: Declared here rather than read out of whichever document is being checked, so that the two documents are
 #: compared against one string and changing it stays a deliberate edit rather than a typo that propagates.
 _SECURITY_ADDRESS: Final = "mongodb-partners@mongodb.com"
@@ -148,7 +148,7 @@ def _text(path: Path) -> str:
     Returns:
         The file's text.
     """
-    assert path.is_file(), f"REQ-E-111: {path.relative_to(_ROOT)} is not in the repository"
+    assert path.is_file(), f"{path.relative_to(_ROOT)} is not in the repository"
     return path.read_text()
 
 
@@ -282,10 +282,9 @@ def _source_modules() -> list[Path]:
 def _public_definitions(tree: ast.Module) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
     """Module-level functions and the methods of public classes, and nothing nested inside them.
 
-    The definition ``REQ-E-112`` records, and it has to be stated rather than implied: the decorator
-    factories in ``memory_store.py`` and ``storage.py`` each hold two inner functions with public names
-    and no docstring, and a rule that called those public would report four violations of a convention
-    nobody meant to apply to closures.
+    The definition is stated rather than implied because the decorator factories in ``memory_store.py``
+    and ``storage.py`` each hold two inner functions with public names and no docstring. A rule that called
+    those public would report four violations of a convention that does not apply to closures.
 
     Args:
         tree: A parsed module.
@@ -349,21 +348,21 @@ _CONTRIBUTING_TOPICS: Final = {
 
 
 class TestBothConventionDocumentsExist:
-    """``AT-112`` — ``REQ-E-111``, which asked for two files and for a long time got neither.
+    """``AT-112`` — both convention documents exist and cover what a contributor needs.
 
-    They are "the SDK's house conventions copied into this repo", carried as a recommended
-    item ``[RECOMMENDED]``. Recommended is why nothing failed while they were missing: no test read them,
-    so the gap was invisible to everything except a reader looking for them.
+    They hold the SDK's house conventions adapted to this repository. A missing document fails nothing
+    unless a test reads it, so these tests read both.
     """
 
     def test_both_documents_are_at_the_repository_root(self) -> None:
-        """AT-112 — ``REQ-E-111``: one copy of each, at the root, not two split by language.
+        """AT-112 — one copy of each, at the root, not two split by language.
 
         The SDK splits its conventions across a root file and a per-language file. This repository has one
-        package, so a split would duplicate exactly what the README split refused to duplicate for the two READMEs.
+        package, so a split would only duplicate content, which the repository also avoids between its two
+        READMEs.
         """
         missing = [path.name for path in _CONVENTION_DOCUMENTS if not path.is_file()]
-        assert missing == [], f"REQ-E-111 asks for these at the repository root and they are absent: {missing}"
+        assert missing == [], f"these documents belong at the repository root and are absent: {missing}"
 
     def test_the_agents_document_covers_what_a_contributor_needs_before_writing_code(self) -> None:
         """AT-112 — the six subjects a contributor needs before their first commit, by heading."""
@@ -384,7 +383,7 @@ class TestBothConventionDocumentsExist:
 
         The split is deliberate: ``CONTRIBUTING.md`` is the process a contributor follows once, and
         ``AGENTS.md`` is the rules they read every time. Restating the second inside the first is how one
-        of them goes stale, and the stale one is always the copy.
+        of them goes stale.
         """
         text = _text(_CONTRIBUTING)
         assert "AGENTS.md" in text, "CONTRIBUTING.md never points at AGENTS.md, so the conventions are unreachable"
@@ -394,7 +393,7 @@ class TestBothConventionDocumentsExist:
 
 @pytest.mark.parametrize("document", _CONVENTION_DOCUMENTS, ids=lambda path: path.name)
 class TestEveryClaimResolvesAgainstThisRepository:
-    """``AT-113`` — ``REQ-E-111``, the six classes of claim a copied conventions document gets wrong.
+    """``AT-113`` — the six classes of claim a copied conventions document gets wrong.
 
     Not one of these is about writing. Each is a name that either resolves against a file in this
     repository or sends a contributor to debug their own machine over a sentence that was never true here.
@@ -453,10 +452,10 @@ class TestEveryClaimResolvesAgainstThisRepository:
         assert missing == [], f"{document.name} names paths that are in neither the root nor python/: {missing}"
 
     def test_every_placeholder_names_a_tracked_item(self, document: Path) -> None:
-        """AT-113 — ``REQ-E-111``: a ``TODO`` with nothing behind it is how an open decision ships as prose.
+        """AT-113 — a ``TODO`` must name a tracked item, so an open decision cannot ship as prose.
 
-        The code of conduct this repository adopts and the address a security report goes to were the two
-        this check was written for, and both are filled in now. It stays for the next one, and ``AT-181`` now
+        No placeholder is open in these documents. The check stays for the next one, and
+        ``test_no_placeholder_stands_where_an_address_or_a_link_belongs``
         holds the two sections to naming an address rather than to naming the item that will name one.
 
         The open set is declared in :data:`_OPEN_PLACEHOLDERS` rather than inferred, so that adding a
@@ -524,7 +523,7 @@ class TestTheDocumentsAndTheRepositoryAgreeBothWays:
 def _swept_documents() -> list[Path]:
     """Every Markdown file in the repository that a reader outside it can reach.
 
-    Found by walking rather than by listing, which is the point of ``AT-114``: a list has to be extended
+    Found by walking rather than by listing, which is the point of the credential sweep: a list has to be extended
     when a document is added, and the document nobody adds to the list is the one that leaks.
 
     Returns:
@@ -536,11 +535,16 @@ def _swept_documents() -> list[Path]:
 
 
 class TestNoShippedDocumentCarriesACredential:
-    """``AT-114`` — ``REQ-E-111`` and ``REQ-E-093``, widened from a list of three files to a walk.
+    """``AT-114`` — no Markdown file a reader can reach carries a credential, found by walking the tree.
 
-    ``AT-097`` sweeps the two READMEs and the migration guide, named one at a time. That list never
-    included ``python/examples/README.md``, which the sdist ships, and it could not have included the two
-    documents this task adds. Walking the tree covers all of them and everything added next.
+    ``TestEveryBlockDeclaresWhatHappensToIt`` in ``test_readme.py`` sweeps the two READMEs and the migration
+    guide, named one at a time. A named list misses ``python/examples/README.md``, which the sdist ships, and
+    the two convention documents. Walking the tree covers all of them and every document added later.
+
+    The working-notes directory, which is not published, is outside the walk. Its documents quote synthetic
+    passwords on purpose, to describe the tests that prove a real one cannot leak, so sweeping them would
+    report the leak tests as leaks. No package ships them and no reader outside the project is pointed at
+    them.
     """
 
     def test_the_sweep_reaches_every_document_that_ships(self) -> None:
@@ -554,7 +558,7 @@ class TestNoShippedDocumentCarriesACredential:
         assert unreached == [], f"the walk did not reach documents that ship: {unreached}. It found {sorted(reached)}"
 
     def test_no_swept_document_carries_a_credential(self) -> None:
-        """AT-114 — ``REQ-E-093``: a literal connection string in a document is how a password ships."""
+        """AT-114 — no swept document contains a connection string with credentials in it."""
         leaking = [
             str(path.relative_to(_ROOT)) for path in _swept_documents() if _CREDENTIALED_URI.search(path.read_text())
         ]
@@ -576,14 +580,13 @@ class TestNoShippedDocumentCarriesACredential:
 
 
 class TestTheHouseConventionsAreEnforcedNotDescribed:
-    """``AT-115`` — ``REQ-E-112``: the nine conventions ``AGENTS.md`` states, checked against the package.
+    """``AT-115`` — the nine conventions ``AGENTS.md`` states, checked against the package.
 
     Seven of the nine are mechanical, and each is checked here. Two are not: Google-style docstrings and
     naming are review's job, and conventional commit messages are git's history rather than the tree.
 
-    Six of the seven held when this task measured them, which is the reason they are worth asserting now
-    rather than fixing later: a convention that holds by habit stops holding on the first contribution from
-    somebody who never read the document. The seventh, ``__all__``, held in nine modules of ten.
+    All seven hold, and asserting them is what keeps them holding: a convention that holds by habit stops
+    holding on the first contribution from somebody who never read the document.
     """
 
     def test_no_module_spells_an_optional_type_as_optional(self) -> None:
@@ -594,9 +597,8 @@ class TestTheHouseConventionsAreEnforcedNotDescribed:
     def test_every_module_declares_what_it_exports(self) -> None:
         """AT-115 — an ``__all__`` on every module, so the public surface is a decision rather than a leak.
 
-        ``_extras.py`` was the one module without one, alone among the four private modules. This test added
-        it rather than writing the exemption into this test, because the exemption would have had to explain
-        why one module's exports are nobody's business.
+        Private modules included. No exemption is written into this test, because an exemption would have
+        to explain why one module's exports need no decision.
         """
         silent = []
         for path in _source_modules():
@@ -612,8 +614,8 @@ class TestTheHouseConventionsAreEnforcedNotDescribed:
     def test_the_logging_rule_is_a_selected_lint_rule(self) -> None:
         """AT-115 — ``%s`` and not f-strings in log calls, enforced the way the SDK enforces it.
 
-        All thirteen log calls in this package pass ``G``, and ``LOG`` too. The rule was not selected,
-        which made a passing tree a coincidence rather than a gate, so it is selected here.
+        Every log call in this package passes ``G`` and ``LOG``. Selecting the rule makes that a gate rather
+        than a property of the current tree.
         """
         selected = _config()["tool"]["ruff"]["lint"]["select"]
         assert "G" in selected, (
@@ -621,9 +623,9 @@ class TestTheHouseConventionsAreEnforcedNotDescribed:
         )
 
     def test_every_warning_passes_a_stacklevel(self) -> None:
-        """AT-115 — vacuous today, and stated as vacuous: ``src`` makes no ``warnings.warn`` call at all.
+        """AT-115 — ``src`` makes no ``warnings.warn`` call, so this passes vacuously until one is added.
 
-        Written anyway because the convention exists for the call somebody adds, and a warning without
+        The convention exists for the call somebody adds, and a warning without
         ``stacklevel`` points at this package's own line instead of at the caller's.
         """
         careless = []
@@ -636,10 +638,11 @@ class TestTheHouseConventionsAreEnforcedNotDescribed:
         assert careless == [], f"these warnings.warn calls pass no stacklevel: {careless}"
 
     def test_every_public_definition_that_raises_documents_it(self) -> None:
-        """AT-115 — a ``Raises:`` section wherever a caller can be raised at, which nothing checked before.
+        """AT-115 — a ``Raises:`` section wherever a caller can be raised at.
 
-        46 module-level functions and public-class methods when this was measured, and no gaps. The
-        definition of "public" excludes closures, and :func:`_public_definitions` says why.
+        Over every module-level function and public-class method; the floor of 40 definitions guards against
+        a sweep that silently finds none. The definition of "public" excludes closures, and
+        :func:`_public_definitions` says why.
         """
         undocumented, counted = [], 0
         for path in _source_modules():
@@ -654,8 +657,7 @@ class TestTheHouseConventionsAreEnforcedNotDescribed:
     def test_no_version_gated_asyncio_api_is_used_ungated(self) -> None:
         """AT-115 — ``TaskGroup`` and ``asyncio.timeout`` are 3.11+, and the floor is 3.10.
 
-        Held by absence rather than by discipline: neither appears in ``src``. The test is the thing that
-        keeps the floor from being broken by one convenient import.
+        Neither appears in ``src``. This test keeps the floor from being broken by one convenient import.
         """
         ungated = []
         for path in _source_modules():
@@ -671,40 +673,37 @@ class TestTheHouseConventionsAreEnforcedNotDescribed:
         assert importing == [], f"these modules reach for pydantic: {importing}"
 
     def test_the_one_convention_this_package_declines_is_written_down(self) -> None:
-        """AT-115 — ``REQ-E-112``: the log message shape, and the deviation stated as a decision.
+        """AT-115 — the log message shape, and the deviation from the SDK stated as a decision.
 
         The SDK's format is ``field=<%s> | lowercase message``. This package prefixes ``strands_mongodb: ``
         and writes a sentence, because a message such as the one naming the server error code a capability
         probe saw is explanatory rather than a field list, and because the logger name is not rendered in
-        most agent processes. A
-        deviation nobody wrote down is indistinguishable from not knowing the rule, and contributor number
-        two writes log call eleven either way.
+        most agent processes. Writing the deviation down tells a contributor the SDK's rule is known and
+        declined, so new log calls follow this package's shape.
         """
         text = _text(_AGENTS)
         assert "strands_mongodb: " in text, "AGENTS.md does not show the log prefix this package actually uses"
         assert any(word in text.lower() for word in ("deviat", "differs from", "does not copy")), (
-            "AGENTS.md states the log format without saying it deviates from the SDK's, which reads as ignorance"
+            "AGENTS.md states the log format without saying it deviates from the SDK's"
         )
 
 
 class TestADeprecationIsAFailureRatherThanAScrollbackLine:
-    """``AT-162`` / ``REQ-E-156`` -- the warning filter, and the floor that lets the suite survive it.
+    """``AT-162`` -- the warning filter, and the floor that lets the suite survive it.
 
-    The pin below sat at ``<1.0.0`` from this package's first commit, and the cost of leaving it there
-    looked like tidiness: 2,269 ``DeprecationWarning``s per run, every one of them ``pytest_asyncio``
-    0.26 calling ``asyncio.get_event_loop_policy()``, which Python removes in 3.16. The real cost was that
-    a deprecation raised by *this* package would have arrived as line 2,270 of a wall nobody reads, and
-    :class:`TestTheHouseConventionsAreEnforcedNotDescribed.test_every_warning_passes_a_stacklevel` is
-    written for exactly the ``warnings.warn`` call somebody adds later.
+    ``pyproject.toml`` turns every ``DeprecationWarning`` into an error, so a deprecation raised by this
+    package fails the run instead of scrolling past in a long list of warnings.
+    :class:`TestTheHouseConventionsAreEnforcedNotDescribed.test_every_warning_passes_a_stacklevel` is written
+    for the ``warnings.warn`` call somebody adds later, and this filter is what makes its warning visible.
 
-    So the two halves are one change: the filter makes the category fatal, and the floor is what makes the
-    filter survivable. Measured on the same tree under the same filter -- 915 errors on ``pytest-asyncio``
-    0.26.0, 912 passed on 1.4.0.
+    The filter needs ``pytest-asyncio`` 1.0 or newer. Version 0.26 calls ``asyncio.get_event_loop_policy()``,
+    which Python removes in 3.16, on every async test, and under the filter each of those calls is an error.
+    So the two halves are one change: the filter makes the category fatal, and the floor makes the filter
+    survivable.
 
     Both tests below observe the running interpreter rather than reading ``pyproject.toml`` back. A test
-    that parses the manifest and asserts the manifest says what the manifest says passes while the setting
-    does nothing -- the same failure as a document checked only against itself, which is how the root
-    ``README.md`` came to describe a fixed defect for months with a passing test over it.
+    that parses the manifest and asserts the manifest says what it says passes while the setting does
+    nothing.
     """
 
     def test_a_deprecation_warning_raised_here_stops_the_test(self) -> None:
@@ -721,10 +720,9 @@ class TestADeprecationIsAFailureRatherThanAScrollbackLine:
     def test_the_async_plugin_is_past_the_version_that_trips_that_filter(self) -> None:
         """AT-162 -- read from the installed distribution, so the failure names the cause.
 
-        Strictly redundant: on 0.26 the filter turns 915 tests into errors and the run is unmistakably
-        broken. It is here for what the *first* line of that report says. 915 errors inside pytest's own
-        plugin is a morning of bisecting; one failure naming the plugin and the floor is a ``pip install``.
-        A test can be redundant about the outcome and load-bearing about the diagnosis.
+        The outcome is already clear without it: on 0.26 the filter turns most of the suite into errors. It
+        is here for the diagnosis. Hundreds of errors inside pytest's own plugin are slow to trace, and one
+        failure naming the plugin and the floor points straight at the ``pip install`` that fixes them.
         """
         installed = version("pytest-asyncio")
         major = int(installed.split(".")[0])
@@ -736,28 +734,22 @@ class TestADeprecationIsAFailureRatherThanAScrollbackLine:
 
 
 class TestTheWarningTheFilterLeavesCountedIsNotOursToFix:
-    """``AT-191`` / ``REQ-E-156`` -- the reason the filter names one category instead of erroring on all.
+    """``AT-191`` -- the reason the filter names one category instead of erroring on all.
 
     ``filterwarnings = ["error::DeprecationWarning"]`` is deliberately narrower than ``["error"]``, and the
-    comment in ``pyproject.toml`` gives two reasons. One of them was read off the tail of a 1,922-second
-    contract run and never reproduced: nine ``PytestUnraisableExceptionWarning``s, diagnosed as
-    pymongo's periodic executor cancelling its task from a weakref callback after the loop it belongs to
-    has closed. The test named in that report was whichever one happened to be running, so the diagnosis
-    was an inference from a stack trace, and a justification nobody can reproduce is a justification that
-    gets argued away the next time somebody wants the strict setting.
+    comment in ``pyproject.toml`` gives two reasons. One is a ``PytestUnraisableExceptionWarning`` that
+    pymongo raises when its periodic executor cancels its task from a weakref callback after the event loop
+    it belongs to has closed. It appears at the end of a long contract run, attributed to whichever test
+    happens to be running, so the stack trace alone does not identify the cause.
 
-    Reproduced here in five lines, deterministically and with no deployment: exactly the shape
-    ``monitor.py`` builds, exactly one ``RuntimeError: Event loop is closed``, arriving where no ``except``
-    can see it.
+    These tests reproduce it deterministically and with no deployment: exactly the shape ``monitor.py``
+    builds, exactly one ``RuntimeError: Event loop is closed``, arriving where no ``except`` can see it.
+    One executor whose loop has closed produces one warning.
 
-    **Not fixed upstream, and not by anything this project can pin.** ``AsyncPeriodicExecutor.close`` is
-    byte-identical in 4.14.0 and in 4.18.1, the newest release at the time of writing: it calls
-    ``self._task.cancel()`` with nothing asking whether the loop is still alive. So the filter stays narrow,
-    and if that ever changes these tests fail -- which is the good direction, and the signal that
-    ``["error"]`` has become affordable.
-
-    **Not claimed: that the nine warnings in that run were each this.** One executor produces one, and the
-    count matched the number of clients that outlived their loops; that is consistent rather than proven.
+    **Not fixed upstream.** ``AsyncPeriodicExecutor.close`` is byte-identical in pymongo 4.14.0 and 4.18.1:
+    it calls ``self._task.cancel()`` without checking whether the loop is still alive. So the filter stays
+    narrow. If the driver adds that check these tests fail, which is the signal that ``["error"]`` has
+    become affordable.
     """
 
     def test_the_executors_close_raises_when_its_loop_is_gone(self) -> None:
@@ -814,7 +806,7 @@ class TestTheWarningTheFilterLeavesCountedIsNotOursToFix:
 
         The wiring is not reachable through behaviour: the callback is registered inside ``Monitor.open``
         on an object that closes over ``self``, and nothing exposes it. So the module is read. A brittle
-        assertion on purpose -- if pymongo stops passing ``executor.close`` to ``weakref.ref``, the
+        assertion on purpose: if pymongo stops passing ``executor.close`` to ``weakref.ref``, the
         reproduction above is testing a shape the driver no longer builds, and this is the only test that
         would say so.
         """
@@ -822,14 +814,15 @@ class TestTheWarningTheFilterLeavesCountedIsNotOursToFix:
 
         assert "weakref.ref(self, executor.close)" in inspect.getsource(monitor), (
             f"pymongo {version('pymongo')} no longer registers the executor's close as a weakref callback, "
-            f"so AT-191's reproduction no longer mirrors the driver -- re-derive it from monitor.py"
+            f"so the reproduction in test_the_executors_close_raises_when_its_loop_is_gone no longer mirrors "
+            f"the driver; re-derive it from monitor.py"
         )
 
 
 def _section(document: Path, heading: str) -> str:
     """The body of one ``##`` section of a Markdown document, matched on the heading text.
 
-    Sections rather than whole documents, because the questions ``AT-181`` asks are local: the address in
+    Sections rather than whole documents, because the questions the security-address tests ask are local: the address in
     the security section is the one a finder uses, and an address anywhere else in the file is a different
     claim. Two sections with the same heading would be concatenated, which no document here has.
 
@@ -865,16 +858,13 @@ def _addresses(text: str) -> set[str]:
 
 
 class TestTheCodeOfConductAndTheSecurityAddressResolve:
-    """``AT-181`` — ``REQ-E-176``: the two sections that shipped as placeholders for a long time.
+    """``AT-181`` — the code of conduct and the security address resolve, to the company that can act.
 
-    Neither was a hard question; both were somebody else's. The template these documents were modelled on
-    answers both with Amazon's, and ``AT-113`` held the placeholders to naming a tracked item so that going
-    quiet could not resolve them. The owner supplied both on 2026-09-17, and the claim moves with them: from
-    "a placeholder names its item" to "an address resolves, and belongs to the company that can act on it".
-
-    The company check is the one worth having. A wrong address is a report nobody reads, and the specific way
-    this repository could have got there was inheriting a contact from the template -- which is a valid
-    address at a company that cannot fix a defect in a MongoDB package.
+    The code of conduct section links a document, and the security route is one address that belongs to
+    the company that can act on a report. The template these documents were modelled on answers both with
+    Amazon's, which is why the company check matters most: a wrong address is a report nobody reads, and a
+    contact inherited from the template is a valid address at a company that cannot fix a defect in a
+    MongoDB package.
     """
 
     def test_the_security_policy_is_at_the_filename_github_reads(self) -> None:
@@ -883,7 +873,7 @@ class TestTheCodeOfConductAndTheSecurityAddressResolve:
         ``CONTRIBUTING.md`` has the same address in it and is not where a finder looks: GitHub surfaces this
         filename and only this filename.
         """
-        assert _SECURITY.is_file(), f"REQ-E-176 asks for a security policy at {_SECURITY.name} and it is absent"
+        assert _SECURITY.is_file(), f"the security policy belongs at {_SECURITY.name} and it is absent"
 
     def test_the_code_of_conduct_section_links_a_document_rather_than_describing_one(self) -> None:
         """AT-181 — a link, because "be respectful" is a sentiment and a code of conduct is a document."""
@@ -907,10 +897,10 @@ class TestTheCodeOfConductAndTheSecurityAddressResolve:
         assert found == {_SECURITY_ADDRESS}, f"the security route is not one address: {sorted(found)}"
 
     def test_no_address_any_of_the_documents_names_belongs_to_another_company(self) -> None:
-        """AT-181 — the failure exactly: a valid address at a company that cannot act on the report.
+        """AT-181 — no address in the documents is a valid one at a company that cannot act on a report.
 
-        Both addresses in this repository are at ``mongodb.com`` -- the reporting one the owner supplied,
-        and ``community@mongodb.com``, which is the address MongoDB's own code of conduct names. The count
+        Both addresses in this repository are at ``mongodb.com``: the reporting address, and
+        ``community@mongodb.com``, which is the address MongoDB's own code of conduct names. The count
         guards the walk: an expression that matched nothing would pass the domain check silently.
         """
         found = {address for path in (_AGENTS, _CONTRIBUTING, _SECURITY) for address in _addresses(_text(path))}
@@ -949,9 +939,8 @@ class TestTheCodeOfConductAndTheSecurityAddressResolve:
     def test_no_placeholder_stands_where_an_address_or_a_link_belongs(self) -> None:
         """AT-181 — ``AT-113`` asserts a placeholder names a tracked item; this asserts there is none left.
 
-        The two are different claims and both are worth keeping. A tracked placeholder was the right answer
-        while the decision was open, and it is the wrong answer now that it is closed: the address exists, so
-        a ``TODO`` in either section would mean somebody replaced an answer with a promise.
+        The two are different claims. A tracked placeholder is acceptable while a decision is open. In these
+        sections the decision is made, so a ``TODO`` in either would replace an answer with a promise.
         """
         sections = {
             "CONTRIBUTING.md 'Code of conduct'": _section(_CONTRIBUTING, "Code of conduct"),
@@ -959,4 +948,4 @@ class TestTheCodeOfConductAndTheSecurityAddressResolve:
             _SECURITY.name: _text(_SECURITY),
         }
         held = {name: _TODO.findall(text) for name, text in sections.items() if _TODO.search(text)}
-        assert held == {}, f"a placeholder stands where REQ-E-176 asks for an address or a link: {held}"
+        assert held == {}, f"a placeholder stands where an address or a link belongs: {held}"

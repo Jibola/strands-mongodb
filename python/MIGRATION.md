@@ -367,8 +367,9 @@ The second row is the near miss, and it is the one worth being careful about: it
 one of the three this package declares, so an index that looks right is missing precisely the two entries
 that make scope and store isolation enforceable server-side.
 
-**`initialize()` changes nothing, and under a named `search_type` it raises.** It reads the existing index by name, compares the reported
-definition against the one it needs by containment, and when something it declared is absent it stops. It
+**`initialize()` changes nothing, and under a named `search_type` it raises.** It reads the existing index
+by name, compares the reported definition against the one it needs by containment, and when something it
+declared is absent it stops. It
 does not drop the index, and it does not issue a create for a name that is already taken. The message names
 the gap and leaves both remedies for you to run:
 
@@ -389,8 +390,8 @@ is dropped and the store answers from the text tier, so a migrated store that st
 matches may be this case. Check `_search_type` on a result, or the warning, before concluding that it is
 working.
 
-Measured against Atlas 8.0.30 on 2026-09-01, with the database name replaced and the create command's
-definition elided for width. Both foreign definitions were created on that deployment first, and Atlas
+Output from Atlas 8.0.30, with the database name replaced and the create command's definition elided for
+width. Both foreign definitions were created on that deployment first, and Atlas
 accepted both, including the legacy `knnVector` form, which it reports as `type: "search"` with the
 definition echoed back unchanged.
 
@@ -401,8 +402,8 @@ match: same path, same model. That is the useful version of the message, since i
 one line short rather than wrong. If you configure `embedding_dimensions` and supply your own vectors, the
 field it names first is the `vector` one on `embedding` instead.
 
-The clause about dropping is not boilerplate: a search index build takes minutes, and something may be
-querying the old one, so the choice of when to drop it belongs to you.
+The package does not drop the index for you because a search index build takes minutes and something may
+be querying the old one, so the choice of when to drop it belongs to you.
 
 Two ways to avoid the collision entirely. Copy into a **new collection**, which is what the script above
 does, and let this package build its own indexes there. Or, if you want both packages on one collection

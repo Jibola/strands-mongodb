@@ -1,33 +1,34 @@
 """The two shipped examples, run as subprocesses rather than read as documentation.
 
-The examples acceptance set, ``AT-086`` through ``AT-090``, split across three tiers because the two
-scripts need different deployments and two of the claims need none:
+The tests are split across three tiers, because the two scripts need different deployments and three
+of the classes need none:
 
-===============================  ==============================  =========================================
-Test                             Tier                            Why
-===============================  ==============================  =========================================
-``AT-086``                       ``example`` + ``autoembed``      recalls a fact from a query sharing no
-                                                                 word with it, which only server-side
-                                                                 embeddings can answer
-``AT-089``                       ``example`` + ``contract``       ``Storage`` is primary-key reads and a
-                                                                 key-space scan; no search index exists
-``AT-087``, ``AT-088``, ``AT-090``  unit                          a stream mapping, a refusal to start,
-                                                                 and four lines of ``pyproject.toml``
-===============================  ==============================  =========================================
+=========================================  ==========================  ===================================
+Class                                      Tier                        Why
+=========================================  ==========================  ===================================
+``TestTheMemoryExampleAcrossTwoProcesses``   ``example`` + ``autoembed``  recalls a fact from a query sharing
+                                                                         no word with it, which only
+                                                                         server-side embeddings can answer
+``TestTheStorageExampleAcrossTwoProcesses``  ``example`` + ``contract``   ``Storage`` is primary-key reads
+                                                                         and a key-space scan; no search
+                                                                         index exists
+``TestTheScriptedModelStream``,              unit                        a stream mapping, a refusal to
+``TestTheScriptsRefuseToStartAndSayWhy``,                                start, and four lines of
+``TestTheExamplesAreInsideEveryFileSet``                                 ``pyproject.toml``
+=========================================  ==========================  ===================================
 
-**``example`` is a selector, not a gate.** It has no environment variable of its own (``REQ-E-089``),
-the way ``compat`` and ``gate`` do not, so ``-m example`` collects both subprocess tests and the tier
-marker beside it decides whether either runs. A test carrying only ``example`` would run everywhere and
-need a deployment nowhere, which is the failure this arrangement avoids.
+**``example`` is a selector, not a gate.** It has no environment variable of its own, the way ``compat``
+and ``gate`` do not, so ``-m example`` collects both subprocess tests and the tier marker beside it decides
+whether either runs. A test carrying only ``example`` would run everywhere and need a deployment nowhere,
+which is the failure this arrangement avoids.
 
 **Nothing here imports ``examples/``.** The scripts are run with ``sys.executable`` and read through
-their exit status and their stdout, which is what the reader does. ``AT-087`` is the one exception in
-spirit and not in fact: it needs to see the events ``ScriptedModel`` yields, so it imports ``_support``
-inside a child interpreter with ``examples/`` on the path, and the parent process never does. Keeping
-the package's own test suite free of an import path into ``examples/`` is what stops a script from
-quietly becoming a library that the tests, and only the tests, depend on.
+their exit status and their stdout, which is what the reader does. ``TestTheScriptedModelStream`` needs to
+see the events ``ScriptedModel`` yields, so it imports ``_support`` inside a child interpreter with
+``examples/`` on the path, and the parent process never does. Keeping the package's own test suite free of
+an import path into ``examples/`` stops a script from becoming a library that only the tests depend on.
 
-**The two subprocess tests cross a real process boundary.** What passes from the first process to the second
+**The two subprocess tests cross a process boundary.** What passes from the first process to the second
 is whatever MongoDB holds and the command line the first process printed. A second ``Agent`` in one
 interpreter would exercise neither, while looking like a restart in the test's name.
 """
@@ -66,29 +67,28 @@ _PYPROJECT = _PROJECT_ROOT / "pyproject.toml"
 #
 # The lookahead is the one thing this pattern permits, and it is permitted exactly: `_support.redact`
 # replaces the whole userinfo with `<redacted>`, so `mongodb+srv://<redacted>@host` is the redaction
-# working rather than a leak. Without it the guard flagged its own output, which is what happened the
-# first time either script ran against a real `mongodb+srv://` cluster. A partial redaction such as
-# `user:<redacted>@` does not start with the placeholder and is still caught.
+# working rather than a leak, and without the lookahead the guard would flag the redacted output. A
+# partial redaction such as `user:<redacted>@` does not start with the placeholder and is still caught.
 _CREDENTIALED_URI = re.compile(r"mongodb(\+srv)?://(?!<redacted>@)[^\s/]*@")
 
 # Punctuation the no-shared-word check strips before comparing, so `"dark-mode."` and `"dark mode"`
-# are not counted as different words. `REQ-E-082` asks the script to make this check itself; `AT-086`
+# are not counted as different words. The memory example makes this check itself; the two-process test
 # repeats it over what the script printed, which is the only way to catch a script whose own check
 # passes against literals it no longer uses.
 _NOT_A_WORD = re.compile(r"[^a-z0-9]+")
 
-# How long `AT-086` waits for a written memory to become searchable, and how long it pauses between
-# tries (`REQ-E-091`, write to searchable).
+# How long the memory example's two-process test waits for a written memory to become searchable, and
+# how long it pauses between tries.
 #
 # Atlas embeds a newly inserted document after the write acknowledges. There is no status field for it
 # anywhere in the driver surface, unlike the index build that `_indexes.ensure` polls, so waiting is
-# the only thing a caller can do. Measured on the development cluster: `add()` returned in 0.06s and
-# the document first answered a vector query 15.5s later. The budget is 90s, which is roughly six
-# times that, because the number is one cluster's behaviour under no load and not a guarantee.
+# the only thing a caller can do. On a quiet cluster `add()` returns in well under a second and the
+# document answers a vector query about 15 s later. The budget is 90 s, roughly six times that, because
+# that figure is one cluster's behaviour under no load and not a guarantee.
 #
-# The timeout is what makes this a test rather than a coin toss, and it is why the assertion below is
-# on the deadline expiring: a regression that stops writing altogether never produces a hit, so it
-# still fails, just 90 seconds later than it used to.
+# The deadline keeps the test deterministic, and it is why the assertion below fires when the deadline
+# expires: a regression that stops writing altogether never produces a hit, so it still fails, after
+# the full 90 seconds.
 _EMBEDDING_BUDGET_SECONDS = 90.0
 _EMBEDDING_POLL_SECONDS = 5.0
 
@@ -185,10 +185,10 @@ def _recall_until_embedded(
 
     Polls on ``recalled`` rather than on any hit, which matters: the curated store's fact is written
     first and becomes searchable first, so a run can report one hit while the fact under test is still
-    unembedded. Waiting on the wrong condition would have passed with the extracted memory missing.
+    unembedded. Waiting on any hit would pass with the extracted memory missing.
 
-    Every attempt is a full subprocess, which is the point of the boundary and not overhead worth
-    optimising away. Each one also gets the credential sweep, because a leak on attempt four is a leak.
+    Every attempt is a full subprocess, because crossing the process boundary is what the test proves.
+    Each one also gets the credential sweep, because a leak on a later attempt is still a leak.
 
     Args:
         arguments: The shared command line, identical to the write step's.
@@ -235,15 +235,15 @@ def _unconfigured_environment() -> dict[str, str]:
 @pytest.mark.example
 @pytest.mark.autoembed
 class TestTheMemoryExampleAcrossTwoProcesses:
-    """AT-086 / REQ-E-080, REQ-E-081, REQ-E-082, REQ-E-083, REQ-E-084 — across a real process boundary.
+    """AT-086. A fact written by one process is recalled by another.
 
     One test, because the claim is one claim: a fact written by a process that has exited is found by a
     process that never saw it, using a query with no word in common with it. Splitting it into "the write
     step exits zero" and "the recall step finds something" would let the second pass on residue from an
-    earlier run, which is why both steps take the throwaway collection ``conftest.py`` drops on teardown
+    earlier run, which is why both steps take the temporary collection ``conftest.py`` drops on teardown
     and a scope unique to this test.
 
-    The tier is ``autoembed`` rather than ``integration`` for the reason ``REQ-E-082`` gives. A query
+    The tier is ``autoembed`` rather than ``integration``. A query
     sharing no token with the stored fact is answerable only by a vector search whose embeddings the
     server produced; on a deployment with mongot and no registered model there is nothing to embed the
     query with, and the test would fail for the configuration rather than for the code.
@@ -273,18 +273,17 @@ class TestTheMemoryExampleAcrossTwoProcesses:
         _no_credentials(write, autoembed_uri)
         written = _summary(write)
 
-        # The handoff `REQ-E-081` requires, checked here against a command that has to work rather
-        # than only against the `--dry-run` text `AT-088` reads.
+        # The printed handoff to the recall step, checked here against a command that has to work rather
+        # than only against the `--dry-run` text `TestTheScriptsRefuseToStartAndSayWhy` reads.
         assert "recall" in write.stdout
         assert scope in write.stdout
 
         stored = [entry["content"] for entry in written["stored"]]
         assert stored, f"the write step reported no stored entries: {written!r}"
 
-        # Retried, not run once (`REQ-E-091`). The write above has acknowledged and the
-        # document is durable, but Atlas embeds it afterwards and a search before that finishes returns
-        # nothing rather than failing. Running this once is how the test failed on its first live run
-        # with the code working exactly as specified.
+        # Retried, not run once. The write above has acknowledged and the document is durable, but Atlas
+        # embeds it afterwards and a search before that finishes returns nothing rather than failing, so a
+        # single attempt would fail with the code working as specified.
         recall, found, recalled = _recall_until_embedded(arguments, environment, autoembed_uri, stored)
         hits = found["hits"]
 
@@ -292,12 +291,12 @@ class TestTheMemoryExampleAcrossTwoProcesses:
         assert recalled[0]["content"] in recall.stdout
         assert isinstance(recalled[0]["score"], float)
 
-        # `REQ-E-083`: two stores in one manager, and the hit comes from the writable one by name.
+        # Two stores in one manager, and the hit comes from the writable one by name.
         assert any(hit["store_name"] == found["writable_store"] for hit in recalled), (
             f"no hit came from the writable store {found['writable_store']!r}: {hits!r}"
         )
 
-        # `REQ-E-082`, re-derived from the two strings the script printed. A script that checks its
+        # No shared word, re-derived from the two strings the script printed. A script that checks its
         # own literals and then queries with something else would pass its own check and fail here.
         overlap = _words(found["query"]) & _words(recalled[0]["content"])
         assert not overlap, f"query and fact share {sorted(overlap)}"
@@ -306,16 +305,16 @@ class TestTheMemoryExampleAcrossTwoProcesses:
 @pytest.mark.example
 @pytest.mark.contract
 class TestTheStorageExampleAcrossTwoProcesses:
-    """AT-089 / REQ-E-086, REQ-E-087, REQ-E-088 — across a real process boundary.
+    """AT-089. One collection serves three SDK subsystems, across two processes.
 
     ``contract`` and not ``integration``: everything this example does is a primary-key write, a
     primary-key read and a bounded ``_id`` range scan, so it runs against a plain ``mongod``. The
     prefix census is a ``list()`` over key space, which needs no search index and no mongot.
 
     The three prefixes are read with a direct client rather than from the script's own census, and the
-    difference matters. ``REQ-E-087`` has the script print what it reads, so a census assertion made
-    against that output would confirm the script agrees with itself. The point of the acceptance test is
-    that three SDK subsystems really did land in one collection, which only a fourth reader can say.
+    difference matters. The script prints what it reads, so a census assertion made against that output
+    would confirm the script agrees with itself. The test proves that three SDK subsystems landed in one
+    collection, which only an independent reader can confirm.
     """
 
     async def test_one_collection_serves_three_subsystems_and_the_session_survives_a_restart(
@@ -355,9 +354,9 @@ class TestTheStorageExampleAcrossTwoProcesses:
 
         assert resumed["restored_messages"] > 0, f"nothing was restored\n{_both_streams(second)}"
 
-        # `REQ-E-088`'s sentence, identified by the prefix it opens with so the assertion does not pin
-        # the wording. It has to name both halves of the distinction to be the sentence at all.
-        cited = [line for line in second.stdout.splitlines() if "on the memory/ prefix:" in line]
+        # The storage-versus-memory sentence, found by its one technical term so the assertion does not pin
+        # the rest of the wording. It has to name both halves of the distinction to be the sentence at all.
+        cited = [line for line in second.stdout.splitlines() if "token overlap" in line]
         assert cited, f"the storage-versus-memory-collection sentence is missing\n{second.stdout}"
         assert any("storage" in line.lower() and "memor" in line.lower() for line in cited), cited
 
@@ -421,7 +420,7 @@ _TOOL_USE_BLOCK_EVENTS = [
 
 
 class TestTheScriptedModelStream:
-    """AT-087 / REQ-E-085 — the bundled model emits the sequence the event loop reads.
+    """AT-087. The bundled model emits the sequence the event loop reads.
 
     Whole-list equality rather than a set of spot checks, and that is the point of the test. A stream
     missing its ``messageStop``, or carrying a ``contentBlockDelta`` with no ``contentBlockStart`` before
@@ -458,17 +457,16 @@ _FIRST_STEPS = [
 
 
 class TestTheScriptsRefuseToStartAndSayWhy:
-    """AT-088 / REQ-E-080, REQ-E-081, REQ-E-081a — the unit-tier half of the examples.
+    """AT-088. The unit-tier half of the examples.
 
     Three properties, none of which needs a deployment, and all three of which are what a reader meets
     first: the script refuses to start when it has no cluster and names the variable it wants, it will
     describe a step without connecting, and it stays quiet on stdout unless asked for a machine-readable
     line.
 
-    ``--dry-run`` is why the handoff (``REQ-E-081``) is checkable here at all. The alternative is
-    asserting it only inside ``AT-086`` and ``AT-089``, which leaves the one string joining the two
-    processes unchecked in every run with no ``MONGODB_URI``, and that is most runs while the examples
-    are being written.
+    ``--dry-run`` is why the printed handoff to the second step is checkable here at all. The alternative
+    is asserting it only inside the two subprocess test classes, which leaves the one string joining the
+    two processes unchecked in every run with no ``MONGODB_URI``, which is most local runs.
     """
 
     @pytest.mark.parametrize(("script", "first", "second", "carried"), _FIRST_STEPS)
@@ -529,17 +527,15 @@ class TestTheScriptsRefuseToStartAndSayWhy:
     def test_the_credential_guard_permits_only_the_exact_redaction(self, line: str, is_a_leak: bool) -> None:
         """The guard itself, because it is the only thing between an Atlas password and a CI log.
 
-        A test of a test, and worth the four lines. The pattern started as a blanket ban on an ``@`` in
-        the userinfo position, which flagged ``_support.redact``'s own output the first time either script
-        connected to a `mongodb+srv://` cluster. Widening it to allow the placeholder is the kind of fix
-        that quietly allows everything if the lookahead is written loosely, so the two partial redactions
-        below are here to prove it did not.
+        A test of a test. The pattern allows exactly one thing in the userinfo position, the
+        ``<redacted>`` placeholder that ``_support.redact`` writes. A loosely written lookahead would allow
+        everything, so the two partial redactions below prove that only the exact redaction passes.
         """
         assert bool(_CREDENTIALED_URI.search(line)) is is_a_leak
 
 
 class TestTheExamplesAreInsideEveryFileSet:
-    """AT-090 / REQ-E-089, REQ-E-090 — four lines of ``pyproject.toml``, asserted rather than assumed.
+    """AT-090. Four lines of ``pyproject.toml``, asserted rather than assumed.
 
     Each of the four is invisible when wrong. ruff and mypy both report success over the files they were
     given, so an ``examples/`` directory missing from either list produces a green run that checked

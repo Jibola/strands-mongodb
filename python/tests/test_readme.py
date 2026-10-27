@@ -1,13 +1,12 @@
 """The two READMEs and the migration guide, read as source rather than as prose.
 
-The README acceptance set, ``AT-092`` through ``AT-097``. Every test here reads
-``python/README.md``, the repository-root ``README.md`` or ``python/MIGRATION.md`` and compares it against
-something that cannot drift silently: a running interpreter, a ``TypedDict``, a command renderer, a
-deployment, or ``pyproject.toml``.
+Every test here reads ``python/README.md``, the repository-root ``README.md`` or ``python/MIGRATION.md``
+and compares it against something that cannot drift silently: a running interpreter, a ``TypedDict``, a
+command renderer, a deployment, or ``pyproject.toml``.
 
-The guide was added to this sweep rather than given a sweep of its own, so its procedures obey
-the same directive rule as a quickstart. ``test_migration.py`` covers what the guide claims; this file
-covers what it runs.
+The migration guide shares this sweep rather than having one of its own, so its procedures obey the same
+directive rule as a quickstart. ``test_migration.py`` covers what the guide claims; this file covers what
+it runs.
 
 Each fenced block declares what happens to it in an HTML comment on the line above the fence:
 
@@ -24,13 +23,13 @@ Directive                               Means
 ``<!-- skip: <reason> -->``             not executed, and the reason is part of the document
 ======================================  ===================================================================
 
-A block with an executable language and no directive fails ``AT-097``. That is the point of the
-mechanism: executing a snippet is the default, and not executing one is a decision somebody wrote down
-where a reviewer can see it.
+A block with an executable language and no directive fails ``TestEveryBlockDeclaresWhatHappensToIt``.
+That is the point of the mechanism: executing a snippet is the default, and not executing one is a
+decision written down where a reviewer can see it.
 
 Snippets read their deployment and database from the environment, which is what makes them runnable
-here and is also the standing rule: a literal connection string in a document is how a password
-reaches a document.
+here and also keeps credentials out of the documents: a literal connection string in a document is how a
+password gets published.
 """
 
 from __future__ import annotations
@@ -182,10 +181,10 @@ def _blocks(path: Path) -> tuple[Block, ...]:
 _PACKAGE_BLOCKS = _blocks(_PACKAGE_README)
 _ROOT_BLOCKS = _blocks(_ROOT_README)
 
-# The migration guide joins the sweep rather than getting its own copy of it (`REQ-E-102`).
-# Its procedures are the snippets in this repository most likely to be run against real data, so the
-# directive rule, the credential rule and the tier runners apply to them by inheritance. What the guide
-# *says* is `test_migration.py`'s subject; what it *runs* is this file's.
+# The migration guide joins the sweep rather than getting its own copy of it. Its procedures are the
+# snippets in this repository most likely to be run against real data, so the directive rule, the
+# credential rule and the tier runners apply to them by inheritance. What the guide *says* is
+# `test_migration.py`'s subject; what it *runs* is this file's.
 _MIGRATION_GUIDE = _PROJECT_ROOT / "MIGRATION.md"
 _MIGRATION_BLOCKS = _blocks(_MIGRATION_GUIDE)
 
@@ -331,13 +330,13 @@ def _annotated_keys(typed_dict: Any) -> tuple[frozenset[str], frozenset[str]]:
 class TestEveryBlockDeclaresWhatHappensToIt:
     """``AT-097`` -- the sweep that makes every other test in this file mandatory rather than optional.
 
-    Executing the snippets proves the executed ones work. It says nothing about the snippet somebody
-    adds next week, which is the one that will be wrong. So the default is execution and an exemption
-    has to be written down.
+    Executing the snippets proves the executed ones work. It says nothing about the next snippet added,
+    which is the one most likely to be wrong. So the default is execution and an exemption has to be
+    written down.
     """
 
     def test_every_executable_block_carries_a_directive(self) -> None:
-        """AT-097 -- a ``python`` or ``javascript`` block with no directive fails here (``REQ-E-097``)."""
+        """AT-097 -- a ``python`` or ``javascript`` block with no directive fails here."""
         undeclared = [block.where for block in _ALL_BLOCKS if block.executable and not block.kind]
         assert undeclared == [], (
             f"these code blocks declare neither a run tier nor a skip reason: {undeclared}. Add "
@@ -359,19 +358,19 @@ class TestEveryBlockDeclaresWhatHappensToIt:
         assert unknown == [], f"unrecognised run tiers, which no test below would pick up: {unknown}"
 
     def test_no_document_in_the_sweep_carries_a_credential(self) -> None:
-        """AT-097 -- ``REQ-E-093``: a literal connection string in a document is how a password ships.
+        """AT-097 -- no document carries a connection string with credentials in it.
 
         Over the whole file rather than over the code blocks, because prose is where a URI gets pasted
-        while somebody explains what a URI looks like. The migration guide is the highest-risk of the
-        three: its reader has an old deployment and a new one, so it is the document where somebody is
-        most tempted to write both out.
+        while explaining what a URI looks like. The migration guide carries the most risk of the three:
+        its reader has an old deployment and a new one, so it is the document most likely to have both
+        written out.
         """
         for path in _DOCUMENTS:
             found = _CREDENTIALED_URI.findall(path.read_text())
             assert found == [], f"{path.name} contains a connection string with credentials in it"
 
     def test_every_connecting_snippet_reads_its_deployment_from_the_environment(self) -> None:
-        """AT-097 -- ``REQ-E-093``, the positive half: the snippets show the habit, not just avoid the leak.
+        """AT-097 -- the positive half: the snippets show the habit, not just avoid the leak.
 
         A reader copies the snippet before reading the paragraph above it, so where the URI comes from is
         the snippet's job to demonstrate.
@@ -387,7 +386,7 @@ class TestEveryBlockDeclaresWhatHappensToIt:
 
 
 class TestTheQuickstartsRun:
-    """``AT-092`` -- ``REQ-E-092``: the quickstart is executed from the README text, not transcribed.
+    """``AT-092`` -- the quickstart is executed from the README text, not transcribed.
 
     A quickstart is the one snippet every reader runs, so it is the one snippet that must not be stale.
     Copying it into a test file would only prove the copy works.
@@ -436,10 +435,10 @@ class TestTheQuickstartsRun:
 
 
 class TestTheTwoReadmesAgree:
-    """``AT-093`` -- the drift guard on the split between the two files.
+    """``AT-093`` -- the drift guard between the landing page and the package reference.
 
-    Two files stating one fact is the arrangement that rots, and it rots asymmetrically: the file people
-    edit stays right and the other one keeps its old number. So the shared facts are compared, and the
+    Two files stating one fact is the arrangement that drifts, and it drifts asymmetrically: the file
+    people edit stays right and the other one keeps its old number. So the shared facts are compared, and the
     version floors are compared against ``pyproject.toml`` rather than against each other, because two
     files agreeing on a stale number is the failure this is meant to catch.
     """
@@ -447,15 +446,13 @@ class TestTheTwoReadmesAgree:
     def test_the_install_section_is_identical_in_both(self) -> None:
         """AT-093 -- the whole ``## Install`` section, compared verbatim rather than one block out of it.
 
-        This compared ``[0]`` of the blocks containing ``pip install``, which was the entire shared
-        surface while the PyPI commands were the only install block. Two things make that too narrow now.
-        The section gained a second block -- how to install before the package is published -- and the
-        first element of a list is exactly what keeps matching while the part somebody edited drifts. And
-        a block comparison never saw the prose between the blocks, where the reason for each command is
-        written; the caveat about quoting brackets could disagree between the two files indefinitely.
+        The whole section rather than one block, because the section holds more than one install block,
+        and comparing only the first would keep matching while another one drifted. A block comparison
+        would also miss the prose between the blocks, where the reason for each command is written, such
+        as the caveat about quoting brackets.
 
-        The section rather than the file, because these are not the same document: the split makes the root
-        file a landing page and ``python/README.md`` the reference, and the reference carries a
+        The section rather than the file, because these are not the same document: the root file is a
+        landing page and ``python/README.md`` is the reference, and the reference carries a
         ``pip install -e`` line for contributors that the landing page has no reason to repeat. What the
         two are required to agree on is what they tell a reader to install, and that is this section.
         """
@@ -494,18 +491,17 @@ class TestTheTwoReadmesAgree:
             assert f">= {floor}" in stated[0], f"{path.name} states {stated[0]!r}, not >= {floor}"
 
     def test_the_landing_page_points_at_the_reference(self) -> None:
-        """AT-093 -- what the root file does instead of repeating: it links, and that is asserted."""
+        """AT-093 -- what the root file does instead of repeating the reference: it links to it."""
         assert "python/README.md" in _ROOT_README.read_text(), (
             "the root README does not link to python/README.md, so nothing leads a reader to the reference"
         )
 
 
 class TestTheConfigurationTablesMatchTheTypes:
-    """``AT-094`` -- ``REQ-E-094``: every key of the three configuration ``TypedDict``s is documented.
+    """``AT-094`` -- every key of the three configuration ``TypedDict``s is documented.
 
-    This is the requirement that paid for itself before it was written. ``filter_fields``,
-    ``search_type`` and ``max_score`` were all added during the build, and the scaffold's README
-    documented none of them.
+    A configuration key added to a type without a README row is invisible to a caller who reads the
+    documentation first, so the tables are compared against the declarations in both directions.
     """
 
     @pytest.mark.parametrize(
@@ -563,24 +559,22 @@ _TRACEABLE_VALUES: dict[str, tuple[str, ...]] = {
     "POLL_INTERVAL_SECONDS": (f"{_indexes.POLL_INTERVAL_SECONDS:g}",),
 }
 
-# The open questions and requirements `REQ-E-095` names, which have a limit to state and no constant behind
-# it. A row cites one of these in its source column instead of a symbol.
+# The limits with no constant behind them. A row cites the public API it is about instead.
 _TRACEABLE_IDS = frozenset(
     {
-        "REQ-E-017a",
-        "REQ-E-017b",
-        "REQ-E-017c",
-        "REQ-E-091",
-        "store search failed",
+        "MongoDBConfig",
+        "MongoDBStorage.close()",
+        "MongoDBMemoryStore.close()",
+        "MongoDBMemoryStore.add()",
+        "MongoDBMemoryStore.search()",
         "Storage.list()",
         "MongoDBStorage.ensure_indexes()",
     }
 )
-"""The sources ``REQ-E-095``'s rows cite that are not package constants.
+"""The sources the limits rows cite that are not package constants.
 
-``strands_expires_at_ttl`` was one of them until ``REQ-E-119`` closed it: the row it labelled said no
-code path creates the storage TTL index, and ``MongoDBStorage.ensure_indexes()`` is that code path now.
-A row citing a method rather than an index name is one a reader can act on without leaving the document.
+Each is a public API name, so a reader can act on the row without leaving the document. The storage TTL
+row, for example, cites ``MongoDBStorage.ensure_indexes()``, the call that creates the index.
 """
 
 
@@ -610,7 +604,7 @@ def _limit_rows() -> list[tuple[str, str, str]]:
 
 
 class TestTheDocumentedValuesAreTheValues:
-    """``AT-095`` -- ``REQ-E-095``: one limits section, every row traceable to the thing that sets it.
+    """``AT-095`` -- one limits section, every row traceable to the thing that sets it.
 
     The third column is what makes this testable. A limits section is prose about numbers, and prose
     about numbers is exactly what goes stale; naming the symbol beside each number turns the section into
@@ -628,11 +622,11 @@ class TestTheDocumentedValuesAreTheValues:
         ]
         assert untraceable == [], (
             f"these limits name a source this test cannot resolve: {untraceable}. Name a constant from "
-            f"the package or a requirement id, and add it to _TRACEABLE_VALUES or _TRACEABLE_IDS."
+            f"the package or a public API, and add it to _TRACEABLE_VALUES or _TRACEABLE_IDS."
         )
 
     def test_every_limit_requirement_e_095_names_is_present(self) -> None:
-        """AT-095 -- the coverage direction: ``REQ-E-095`` lists eight limits and all eight are rows."""
+        """AT-095 -- the coverage direction: every limit with no constant behind it is a row."""
         cited = {source for _, _, source in _limit_rows()}
         assert _TRACEABLE_IDS <= cited, f"limits dropped from the section: {sorted(_TRACEABLE_IDS - cited)}"
 
@@ -670,7 +664,7 @@ class TestTheDocumentedValuesAreTheValues:
         assert missing == [], f"reserved metadata keys the README never mentions: {missing}"
 
     def test_the_authentication_mechanisms_are_the_drivers(self) -> None:
-        """AT-095 -- ``REQ-E-093``'s list, taken from the installed driver rather than guessed at.
+        """AT-095 -- the supported mechanisms, taken from the installed driver rather than from memory.
 
         ``DEFAULT`` is excluded: it is how the driver is told to negotiate, not a mechanism an operator
         configures on a user.
@@ -735,8 +729,8 @@ def _rendered_commands() -> list[str]:
 
     The storage collection first, then the memory collection's ordinary indexes, then its two search
     indexes under the zero-configuration defaults. ``memory_search_specs`` is given an empty config
-    beyond the database name, which resolves to the AutoEmbeddings path, matching what
-    ``REQ-E-092``'s quickstart does.
+    beyond the database name, which resolves to the AutoEmbeddings path, matching what the memory
+    quickstart does.
 
     Returns:
         One ``db.runCommand({...})`` string per index the package creates.
@@ -750,15 +744,16 @@ def _rendered_commands() -> list[str]:
     ]
 
 
-# The privilege actions each command the package can send requires, for `AT-116`. An empty set means the
+# The privilege actions each command the package can send requires, for
+# `test_the_package_needs_no_action_the_documented_role_withholds`. An empty set means the
 # server authorizes the command without any privilege, which is true of the handshake, the session calls
 # and the cursor calls: a client that could not run them could not connect at all, so no role has to
 # grant them.
 #
 # A set rather than one action per command, because the command name and the action are not one to one in
-# either direction. `update` is the case that matters here and it is measured rather than reasoned:
-# `write` and `add` always upsert, and on 8.3.8 a user holding only `find` and `update` is refused an
-# upsert with `Unauthorized` while a plain update succeeds. So this package needs `insert` without ever
+# either direction. `update` is the case that matters here: `write` and `add` always upsert, and on
+# MongoDB 8.3.8 a user holding only `find` and `update` is refused an upsert with `Unauthorized` while a
+# plain update succeeds. So this package needs `insert` without ever
 # sending an `insert` command, which is why the README table lists that action for `write` and `add`.
 #
 # The two directions are checked separately: a command absent from this mapping fails the test as
@@ -798,7 +793,7 @@ class _CommandNames(monitoring.CommandListener):
 
     A listener rather than a proxy or a patched method, because it observes the wire rather than the call
     site: a command the package sends indirectly, through an index helper or a cursor continuation, is
-    recorded the same as one it sends directly. That is the whole point of ``AT-116``, since the commands
+    recorded the same as one it sends directly. The privileges check depends on that, since the commands
     a reviewer forgets are the indirect ones.
     """
 
@@ -829,7 +824,7 @@ class _CommandNames(monitoring.CommandListener):
 
 
 def _fused_score_examples() -> dict[str, str]:
-    """The two fused scores worth writing down, computed rather than remembered (``AT-151``).
+    """The two fused scores worth writing down, computed rather than remembered.
 
     Both documents quote these, and quoting a number is how a document goes stale. Deriving them from
     :data:`_pipeline.RANK_FUSION_PENALTY` here means the test fails when the constant moves, instead of
@@ -845,17 +840,16 @@ def _fused_score_examples() -> dict[str, str]:
 
 
 class TestTheFusedScaleIsStatedWhereABoundIsChosen:
-    """AT-151 -- ``REQ-E-146``: the number a caller needs in order to pick a bound for the hybrid tier.
+    """AT-151 -- the number a caller needs in order to pick a bound for the hybrid tier.
 
-    ``REQ-E-145`` protects a caller on ``"auto"`` by declining fusion when a bound is set. ``REQ-E-146``
-    removes that protection the moment they ask for ``"hybrid"`` by name, which is correct -- it is their
-    tier -- and leaves them owing a number they have no way to derive. Reciprocal rank fusion is not a
-    similarity, there is no 0-to-1 range to reason from, and the ceiling depends on a rank constant that
-    lives in the server.
+    Under ``"auto"`` the package declines fusion when a bound is set. A caller who asks for ``"hybrid"``
+    by name gets fusion with their bound applied, so they need a number they have no way to derive.
+    Reciprocal rank fusion is not a similarity, there is no 0-to-1 range to reason from, and the ceiling
+    depends on a rank constant that lives in the server.
 
     So both documents state it, and both are checked against :data:`_pipeline.RANK_FUSION_PENALTY` rather
-    than against 60. The constant exists to be quoted; if it ever stops being 60, the document that still
-    says 60 should fail here rather than mislead someone into a floor that empties their result set.
+    than against 60. If the constant ever stops being 60, a document that still says 60 fails here rather
+    than leading a caller to a floor that empties their result set.
     """
 
     def test_the_readme_explains_the_fused_scale_and_quotes_the_live_penalty(self) -> None:
@@ -890,12 +884,12 @@ class TestTheFusedScaleIsStatedWhereABoundIsChosen:
 
 
 class TestTheIndexAndPrivilegesReference:
-    """``AT-096`` -- ``REQ-E-096``: the block an operator pastes, generated rather than written.
+    """``AT-096`` -- the block an operator pastes, generated rather than written.
 
-    ``REQ-E-096`` asks for copy-pasteable creation commands so a DBA can provision before first run. A command
-    block that does not paste is worse than no block, because it fails in their terminal with our name on
-    it. So the block is compared against the renderers ``REQ-E-061`` already ships, and the ordinary
-    commands are also sent to a real deployment.
+    The README carries copy-pasteable creation commands so a DBA can provision before first run. A
+    command block that does not paste is worse than no block, because it fails in the operator's terminal.
+    So the block is compared against the renderers the package uses, and the ordinary commands are also
+    sent to a real deployment.
     """
 
     def test_the_documented_commands_are_the_rendered_commands(self) -> None:
@@ -924,7 +918,7 @@ class TestTheIndexAndPrivilegesReference:
         """AT-096 -- the strongest form of the claim: the server accepts the lines as written.
 
         Ordinary indexes only. ``createSearchIndexes`` needs mongot, which the contract tier does not
-        promise, and the integration tier already covers that path against Atlas.
+        promise, and the Atlas integration tier covers that path.
         """
         for command in _documented_commands():
             match = _RUN_COMMAND.match(command)
@@ -937,11 +931,11 @@ class TestTheIndexAndPrivilegesReference:
 
     @pytest.mark.contract
     async def test_the_privileges_table_matches_the_deployment(self, contract_database: Any) -> None:
-        """AT-096b -- the measured half of ``REQ-E-096``, rechecked rather than trusted.
+        """AT-096b -- the privileges table, rechecked against the deployment rather than trusted.
 
-        It was assumed that a ``readWrite`` user cannot create indexes. Measured on Atlas 8.0.30 it can,
-        including search indexes, which is why the README says so and why this test exists: the claim is
-        about a specific server's role definitions, and role definitions are the server's to change.
+        On Atlas 8.0.30 a ``readWrite`` user can create indexes, including search indexes, and the README
+        says so. The claim is about a specific server's role definitions, and role definitions are the
+        server's to change, so the test reads them back.
 
         Skips rather than fails where ``rolesInfo`` goes unanswered, since a deployment may withhold it
         from the credential the tier was given, and that is not a documentation defect.
@@ -975,13 +969,12 @@ class TestTheIndexAndPrivilegesReference:
     async def test_the_package_needs_no_action_the_documented_role_withholds(
         self, contract_uri: str, test_database_name: str, unique_collection_name: str
     ) -> None:
-        """AT-116 -- ``REQ-E-113``: every command the package sends is one ``readWrite`` authorizes.
+        """AT-116 -- every command the package sends is one ``readWrite`` authorizes.
 
         The table above says what each action is needed for. This says the converse, which is the half
-        that rots: nothing the package sends needs an action the table omits. That was verified by
-        running the whole suite under a credential holding only ``readWriteAnyDatabase``, and a run is
-        evidence that expires. The eleventh command a later change adds would fail at a customer's
-        deployment, not here, so the property is asserted against the commands rather than the run.
+        that drifts: nothing the package sends needs an action the table omits. A new command that needed
+        an extra action would otherwise fail at a customer's deployment, not here, so the property is
+        asserted against the commands the driver actually sends.
 
         Outcomes are deliberately not asserted. Which of these calls succeeds depends on the deployment,
         and a contract-tier deployment promises no search process, so ``search`` on either surface may
@@ -1029,9 +1022,9 @@ class TestTheIndexAndPrivilegesReference:
         )
 
 
-# The nine subjects, in ``REQ-E-118``'s own order, that the README has to cover before the
-# package is documented. Each pair is (subject, what locates it), and the locator is a heading rather than a phrase
-# so that a section renamed fails here and a sentence reworded does not. Six of the nine are asserted only
+# The nine subjects the README has to cover for the package to count as documented. Each pair is
+# (subject, what locates it), and the locator is a heading rather than a phrase so that a section renamed
+# fails here and a sentence reworded does not. Six of the nine are asserted only
 # as present, because whether their prose is right is asserted by the tests above, against the code.
 _REQUIRED_SUBJECTS: tuple[tuple[str, str], ...] = (
     ("install", "## Install"),
@@ -1047,15 +1040,12 @@ _REQUIRED_SUBJECTS: tuple[tuple[str, str], ...] = (
 
 
 class TestTheReadmeCoversEverySubjectTheRequirementNames:
-    """``AT-120`` -- ``REQ-E-118`` lists nine subjects, read as a list rather
-    than assumed.
+    """``AT-120`` -- the README covers nine required subjects, each checked as a section.
 
-    The gap this closes is small and was real. It is one sentence naming nine things, and until
-    this test was written nothing asserted eight of them; the README happened to cover all nine, so
-    a deleted section would have taken a subject with it and no test would have noticed. Deliberately the
-    weakest assertion in this file: presence of a section, plus one value check where the subject is a
-    number the code owns. Everything about whether the prose is *correct* is asserted elsewhere, against
-    the code, and repeating it here would be a second place for the same fact to drift.
+    Without this, a deleted section would take a subject with it and no test would notice. Deliberately
+    the weakest assertion in this file: presence of a section, plus one value check where the subject is a
+    number the code owns. Whether the prose is *correct* is asserted elsewhere, against the code, and
+    repeating it here would be a second place for the same fact to drift.
     """
 
     def test_every_subject_has_a_section(self) -> None:
@@ -1066,17 +1056,18 @@ class TestTheReadmeCoversEverySubjectTheRequirementNames:
         assert absent == {}, f"required subjects whose section is gone from {_PACKAGE_README.name}: {absent}"
 
     def test_the_nine_subjects_are_nine(self) -> None:
-        """The list above is a transcription of one sentence, and a transcription can lose a clause."""
+        """The list above is maintained by hand, so its length and uniqueness are checked."""
         assert len(_REQUIRED_SUBJECTS) == 9
         assert len({heading for _, heading in _REQUIRED_SUBJECTS}) == 9
 
     def test_the_document_ceiling_is_stated_as_a_number(self) -> None:
-        """Item 24 asks for the caveat, not for a heading. 16 MB is the one subject that is a value.
+        """The subject is the caveat, not the heading. 16 MB is the one subject that is a value.
 
         The value comes from the package rather than from this file, so a ceiling changed in code and not
-        in the document fails here. Which duplicates ``AT-095``'s limits-table check on purpose: that one
-        reads the table by its marker, and this one reads the section, so deleting the table fails one and
-        deleting the section fails the other.
+        in the document fails here. This duplicates the limits-table check in
+        ``TestTheDocumentedValuesAreTheValues`` on purpose: that one reads the table by its marker, and
+        this one reads the section, so deleting the table fails one and deleting the section fails the
+        other.
         """
         section = _PACKAGE_README.read_text().split("## Limits", 1)[1].split("\n## ", 1)[0]
         megabytes = MAX_DOCUMENT_BYTES // (1024 * 1024)
@@ -1132,23 +1123,22 @@ def _verify_rows() -> list[tuple[str, str, str]]:
 
 
 class TestTheManualVectorPathIsDocumentedAtItsRealWidth:
-    """``AT-128`` -- ``REQ-E-125``: a read half that works and no write half.
+    """``AT-128`` -- the manual vector path: the package indexes and queries a vector, and never writes one.
 
-    That gap was never an API defect. A `vector` keyword on `add` would be reachable only by a caller who
-    has already stepped around `MemoryManager`, and that caller can write the document. What was wrong
-    was the document: it offered `embedding_dimensions` and `similarity` as two more configuration keys
-    and never said that the field they index is one nothing in this package fills.
+    A `vector` keyword on `add` would be reachable only by a caller who has already stepped around
+    `MemoryManager`, and that caller can write the document. What a reader needs is the documentation:
+    `embedding_dimensions` and `similarity` configure an index over a field that nothing in this package
+    fills, and the README has to say so.
 
     So both directions are asserted. The README has to *say* it, and the fact it states has to still be
-    true of the code -- the day `add` grows a vector parameter, the sentence becomes a lie and this class
-    is what notices.
+    true of the code: if `add` gains a vector parameter, the passage is out of date and this class fails.
     """
 
     def test_the_readme_names_the_field_the_index_covers(self) -> None:
         """AT-128 -- the name comes from the package, so renaming the field fails here.
 
-        A reader who has to supply the vector needs the field name above everything else, and it appears
-        nowhere in the document today: `embedding_dimensions` is a config key, not a path.
+        A reader who has to supply the vector needs the field name above everything else:
+        `embedding_dimensions` is a config key, not a path.
         """
         section = _marked_section("manual-vectors")
         assert section, f"no passage marked '<!-- manual-vectors -->' in {_PACKAGE_README.name}"
@@ -1158,7 +1148,7 @@ class TestTheManualVectorPathIsDocumentedAtItsRealWidth:
         )
 
     def test_the_readme_says_the_package_never_produces_a_vector(self) -> None:
-        """AT-128 -- the statement `REQ-E-125` asks for, read as two clauses rather than one sentence."""
+        """AT-128 -- the statement itself, read as separate clauses rather than one sentence."""
         section = _marked_section("manual-vectors").lower()
         for clause, phrases in (
             ("that this package indexes and queries the field", ("index", "quer")),
@@ -1168,21 +1158,21 @@ class TestTheManualVectorPathIsDocumentedAtItsRealWidth:
             assert any(phrase in section for phrase in phrases), f"the manual-vector passage does not state {clause}"
 
     def test_add_has_no_vector_parameter_for_the_readme_to_offer(self) -> None:
-        """AT-128 -- the negative half of ``REQ-E-125``, asserted against the signature it is about.
+        """AT-128 -- the negative half, asserted against the signature it is about.
 
-        ``REQ-E-125`` forbids presenting ``embedding_dimensions`` as something ``add`` can fill. This is
-        the load-bearing half: prose can be re-read, but the reason the prose is correct is that the
-        parameter does not exist, and if somebody adds one the document has to change with it.
+        The README must not present ``embedding_dimensions`` as something ``add`` can fill. The prose is
+        correct because the parameter does not exist, and if one is added the document has to change
+        with it.
         """
         parameters = set(inspect.signature(MongoDBMemoryStore.add).parameters)
 
         assert not parameters & {"vector", "embedding", "embeddings"}, (
             f"MongoDBMemoryStore.add now takes {sorted(parameters & {'vector', 'embedding', 'embeddings'})}, "
-            f"so the write half exists and the README's manual-vector passage is out of date"
+            f"so the package can now write a vector and the README's manual-vector passage is out of date"
         )
 
     def test_the_passage_sits_where_a_reader_configuring_the_manual_path_will_be(self) -> None:
-        """AT-128 -- placement, because a true sentence in the wrong section is not a statement.
+        """AT-128 -- placement, because a true sentence in the wrong section goes unread.
 
         The two keys that select the path are in the `MongoDBConfig` table; the consequence of selecting
         it belongs with the search tiers, which is where a reader goes to find out what answers a query.
@@ -1199,13 +1189,12 @@ class TestTheManualVectorPathIsDocumentedAtItsRealWidth:
 
 
 class TestBothHalvesOfVerifyModeAreStated:
-    """``AT-129`` -- ``REQ-E-126``: the section said verify mode never raises, and it always could.
+    """``AT-129`` -- the README states which missing indexes make verify mode raise and which only warn.
 
-    The sentence was wrong about both halves. ``_ensure_ordinary`` raises on a missing ordinary index and
-    always has (``REQ-E-061``), and ``_ensure_search`` raises too; what is tolerant is one level up, in
-    ``_ensure_search_tiers``, and only under ``search_type: "auto"``, where a failed tier is dropped
-    because another one may answer. A reader planning a no-DDL deployment needs to know which of their
-    indexes stops startup and which one only degrades it, and the old text told them neither.
+    ``_ensure_ordinary`` raises on a missing ordinary index, and ``_ensure_search`` raises too; what is
+    tolerant is one level up, in ``_ensure_search_tiers``, and only under ``search_type: "auto"``, where a
+    failed tier is dropped because another one may answer. A reader planning a no-DDL deployment needs to
+    know which of their indexes stops startup and which one only degrades it.
 
     The search half's *behaviour* is asserted in ``test_memory_store.py``, where the warning is raised;
     this class asserts the document, plus the one fact the document promises about the ordinary half that
@@ -1235,12 +1224,11 @@ class TestBothHalvesOfVerifyModeAreStated:
         assert "warn" in auto, f"the auto search row does not say a missing index warns: {auto!r}"
         assert "rais" in named, f"the named search_type row does not say a missing index raises: {named!r}"
         assert "warn" not in ordinary, (
-            f"the ordinary row still describes the search half's warning, which is the confusion "
-            f"REQ-E-126 is about: {ordinary!r}"
+            f"the ordinary row describes the search half's warning, but a missing ordinary index raises: {ordinary!r}"
         )
 
     def test_the_sentence_that_said_verify_never_raises_is_gone(self) -> None:
-        """AT-129 -- the regression direction, since a corrected table under a wrong paragraph is worse.
+        """AT-129 -- no paragraph claims verify mode cannot raise, which would contradict the table.
 
         A reader who reaches the paragraph first stops there. Phrased against the claim rather than the
         wording, so a reworded version of the same wrong claim fails too.
@@ -1268,19 +1256,17 @@ class TestBothHalvesOfVerifyModeAreStated:
 
 
 class TestTheTtlCaveatNamesTheMethodThatCreatesTheIndex:
-    """``AT-128``'s sibling -- ``REQ-E-119``'s documentation half, the last place that gap was recorded.
+    """``AT-128`` -- the storage TTL rows name ``MongoDBStorage.ensure_indexes()``, the call that creates the index.
 
-    Two rows said no code path creates the storage TTL index. One of them was in the limits table, cited
-    to ``strands_expires_at_ttl``, which is how a reader was expected to find out that ``ttl_seconds``
-    expired nothing. ``ensure_indexes()`` is that code path now, so both rows name it and the citation
-    moves from an index name to the method, which a reader can call rather than read about.
+    Two rows in the README cover the storage TTL index: one in the limits table and one in the index
+    table. Both name the method, so a reader whose ``ttl_seconds`` documents are not expiring has
+    something to call.
     """
 
     def test_the_limits_row_cites_the_method(self) -> None:
-        """AT-128 -- the row is still there and its source is the method rather than the id."""
+        """AT-128 -- the limits row cites the method as its source."""
         sources = {source for _, _, source in _limit_rows()}
 
-        assert "strands_expires_at_ttl" not in sources, "the limits table still cites the bare index name"
         assert "MongoDBStorage.ensure_indexes()" in sources, (
             "no limits row names ensure_indexes(), so a reader whose ttl_seconds documents are not "
             "expiring has nothing to call"
@@ -1293,7 +1279,7 @@ class TestTheTtlCaveatNamesTheMethodThatCreatesTheIndex:
         )
 
     def test_the_index_table_row_no_longer_says_nothing_creates_it(self) -> None:
-        """AT-128 -- the other row, in the index table, which said the same thing in different words."""
+        """AT-128 -- the index table's storage TTL row names the method and does not say nothing creates it."""
         text = _PACKAGE_README.read_text()
         section = text.split("### What gets created", 1)[1].split("\n### ", 1)[0]
         ttl = next(line for line in section.splitlines() if "strands_expires_at_ttl" in line)
@@ -1305,14 +1291,13 @@ class TestTheTtlCaveatNamesTheMethodThatCreatesTheIndex:
 
 
 class TestTheReadmeSaysWhichSurfaceCreatesTheTtlIndex:
-    """``AT-158`` -- ``REQ-E-149``'s documentation half, made necessary and false in one step.
+    """``AT-158`` -- the README says which surface creates its TTL index and how.
 
-    There was once one TTL story and the README told it once: you stamp ``expires_at``, nothing creates
-    the index, call ``ensure_indexes()``. The memory store has the opposite arrangement --
-    ``initialize()`` creates the index whether or not any store sets a ``ttl_seconds`` -- which turned
-    the single story into a claim that is true of one surface and wrong about the other. A reader who
-    believes the unscoped version calls a method that does not exist on ``MongoDBMemoryStore``; a reader
-    who believes its inverse leaves storage documents unexpiring forever. So both rows name their
+    The two surfaces differ. On ``MongoDBStorage`` the caller calls ``ensure_indexes()``. On
+    ``MongoDBMemoryStore``, ``initialize()`` creates the index whether or not any store sets a
+    ``ttl_seconds``. An unscoped statement is true of one surface and wrong about the other: a reader who
+    applies the storage rule to the memory store looks for a method it does not have, and a reader who
+    applies the memory rule to storage leaves storage documents that never expire. So both rows name their
     surface.
     """
 
@@ -1322,7 +1307,7 @@ class TestTheReadmeSaysWhichSurfaceCreatesTheTtlIndex:
         limit, value = row
 
         assert "MongoDBStorage" in limit, (
-            f"the limits row reads as a claim about both surfaces, and it is false on one: {limit!r}"
+            f"the limits row reads as a claim about both surfaces, and it is only true of storage: {limit!r}"
         )
         assert "initialize()" in value, (
             f"the row does not say the memory store creates its own TTL index, so a reader goes looking "
@@ -1330,7 +1315,7 @@ class TestTheReadmeSaysWhichSurfaceCreatesTheTtlIndex:
         )
 
     def test_the_memory_index_row_names_the_method_that_creates_it(self) -> None:
-        """AT-158 -- the index table's memory row, which said what expires and not who armed it."""
+        """AT-158 -- the index table's memory row says what creates the index, not only what expires."""
         text = _PACKAGE_README.read_text()
         section = text.split("### What gets created", 1)[1].split("\n### ", 1)[0]
         rows = [line for line in section.splitlines() if "strands_expires_at_ttl" in line]
@@ -1338,27 +1323,22 @@ class TestTheReadmeSaysWhichSurfaceCreatesTheTtlIndex:
         assert len(rows) == 2, f"expected a TTL row per collection, found {len(rows)}: {rows!r}"
         memory = next(line for line in rows if line.lstrip("| ").startswith("`memory`"))
 
-        assert "initialize()" in memory, (
-            f"the memory TTL row does not say initialize() creates it, which is the whole point: {memory!r}"
-        )
+        assert "initialize()" in memory, f"the memory TTL row does not say initialize() creates it: {memory!r}"
 
 
 class TestTheLandingPageDescribesThePackageAsItIs:
-    """``AT-161`` / ``REQ-E-155`` -- the root README's status block, which nothing checked.
+    """``AT-161`` -- the root README's status block describes the package as it is.
 
-    ``test_the_landing_page_points_at_the_reference`` is the only assertion this file made about the
-    root document, and it checks that the file links to the reference rather than anything it says. So
-    the landing page accumulated claims that were true when written and were not revisited when the
-    package moved: that a store with a ``ttl_seconds`` never expires anything, which stopped being true
-    when ``MongoDBStorage.ensure_indexes()`` arrived; and that ``search()`` spans a vector tier and a
-    text tier, which the ``hybrid`` tier made two-thirds of the answer.
+    ``test_the_landing_page_points_at_the_reference`` checks only that the root document links to the
+    reference, not what it says. This class checks two claims the landing page makes: what makes
+    ``ttl_seconds`` take effect, and which tiers ``search()`` can resolve to.
 
-    It is the first page a reader of the public repository sees, and it was telling them a shipped
-    feature silently does nothing. ``AT-158`` holds the *package* README to the TTL story; this holds
-    the landing page to the same one, and to the tier list the package actually implements.
+    It is the first page a reader of the public repository sees.
+    ``TestTheReadmeSaysWhichSurfaceCreatesTheTtlIndex`` holds the package README to the TTL rules; this
+    holds the landing page to the same rules, and to the tier list the package implements.
 
-    Both assertions read the claim out of the source rather than restating it here, so a third tier or a
-    second surface that needs provisioning fails this file instead of ageing quietly in the document.
+    Both assertions read the claim out of the source rather than restating it here, so a new tier or a
+    second surface that needs provisioning fails this file instead of going stale in the document.
     """
 
     def test_a_ttl_claim_names_the_call_that_arms_it(self) -> None:
@@ -1392,13 +1372,13 @@ class TestTheLandingPageDescribesThePackageAsItIs:
 
 
 class TestWhereCallerTextGoesIsStated:
-    """``AT-198``–``AT-200`` -- ``REQ-E-192`` to ``REQ-E-194``: the data flow a security review asks for.
+    """``AT-198`` to ``AT-200`` -- where caller text goes: the data flow a security review asks for.
 
-    Nothing here is new behaviour. On the default path the deployment embeds what is stored and what is
-    asked, on the manual path nothing does, and erasure stops at the live deployment. All three were true
-    and none was written where a reviewer would look, so a customer's privacy team had to infer the data
-    flow from the index definition. These tests read the marked passages, so the statements cannot drift
-    into an unrelated section, and they read the model name from the package, so a new default fails here.
+    On the default path the deployment embeds what is stored and what is asked, on the manual path
+    nothing does, and erasure stops at the live deployment. The README states all three where a
+    customer's privacy team will look, so the data flow does not have to be inferred from the index
+    definition. These tests read the marked passages, so the statements cannot drift into an unrelated
+    section, and they read the model name from the package, so a new default fails here.
     """
 
     def test_the_section_names_both_paths_and_what_each_sends(self) -> None:
@@ -1470,22 +1450,21 @@ def _span_names() -> set[str]:
     }
 
 
-class TestTheAppNamePassageMatchesTheCode:
-    """AT-223 / REQ-E-216 -- a reader who sets ``appName`` should learn from here what the server will show."""
+class TestTheDriverInfoPassageMatchesTheCode:
+    """AT-230 -- a reader learns from here what the server records about this package."""
 
-    def test_the_passage_states_the_value_the_suffix_the_shortening_and_the_exception(self) -> None:
-        section = _marked_section("app-name")
-        assert section, f"no passage marked '<!-- app-name -->' in {_PACKAGE_README.name}"
+    def test_the_passage_names_the_entry_and_leaves_app_name_alone(self) -> None:
+        """AT-231 -- and that the application's ``appName`` is never touched."""
+        section = _marked_section("driver-info")
+        assert section, f"no passage marked '<!-- driver-info -->' in {_PACKAGE_README.name}"
         lowered = section.lower()
 
-        assert f"`{_client._APP_NAME}`" in section and f"`<yours>{_client._APP_NAME_SUFFIX}`" in section, (
-            "the app-name passage does not show both the default value and the suffixed form"
+        assert f"`{_client._DRIVER_NAME}`" in section, "the driver-info passage does not name the driver entry"
+        assert "`client`" in section and "append_metadata" in section, (
+            "the driver-info passage does not say how an injected client is attributed"
         )
-        assert f"{_client._APP_NAME_MAX_BYTES} bytes" in section and "shorten" in lowered, (
-            "the app-name passage does not say that an over-long value is shortened to fit the limit"
-        )
-        assert "`client`" in section and "inject" in lowered and "unchanged" in lowered, (
-            "the app-name passage does not say that an injected client keeps its own appName"
+        assert "`appname`" in lowered and "never" in lowered, (
+            "the driver-info passage does not say that the package leaves appName alone"
         )
 
     def test_the_passage_sits_in_the_connecting_section(self) -> None:
@@ -1493,7 +1472,7 @@ class TestTheAppNamePassageMatchesTheCode:
 
         assert (
             text.index("## Connecting to a deployment")
-            < text.index("<!-- app-name -->")
+            < text.index("<!-- driver-info -->")
             < text.index("### Authentication mechanisms")
         )
 
@@ -1506,7 +1485,7 @@ def _named_by_telemetry() -> set[str]:
 
 
 class TestTheObservabilitySectionMatchesTheCode:
-    """AT-213 / REQ-E-208 — every span, event and attribute the code can emit is named, and nothing else is.
+    """AT-213 -- every span, event and attribute the code can emit is named, and nothing else is.
 
     Both lists are read from the code. A span added in a later change fails here until the README names
     it, and a name the README keeps after the code drops it fails the reverse check.
@@ -1551,7 +1530,7 @@ class TestTheObservabilitySectionMatchesTheCode:
         assert "`timed_out`" in lowered and "unset" in lowered, "it does not say a timed-out wait is not an error"
 
     def test_every_log_event_and_field_is_named(self) -> None:
-        """AT-210 / REQ-E-205 — the event names are a contract a log pipeline indexes on, so they are listed."""
+        """AT-210 -- the event names are a contract a log pipeline indexes on, so they are listed."""
         section = _marked_section("observability")
 
         missing = sorted(name for name in get_args(_telemetry.LogEvent) if f"`{name}`" not in section)

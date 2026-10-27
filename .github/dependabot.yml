@@ -1,21 +1,15 @@
 # Actions only.
 #
-# Every `uses:` in `.github/workflows/` is a third-party dependency that this repository runs with the
-# permissions of the job that names it, and a pin is a promise about a moment rather than about a
-# version: `REQ-E-164` pins the two actions in the publishing job to a digest, and a digest never
-# moves, including away from a vulnerability. This file is what moves it. `REQ-E-166`.
+# Every `uses:` in `.github/workflows/` is third-party code running with its job's permissions. The
+# publishing job pins its actions to a digest, and a digest never moves, including away from a
+# vulnerability. This file is what moves it.
 #
-# `cooldown` exists because the failure this guards against is a compromised release, and a compromised
-# release is usually yanked within days of publication. Waiting a week before proposing an upgrade
-# turns "Dependabot opened a PR the same afternoon the attacker published" into a bump that never gets
-# proposed. `default-days: 7` is the shortest interval that covers the published incidents.
+# `cooldown` waits a week before proposing an upgrade, because a compromised action release is usually
+# yanked within days of publication.
 #
-# There is deliberately no `pip` entry. This package's dependency specifiers are floors, not pins --
-# `>=`, with no upper bound -- and a floor is a promise to the people who install it: "any version at
-# or above this works." Raising one revokes that promise for everybody still on the older release, so
-# it is a decision about the package's support window and not a maintenance chore. Nothing here should
-# be able to open that PR automatically. `AT-172` asserts the absence, so deleting this paragraph and
-# adding the entry fails the suite rather than passing quietly.
+# There is deliberately no `pip` entry. The package's dependencies are floors (`>=`, no upper bound),
+# and raising a floor drops support for users on older releases. That is a decision about the support
+# window, so nothing should open it automatically. A test asserts the entry is absent.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
@@ -26,8 +20,7 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 5
-    # One PR for the whole set rather than one per action: these move together, the suite that gates
-    # them is the same suite either way, and a single PR is a single CI run.
+    # One PR for the whole set: the same suite gates them either way, and one PR is one CI run.
     groups:
       actions:
         patterns:

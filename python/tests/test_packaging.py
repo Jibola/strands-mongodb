@@ -1,8 +1,7 @@
 """Characterization tests for the declared and resolved package metadata.
 
-Covers ``CH-002`` and ``CH-006``, and stands at the boundary from the
-declared manifest to resolved distribution. Both sides are asserted, because they disagree in ways
-that matter.
+These tests stand at the boundary between the declared manifest and the resolved distribution. Both
+sides are asserted, because they disagree in ways that matter.
 
 ``importlib.metadata`` reads what pip actually installed. That is the stronger assertion for
 dependency and extra questions, and it is the only one that catches a manifest whose extras resolve
@@ -10,11 +9,10 @@ differently than they read. The manifest is read directly only for properties th
 hatchling flattens the self-referential ``all`` extra, and ``hatch-vcs`` resolves a version that
 depends on git state the manifest cannot show.
 
-``importlib.metadata`` has one weakness, and ``AT-002``/``AT-003`` at the bottom of this file exist
-because of it. It describes whichever install last ran, which here is an editable one made before the
-workspace became a git repository: it still reports version ``0.0.0``, hours after a fresh build
-stopped producing that number. Those two tests build a wheel and install it into an empty venv, so
-what they read is this tree.
+``importlib.metadata`` has one weakness, and the two build-tier classes at the bottom of this file exist
+because of it. It describes whichever install last ran, and in a development venv that can be an editable
+install older than the tree, reporting a stale version such as ``0.0.0``. The build-tier classes build a
+wheel and install it into an empty venv, so what they read is this tree.
 """
 
 from __future__ import annotations
@@ -54,14 +52,14 @@ DISTRIBUTION = "strands-mongodb"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = PROJECT_ROOT / "pyproject.toml"
 
-#: Opt-in gate for the build tier (`AT-002`, `AT-003`). Every other test in this file reads metadata
-#: that is already on disk and costs milliseconds. These two build a wheel and resolve dependencies
-#: over the network, which was 4 to 10 seconds per operation when they were written, so they are gated
-#: rather than left to slow every run down.
+#: Opt-in gate for the build tier (`TestEachExtraResolvesFromTheBuiltWheel` and
+#: `TestTheBuiltWheelInstallsIntoAnEmptyVenv`). Every other test in this file reads metadata that is
+#: already on disk and costs milliseconds. Those two classes build a wheel and resolve dependencies over
+#: the network, which takes seconds per operation, so they are gated rather than left to slow every run.
 #:
 #: Gated here and not in `conftest.py`'s `TIER_VARIABLES`, because that mapping is also the list of
 #: names `fill_tier_variables_from_env` reads out of a `.env` file, and every one of them is a
-#: connection string. This tier needs network and no secret, which is why the split exists.
+#: connection string. This tier needs network and no secret.
 BUILD_TIER_VARIABLE = "STRANDS_MONGODB_BUILD_TIER"
 
 #: Both halves are needed. The marker makes the tier selectable with ``-m build`` and is declared in
@@ -110,7 +108,7 @@ def _normalized(name: str) -> str:
     Needed because pip's ``--report`` echoes each distribution's own ``Name``, and distributions
     disagree about the separator: ``typing_extensions`` publishes an underscore, ``pymongo-search-utils``
     a hyphen. Comparing a resolution against names taken from ``pyproject.toml`` without normalizing
-    fails on the underscore, which is how ``AT-002`` first ran RED.
+    fails on the underscore.
 
     Args:
         name: A distribution name in whatever form its own metadata uses.
@@ -184,7 +182,7 @@ def resolve_extra(built_wheel: Path, tmp_path_factory: pytest.TempPathFactory) -
     report names the wheel and almost nothing else, and a test asserting on that set would be reading
     this machine's history rather than the artifact.
 
-    Results are cached per extra, because each resolution took about 4 seconds when this was written.
+    Results are cached per extra, because each resolution takes seconds.
 
     Returns:
         A callable taking an extra name and returning the full transitive set of distribution names.
@@ -228,8 +226,7 @@ def storage_only_venv(built_wheel: Path, tmp_path_factory: pytest.TempPathFactor
     ``[storage]`` rather than ``[all]`` on purpose. It is the only environment where the missing-extra
     path is real: ``pymongo-search-utils`` is genuinely absent, so touching ``MongoDBMemoryStore``
     raises for the reason a user's would rather than because a ``sys.meta_path`` finder blocked it,
-    which is how ``AT-008b`` has to simulate it. This venv was first built by hand as a demo, and
-    nothing since has replaced it; this fixture is it, executed.
+    which is how the end-to-end import test in ``test_extras.py`` has to simulate it.
 
     Returns:
         Path to the venv's interpreter.
@@ -263,18 +260,14 @@ def _in_venv(interpreter: Path, source: str) -> subprocess.CompletedProcess[str]
 
 
 class TestExtras:
-    """CH-002 — three runtime extras, plus dev, and ``all`` is their union."""
+    """Three runtime extras plus ``dev``, and ``all`` is the union of ``storage`` and ``memory``."""
 
     def test_declares_the_expected_extras(self, dist_metadata: PackageMetadata) -> None:
-        """Exactly four extras: three runtime surfaces and ``dev``.
-
-        ``dev`` counts. An earlier draft said "exactly three extras" and would have
-        failed against the package as built.
-        """
+        """Exactly four extras: three runtime surfaces and ``dev``, which is an extra too."""
         assert sorted(dist_metadata.get_all("Provides-Extra") or []) == ["all", "dev", "memory", "storage"]
 
     def test_base_install_has_no_runtime_dependency(self, dist_metadata: PackageMetadata) -> None:
-        """REQ-E-001 — every ``Requires-Dist`` entry is gated behind an extra.
+        """Every ``Requires-Dist`` entry is gated behind an extra.
 
         A dependency that slipped out of an extra would be installed by a bare
         ``pip install strands-mongodb``, which is exactly what the extras exist to prevent.
@@ -294,21 +287,21 @@ class TestExtras:
         assert by_extra["all"] == by_extra["storage"] | by_extra["memory"]
 
     def test_memory_extra_is_a_superset_of_storage(self, dist_metadata: PackageMetadata) -> None:
-        """REQ-E-002 — ``[memory]`` adds ``pymongo-search-utils`` and nothing else."""
+        """``[memory]`` adds ``pymongo-search-utils`` and nothing else."""
         by_extra = _requirements_by_extra(dist_metadata)
 
         assert _distribution_names(by_extra["memory"] - by_extra["storage"]) == {"pymongo-search-utils"}
 
     def test_storage_extra_pulls_no_search_machinery(self, dist_metadata: PackageMetadata) -> None:
-        """REQ-E-002 — the point of splitting the extras, asserted directly.
+        """The point of splitting the extras, asserted directly.
 
         The union test above would still pass if ``[storage]`` quietly gained
         ``pymongo-search-utils``, since the union would simply be equal. This is the assertion that
         the split buys the user something.
 
-        ``typing-extensions`` joined this set later (see
-        ``test_every_directly_imported_third_party_module_is_declared``). ``opentelemetry-api`` joined it
-        with the package's own spans (``AT-212``).
+        ``typing-extensions`` is in this set because ``types.py`` imports it (see
+        ``test_every_directly_imported_third_party_module_is_declared``), and ``opentelemetry-api`` because
+        the package's own spans import it (see ``test_both_store_extras_declare_the_tracing_api_they_import``).
         """
         by_extra = _requirements_by_extra(dist_metadata)
 
@@ -320,7 +313,7 @@ class TestExtras:
         }
 
     def test_every_directly_imported_third_party_module_is_declared(self, dist_metadata: PackageMetadata) -> None:
-        """REQ-E-002 — a dependency we ``import`` is one we name, not one we inherit.
+        """A dependency we ``import`` is one we name, not one we inherit.
 
         ``types.py`` imports ``Required`` and ``TypedDict`` from ``typing_extensions``, because
         ``typing.Required`` is 3.11+ and the declared floor is 3.10. It resolves today whether or not
@@ -329,8 +322,8 @@ class TestExtras:
 
         Relying on that is the thing this test rejects. A transitive pin is a fact about someone
         else's current release, not a promise to us, and the failure it produces is a bare
-        ``ModuleNotFoundError`` at import in a resolution nobody tested. Both extras name it, so
-        The invariant is unaffected: neither surface gained a dependency the other lacks.
+        ``ModuleNotFoundError`` at import in a resolution nobody tested. Both extras name it, so neither
+        surface gains a dependency the other lacks.
         """
         by_extra = _requirements_by_extra(dist_metadata)
 
@@ -338,7 +331,7 @@ class TestExtras:
             assert "typing-extensions" in _distribution_names(by_extra[extra]), sorted(by_extra[extra])
 
     def test_both_store_extras_declare_the_tracing_api_they_import(self, dist_metadata: PackageMetadata) -> None:
-        """AT-212 / REQ-E-207 — ``_telemetry`` imports ``opentelemetry``, so both extras name it.
+        """AT-212 — ``_telemetry`` imports ``opentelemetry``, so both extras name it.
 
         The same argument as ``typing-extensions`` above. ``strands-agents`` brings it today, and that is a
         fact about their release rather than a promise to us. The floor is theirs, so declaring it changes no
@@ -358,17 +351,17 @@ class TestExtras:
         assert manifest["project"]["optional-dependencies"]["all"] == ["strands-mongodb[memory,storage]"]
 
     def test_dev_extra_declares_a_coverage_tool(self, dist_metadata: PackageMetadata) -> None:
-        """REQ-E-005 — the coverage floor is a release gate, so the tool that measures it is declared.
+        """The coverage floor is a release gate, so the tool that measures it is declared.
 
-        The scaffold declared a 90% floor and no ``pytest-cov`` in ``dev``. A gate no
-        installed tool can measure is not a gate.
+        Without ``pytest-cov`` in ``dev``, a contributor's environment could not measure the floor CI
+        enforces.
         """
         dev = _requirements_by_extra(dist_metadata)["dev"]
 
         assert "pytest-cov" in _distribution_names(dev), sorted(dev)
 
     def test_dev_extra_declares_a_yaml_parser(self, manifest: dict[str, Any]) -> None:
-        """REQ-E-104 — the same argument as the coverage tool, one release gate over.
+        """The same argument as the coverage tool, applied to the tests that parse the CI workflow.
 
         ``tests/test_ci.py`` parses the CI workflow, so PyYAML is a test dependency. It is already
         importable in a development venv as a runtime dependency of ``strands-agents``, and that is the
@@ -385,7 +378,7 @@ class TestExtras:
 
 
 class TestCoreMetadata:
-    """CH-006 — interpreter floor, SDK floor, license, version source."""
+    """Interpreter floor, SDK floor, license, version source."""
 
     def test_requires_python_floor_is_3_10(self, dist_metadata: PackageMetadata) -> None:
         """The floor the classifiers and the mypy target both assume."""
@@ -401,9 +394,8 @@ class TestCoreMetadata:
     ) -> None:
         """1.54.0 is the first release shipping every ``strands`` module ``storage.py`` imports.
 
-        ``strands.storage`` and ``StorageError`` arrive at 1.48.0, which is what this floor said until
-        the floors were installed rather than read. ``strands.storage.search.keyword`` -- whose
-        ``tokenize`` the lexical path calls -- arrives at 1.54.0, and below it the storage backend
+        ``strands.storage`` and ``StorageError`` arrive at 1.48.0, but ``strands.storage.search.keyword``,
+        whose ``tokenize`` the lexical path calls, arrives at 1.54.0, and below it the storage backend
         raises ``ModuleNotFoundError`` on import.
 
         Applied to both extras deliberately, though ``strands.memory`` landed in 1.44.0, so ``[all]``
@@ -419,12 +411,11 @@ class TestCoreMetadata:
         """4.14.0 is the first release carrying ``AsyncMongoClient.append_metadata``.
 
         The floor is what makes :func:`_client._attribute_injected_client` a plain call. Below 4.14 the
-        attribute still resolves -- ``AsyncMongoClient.__getattr__`` hands back a ``Database`` of that
-        name -- so an unguarded call raises ``TypeError`` rather than failing to import. A guard would
-        make that silent, and a silent no-op is exactly what the floor exists to rule out.
+        attribute still resolves, because ``AsyncMongoClient.__getattr__`` hands back a ``Database`` of that
+        name, so an unguarded call raises ``TypeError`` rather than failing to import. A guard would make
+        that silent, and a silent no-op is what the floor rules out.
 
-        It was ``>=4.12.0``, inherited from ``pymongo-search-utils`` 0.3.0's own floor rather than chosen.
-        Nothing here needs 4.12, and 4.14.0 supports Python 3.9 upward, which clears our 3.10 floor.
+        4.14.0 supports Python 3.9 upward, which clears the package's 3.10 floor.
         """
         requirements = [r for r in (dist_metadata.get_all("Requires-Dist") or []) if f"extra == '{extra}'" in r]
         floors = [r for r in requirements if r.startswith("pymongo") and not r.startswith("pymongo-search-utils")]
@@ -432,14 +423,14 @@ class TestCoreMetadata:
         assert all(">=4.14.0" in r for r in floors), floors
 
     def test_version_is_derived_from_a_git_tag_not_a_file(self, manifest: dict[str, Any]) -> None:
-        """``CH-006``'s version half, asserted against the manifest.
+        """The version comes from a git tag rather than a file, asserted against the manifest.
 
-        The resolved version cannot demonstrate this, for two reasons that both survive. The workspace
-        carries no ``python-v*`` tag, so ``hatch-vcs`` reports a guess for an untagged tree rather than
-        anything a tag produced; and installed metadata describes whichever build last ran ``pip``,
-        which for this venv predates the repository existing at all and reads ``0.0.0``. Asserting
-        either would assert the absence of a tag, which is the opposite of the invariant. ``AT-003``
-        covers what a fresh build does carry, and ``AT-004`` is the unwritten test that needs a tag.
+        The resolved version cannot demonstrate this, for two reasons. In a checkout with no ``python-v*``
+        tag, ``hatch-vcs`` reports a guess for an untagged tree rather than anything a tag produced; and
+        installed metadata describes whichever build last ran ``pip``, which in a development venv can be
+        older than the tree and read ``0.0.0``. Asserting either would assert the absence of a tag, which
+        is the opposite of the invariant. ``TestTheBuiltWheelInstallsIntoAnEmptyVenv`` covers what a fresh
+        build carries. The version a release tag produces needs a tagged checkout and is not tested here.
         """
         assert manifest["project"]["dynamic"] == ["version"]
         assert "version" not in manifest["project"]
@@ -457,12 +448,12 @@ class TestCoreMetadata:
 
 
 class TestBuildPathsResolveInsideTheProjectRoot:
-    """REQ-E-003 — the defect that made the scaffold unbuildable.
+    """Every file the manifest references lives inside ``python/``, so the package builds.
 
-    ``pyproject.toml`` declared ``readme = "README.md"`` and ``license-files = ["LICENSE", "NOTICE"]``
-    while all three files lived at the repository root, one directory above the project root.
-    ``pip install -e .`` failed at metadata generation with
-    ``OSError: Readme file does not exist: README.md``, so 0.0.1 was never built and never published.
+    ``pyproject.toml`` declares ``readme = "README.md"`` and ``license-files = ["LICENSE", "NOTICE"]``,
+    and the build backend resolves both against the project root. A file that exists only at the
+    repository root, one directory up, fails ``pip install -e .`` at metadata generation with
+    ``OSError: Readme file does not exist: README.md``.
     """
 
     @pytest.mark.parametrize("filename", ["README.md", "LICENSE", "NOTICE"])
@@ -477,27 +468,24 @@ class TestBuildPathsResolveInsideTheProjectRoot:
 
 
 class TestTheDistributionAdvertisesItsTypes:
-    """AT-007c / REQ-E-007a — the PEP 561 marker, and the consequence of shipping without it.
+    """AT-007c — the PEP 561 marker, and the consequence of shipping without it.
 
-    Found by running a demo from a directory outside the project. ``mypy`` on a snippet with
-    a ``MongoDBConfig`` literal missing its ``Required`` ``database`` key exited **0**. Not because
-    the type was wrong: because the package carried no ``py.typed``, so mypy declined to read any of
-    it and made every symbol ``Any``.
+    Without ``py.typed``, mypy declines to read the installed package and makes every symbol ``Any``, so
+    a snippet with a ``MongoDBConfig`` literal missing its ``Required`` ``database`` key passes with exit
+    **0**.
 
     That makes the marker load bearing for the whole typing story rather than a packaging detail.
-    ``Required`` keys, the narrow ``SearchType`` literal and the ``TYPE_CHECKING`` declarations behind
-    ``REQ-E-007`` are all instructions to a consumer's type checker, and a consumer's type checker
-    reads none of them without it. Every reference ships one: ``strands`` itself, the extension
+    ``Required`` keys, the narrow ``SearchType`` literal and the ``TYPE_CHECKING`` declarations are all
+    instructions to a consumer's type checker, and a consumer's type checker reads none of them without
+    it. Every reference ships one: ``strands`` itself, the extension
     template this package was scaffolded from, and ``pymongo``.
     """
 
     def test_the_marker_file_exists_in_the_package(self, dist_metadata: PackageMetadata) -> None:
         """A file whose presence is the entire signal (PEP 561), asserted next to the claim it backs.
 
-        The manifest has carried the ``Typing :: Typed`` classifier since the scaffold, so the
-        omission was two lines of one file disagreeing rather than a decision. The classifier is a
-        claim on PyPI and the marker is the mechanism; asserting both together is what keeps them from
-        drifting apart again in either direction.
+        The ``Typing :: Typed`` classifier is a claim on PyPI and the marker is the mechanism. Asserting
+        both together keeps them from drifting apart in either direction.
         """
         assert "Typing :: Typed" in (dist_metadata.get_all("Classifier") or [])
         assert (PROJECT_ROOT / "src" / "strands_mongodb" / "py.typed").is_file()
@@ -509,8 +497,8 @@ class TestTheDistributionAdvertisesItsTypes:
         ``artifacts`` or ``force-include`` entry is needed. A marker one level up in ``src/`` would
         satisfy the test above and never reach the wheel.
 
-        The stronger form of this assertion inspects a built wheel. That needs a build backend this
-        environment does not install, so the release workflow's own build step is where it belongs.
+        The stronger form of this assertion inspects an installed wheel, and needs the build tier:
+        ``test_the_type_marker_ships_inside_the_installed_package`` is that form.
         """
         packages = manifest["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"]
 
@@ -543,7 +531,7 @@ class TestTheDistributionAdvertisesItsTypes:
 @_BUILD_TIER
 @_BUILD_TIER_GATE
 class TestEachExtraResolvesFromTheBuiltWheel:
-    """AT-002 / REQ-E-002 — the manifest boundary from the artifact side: every extra resolves.
+    """AT-002 — the manifest-to-distribution boundary from the artifact side: every extra resolves.
 
     ``TestExtras`` above reads the same facts out of ``importlib.metadata`` and is the faster test, so
     this one has to justify the network. It does two things that one cannot.
@@ -556,7 +544,7 @@ class TestEachExtraResolvesFromTheBuiltWheel:
 
     And it resolves the **transitive closure**, which is where the extras split is actually decided.
     ``[storage]`` naming no search dependency of its own does not mean a ``[storage]`` install lacks
-    one; any of its 49 transitive dependencies could pull ``pymongo-search-utils`` in and the metadata
+    one; any of its transitive dependencies could pull ``pymongo-search-utils`` in and the metadata
     assertion would still pass.
     """
 
@@ -577,7 +565,7 @@ class TestEachExtraResolvesFromTheBuiltWheel:
             assert required in resolved, f"{required} missing from [{extra}]: {sorted(resolved)}"
 
     def test_only_the_memory_side_pulls_the_search_builders(self, resolve_extra: Callable[[str], set[str]]) -> None:
-        """REQ-E-002 — the split buys the user something, asserted after the resolver has had its say.
+        """The split buys the user something, asserted after the resolver has had its say.
 
         One distribution of difference across the whole closure, and it is the one the manifest names.
         A ``[storage]`` install that arrived at ``pymongo-search-utils`` by some other route would fail
@@ -602,13 +590,12 @@ class TestEachExtraResolvesFromTheBuiltWheel:
 @_BUILD_TIER
 @_BUILD_TIER_GATE
 class TestTheBuiltWheelInstallsIntoAnEmptyVenv:
-    """AT-003 / REQ-E-003 / REQ-E-007a — the artifact and lazy-import boundaries, nothing else installed.
+    """AT-003 — the built wheel installed into an empty venv, with nothing else installed.
 
-    Every other assertion in this file describes the development venv's editable install. That install
-    was made before this workspace became a git repository and it still reports version ``0.0.0``, hours
-    after a fresh build stopped producing that number, which is the shape of the problem: an assertion
-    about installed metadata can be an assertion about an install old enough to predate the change it
-    was meant to catch. The wheel here is built from the tree as it stands, in this session.
+    Every other assertion in this file describes the development venv's editable install, which can be
+    older than the tree and report a stale version such as ``0.0.0``. An assertion about installed
+    metadata can be an assertion about an install that predates the change it was meant to catch. The
+    wheel here is built from the tree as it stands, in this session.
 
     Four things are only observable this way: what the wheel *contains*, which is where ``py.typed``
     either ships or silently does not; what a first import pulls in when the interpreter has never seen
@@ -617,10 +604,11 @@ class TestTheBuiltWheelInstallsIntoAnEmptyVenv:
     """
 
     def test_the_first_import_pulls_no_driver(self, storage_only_venv: Path) -> None:
-        """REQ-E-006 — the lazy export, in an interpreter with no import cache of ours.
+        """The lazy export, in an interpreter with no import cache of ours.
 
-        ``AT-006d`` asserts this already, in a subprocess of the development venv where every
-        dependency is installed and something else could have imported ``pymongo`` first. Here nothing
+        ``TestAccessImportsOnlyWhatWasAsked`` in ``test_lazy_exports.py`` asserts this already, in a subprocess
+        of the development venv where every dependency is installed and something else could have imported
+        ``pymongo`` first. Here nothing
         else is installed, so the observation is unambiguous.
         """
         result = _in_venv(
@@ -641,7 +629,7 @@ class TestTheBuiltWheelInstallsIntoAnEmptyVenv:
     def test_the_missing_extra_message_names_the_extra_that_is_actually_missing(self, storage_only_venv: Path) -> None:
         """The error a user gets after installing the narrower extra, produced by the install.
 
-        ``AT-008b`` covers this with a ``sys.meta_path`` finder that blocks the distribution, because in
+        ``test_extras.py`` covers this with a ``sys.meta_path`` finder that blocks the distribution, because in
         the development venv it is present. A blocked import and an absent one raise the same class and
         need not carry the same message: the finder answers for the module name it was told about, and
         the install answers for whatever ``pip`` actually put on the path.
@@ -665,11 +653,10 @@ class TestTheBuiltWheelInstallsIntoAnEmptyVenv:
         assert "pip install 'strands-mongodb[memory]'" in result.stdout, result.stdout
 
     def test_the_type_marker_ships_inside_the_installed_package(self, storage_only_venv: Path) -> None:
-        """REQ-E-007a — the assertion ``test_the_marker_sits_inside_the_directory_the_wheel_packages`` defers.
+        """The stronger form of ``test_the_marker_sits_inside_the_directory_the_wheel_packages``.
 
-        That test reads the manifest's ``packages`` list and says so in its own docstring: the stronger
-        form inspects a built wheel. This is that form, one step further on, reading the file out of the
-        directory pip unpacked it into. A marker that the build dropped, or placed one level up in
+        That test reads the manifest's ``packages`` list. This one reads the file out of the directory pip
+        unpacked the built wheel into. A marker that the build dropped, or placed one level up in
         ``src/``, is absent here and present in the manifest.
         """
         result = _in_venv(
@@ -689,12 +676,11 @@ class TestTheBuiltWheelInstallsIntoAnEmptyVenv:
     def test_the_installed_version_is_the_one_this_tree_builds(
         self, storage_only_venv: Path, built_wheel: Path
     ) -> None:
-        """``CH-006``'s version half, as far as an untagged repository allows it to be checked.
+        """The installed version is the one this tree builds, as far as an untagged checkout allows.
 
         The wheel's filename carries the version ``hatch-vcs`` resolved at build time, and the installed
-        metadata carries what pip recorded from it. Equal, and equal to neither ``0.0.0`` nor the stale
-        number the development venv still reports, is the whole claim. The tag half needs a ``python-v*``
-        tag and is ``AT-004``, which is unwritten.
+        metadata carries what pip recorded from it. Equal, and not the ``0.0.0`` fallback, is the whole
+        claim. The version a release tag produces needs a ``python-v*`` tag and is not tested here.
 
         The last assertion presumes git metadata is reachable, which is a property of this tier rather
         than of the package: it runs for a maintainer or in CI, both of which have a checkout. Run from
@@ -717,18 +703,17 @@ class TestTheBuiltWheelInstallsIntoAnEmptyVenv:
 
 
 class TestTheDevExtraAndTheHatchEnvironmentAgree:
-    """AT-160 / REQ-E-154 — the same dependency list is written twice, so assert the copies are equal.
+    """AT-160 — the same dependency list is written twice, so assert the copies are equal.
 
     ``[project.optional-dependencies].dev`` is what a contributor installs with
     ``pip install -e '.[all,dev]'``. ``[tool.hatch.envs.default].dependencies`` is what CI installs,
-    because every job runs through ``hatch``. Nothing derives one from the other, and nothing compared
-    them until this test: a package added to the first alone is present locally and absent in CI, which
-    makes a green matrix a statement about the maintainer's laptop.
-
-    Found by having to add the same dependency to both lists and noticing that nothing would have said so.
+    because every job runs through ``hatch``. Nothing derives one from the other, so a package added to
+    the first alone is present locally and absent in CI, and CI then tests a different environment from
+    the one a contributor runs.
 
     Compared as sets of requirement strings rather than as lists, so ordering is free, and in both
-    directions for the same reason ``AT-105`` is: a copy that is merely a superset is still a copy that
+    directions for the same reason as ``TestTheMatrixCoversEveryVersionTheClassifiersClaim`` in
+    ``test_ci.py``: a copy that is merely a superset is still a copy that
     drifted, and which side is ahead is the first thing a reader needs to know.
     """
 

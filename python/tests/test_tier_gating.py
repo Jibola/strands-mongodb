@@ -1,17 +1,14 @@
 """Tests for the test harness itself: does the tier gate actually gate?
 
 ``conftest.py``'s ``pytest_collection_modifyitems`` hook is the single mechanism keeping an
-unconfigured backend from being reported as a pass. It has the property that makes untested
-infrastructure dangerous, in both directions: break it open and every gated test skips while the
-suite still reports green, and nobody investigates a green run; break it the other way and a missing
-database looks like a broken test suite.
+unconfigured backend from being reported as a pass. It can fail in both directions: broken open,
+every gated test skips while the suite still reports green; broken the other way, a missing database
+looks like a broken test suite.
 
 So the gate gets its own tests. ``pytester`` runs a nested pytest session with a synthetic test
 file, which is the only way to observe skip behavior from the outside, since a test cannot watch
-itself be skipped.
-
-Covers the gating half of the harness, and the ``.env`` loader, which decides what the gate sees in the
-first place.
+itself be skipped. The ``.env`` loader, which decides what the gate sees in the first place, is
+tested here too.
 """
 
 from __future__ import annotations
@@ -36,19 +33,18 @@ from strands_mongodb import _indexes
 pytest_plugins = ["pytester"]
 
 EXPECT_SEARCH_VARIABLE = "STRANDS_MONGODB_EXPECT_SEARCH"
-"""How a caller says "the deployment I gave you has a search process, so hold me to it" (``REQ-E-182``).
+"""How a caller says "the deployment I gave you has a search process, so hold me to it".
 
 Set by one leg of the contract tier's two and left empty by the other. One-directional on purpose: set
 means the search process must be there, and unset means nothing, because a developer running this tier
 against a cluster has not promised anything and should not be failed for exceeding the promise.
 """
 
-# How a test says "this machine has no backend for that tier". Deleting the variable stopped being
-# enough once the real conftest learned to read `.env`: every nested session re-imports that
-# module, which re-fills any tier variable the file names and the environment lacks, so a `delenv` here
-# was undone before the gate ran. An empty value is present, therefore never filled, and the gate reads
-# it as unset because it tests truthiness. These tests are hermetic under both configurations now, where
-# before they passed only on a checkout with no `.env` in it.
+# How a test says "this machine has no backend for that tier". Deleting the variable is not enough
+# because the real conftest reads `.env`: every nested session re-imports that module, which re-fills any
+# tier variable the file names and the environment lacks, so a `delenv` here would be undone before the
+# gate ran. An empty value is present, therefore never filled, and the gate reads it as unset because it
+# tests truthiness. That keeps these tests hermetic whether or not the checkout has a `.env`.
 _NO_BACKEND = ""
 
 # The nested session must exercise the real conftest, not a copy that could drift from it. It is
@@ -135,15 +131,15 @@ class TestGateSkipsWhenUnconfigured:
     def test_skips_rather_than_errors_when_the_test_requests_a_session_scoped_fixture(
         self, gated: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Regression test for the fixture-ordering bug the harness smoke tests exposed.
+        """A session-scoped backend fixture does not turn the skip into an error.
 
-        The gate was originally a function-scoped autouse fixture. Pytest instantiates
-        higher-scoped fixtures first, so a test requesting the session-scoped ``contract_uri`` had it
-        built — and raised — before the gate ran. The outcome was **errors**, not skips.
+        Pytest instantiates higher-scoped fixtures first, so a gate implemented as a function-scoped
+        autouse fixture would let the session-scoped ``contract_uri`` be built, and raise, before the
+        gate ran. The outcome would be **errors**, not skips.
 
-        That distinction is the whole point of the gate. An error says the suite is broken and
-        someone should fix the tests; a skip says the environment lacks a backend and names the
-        variable to set. Reporting the second as the first is how a team learns to ignore red.
+        That distinction is the point of the gate. An error says the suite is broken and someone
+        should fix the tests; a skip says the environment lacks a backend and names the variable to
+        set.
         """
         monkeypatch.setenv("MONGODB_URI", _NO_BACKEND)
         gated.makepyfile(
@@ -237,10 +233,9 @@ class TestMarkersAreRequirementsNotAlternatives:
     ) -> None:
         """An ``autoembed`` test also carries ``integration``, and one variable must not satisfy both.
 
-        The failure this prevents: setting only ``MONGODB_ATLAS_URI`` and having the AutoEmbeddings
-        acceptance test run against a deployment with no registered model, where ``$vectorSearch``
-        returns an empty result rather than an error, observed live. It would
-        report a pass.
+        Setting only ``MONGODB_ATLAS_URI`` must not run the AutoEmbeddings acceptance test against a
+        deployment with no registered model, where ``$vectorSearch`` returns an empty result rather
+        than an error and the test would report a pass.
         """
         monkeypatch.setenv("MONGODB_ATLAS_URI", "mongodb://localhost:27017")
         monkeypatch.setenv("MONGODB_AUTOEMBED_URI", _NO_BACKEND)
@@ -288,16 +283,15 @@ class TestFixtureMisuseFailsRatherThanSkips:
 
 
 class TestAnUnreachableSearchProcessSkipsRatherThanFails:
-    """AT-127 / ``REQ-E-124`` — the second gate, which reports infrastructure as infrastructure.
+    """AT-127 — the second gate, which reports infrastructure as infrastructure.
 
     The gate above decides whether a tier runs at all, from a variable read before collection. This one
     covers what the variable cannot see: a deployment that is configured and reachable for everything
-    except the separate process that answers searches. That happened on 2026-09-15, and the tier report
-    it produced named six failing tests in this package, none of which had anything wrong with them.
+    except the separate process that answers searches. Without it, an unreachable search process would
+    be reported as failing tests in this package with nothing wrong with them.
 
-    Every claim here is about the boundary between "skip this" and "fail this", because the helper is
-    only worth having if it stays on the right side of it. A guard that skipped on any search failure
-    would be strictly worse than no guard: it would hide the regressions the tests exist to find.
+    Every claim here is about the boundary between "skip this" and "fail this". A guard that skipped on
+    any search failure would hide the regressions the tests exist to find.
     """
 
     @staticmethod
@@ -312,8 +306,7 @@ class TestAnUnreachableSearchProcessSkipsRatherThanFails:
         return error
 
     def test_the_documented_code_is_the_one_the_deployment_raised(self) -> None:
-        """Sourced rather than chosen: ``HostUnreachable`` is 6 in the server's error table, and 6 is
-        what the 2026-09-15 log carries."""
+        """``HostUnreachable`` is 6 in the server's error table, and 6 is what the server reports."""
         assert HOST_UNREACHABLE == 6
 
     def test_a_chained_host_unreachable_skips_and_the_message_carries_both_halves(self) -> None:
@@ -321,9 +314,9 @@ class TestAnUnreachableSearchProcessSkipsRatherThanFails:
 
         ``pytest.skip`` raises ``Skipped``, which derives from ``BaseException`` rather than
         ``Exception``, so this catches it explicitly rather than letting an ``except Exception`` in the
-        helper's caller decide. The two message assertions are ``REQ-E-124``'s: the namespace comes
-        from this package's own sentence and the host and port from the driver's, and a message
-        carrying one without the other sends the reader to the wrong place.
+        helper's caller decide. The skip message carries both halves: the namespace comes from this
+        package's own sentence and the host and port from the driver's, and a message carrying one
+        without the other sends the reader to the wrong place.
         """
         with pytest.raises(BaseException, match="search process is unreachable") as raised:
             skip_if_search_is_unreachable(self._storage_error(HOST_UNREACHABLE))
@@ -346,14 +339,13 @@ class TestAnUnreachableSearchProcessSkipsRatherThanFails:
         assert raised.typename == "Skipped"
 
     def test_the_index_management_channel_is_recognised_too(self) -> None:
-        """``AT-167`` / ``REQ-E-161`` -- one outage, two codes, because mongod reaches mongot over two channels.
+        """``AT-167`` -- one outage, two codes, because mongod reaches mongot over two channels.
 
-        Measured on 2026-09-16 on a deployment running ``mongod`` with nothing on its ``mongotHost``
-        port. ``$search`` answered with 6 and the host and port that refused; ``$listSearchIndexes``
-        and ``createSearchIndexes`` answered with **125**, ``CommandFailed``, *"Error connecting to
-        Search Index Management service."* -- a different code, a different sentence, no host in it.
-        A guard that knows only 6 therefore catches the query surface and misses every call that
-        provisions or reads an index, which on that deployment was all twelve of the failures.
+        On a deployment running ``mongod`` with nothing on its ``mongotHost`` port, ``$search`` answers
+        with 6 and the host and port that refused; ``$listSearchIndexes`` and ``createSearchIndexes``
+        answer with **125**, ``CommandFailed``, *"Error connecting to Search Index Management
+        service."*: a different code, a different sentence, no host in it. A guard that knew only 6
+        would catch the query surface and miss every call that provisions or reads an index.
         """
         from pymongo.errors import OperationFailure
 
@@ -371,7 +363,7 @@ class TestAnUnreachableSearchProcessSkipsRatherThanFails:
     def test_a_command_failed_that_names_something_else_is_left_to_fail(self) -> None:
         """The other half of it, and the reason 125 is matched with its message rather than alone.
 
-        ``CommandFailed`` is a general code -- unlike 6, which is a network answer, it is what the
+        ``CommandFailed`` is a general code. Unlike 6, which is a network answer, it is what the
         server says about a command that did not work out. Matching the number on its own would skip
         on a whole class of real results. The sentence naming the Search Index Management service is
         the part this package cannot cause: the host it names comes from a server parameter.
@@ -388,11 +380,11 @@ class TestAnUnreachableSearchProcessSkipsRatherThanFails:
             )
 
     def test_a_reason_three_links_down_is_still_found(self) -> None:
-        """``AT-167`` / ``REQ-E-161`` -- the chain is walked to the end, not read two links deep.
+        """``AT-167`` -- the chain is walked to the end, not read two links deep.
 
-        ``REQ-E-160`` gives the ``auto`` path's *"no search tier could be prepared"* a cause, and that
-        cause is itself this package's error wrapping the driver's. So the code now sits three links
-        from what the caller catches, and a guard reading ``error`` and ``error.__cause__`` alone
+        The ``auto`` path's *"no search tier could be prepared"* error has a cause, and that cause is
+        itself this package's error wrapping the driver's. So the code sits three links from what the
+        caller catches, and a guard reading ``error`` and ``error.__cause__`` alone
         stops one link short of every failure on that path.
         """
         from pymongo.errors import OperationFailure
@@ -411,9 +403,9 @@ class TestAnUnreachableSearchProcessSkipsRatherThanFails:
 
     @pytest.mark.parametrize("code", [8, 26, 31082, None], ids=["unknown-error", "namespace", "unsupported", "none"])
     def test_every_other_failure_is_left_to_fail(self, code: int | None) -> None:
-        """The half that keeps the guard honest.
+        """Every other code, or none, is left to fail.
 
-        8 is ``UnknownError`` and is what a mutation to ``!=`` would let through. 26 and 31082 are both
+        8 is ``UnknownError`` and is what a comparison inverted to ``!=`` would let through. 26 and 31082 are both
         real and both mean the package asked for something the deployment does not have, which is a
         result the suite must report rather than skip. ``None`` is a network error that never reached a
         server and therefore carries no code at all.
@@ -428,18 +420,15 @@ class TestAnUnreachableSearchProcessSkipsRatherThanFails:
 
 
 class TestTheOutageSkipsWhereverItSurfaces:
-    """``AT-167`` / ``REQ-E-161`` -- the guard reaches the arrange phase, not only the act phase.
+    """``AT-167`` -- the guard reaches the arrange phase, not only the act phase.
 
-    What the 2026-09-16 reproduction settled. With the codes widened and the chain walked, two of the
-    twelve failures became skips and ten did not, and the ten had nothing in common with the two except
-    *where* they were standing: they failed on ``await store.add(...)``, the line before the search, or
-    in a fixture. ``add`` calls ``initialize`` and ``initialize`` provisions the search indexes, so on a
-    deployment with no mongot the outage arrives during setup and never reaches the search helper that
-    holds the guard.
+    A search outage often surfaces before the search itself: on ``await store.add(...)``, the line
+    before the search, or in a fixture. ``add`` calls ``initialize`` and ``initialize`` provisions the
+    search indexes, so on a deployment with no mongot the outage arrives during setup and never reaches
+    a search helper that holds the guard.
 
-    So the narrowness that was wrong was in the call sites, not in the match. A hook around the setup
-    and call phases sees the failure wherever it is standing; the match stays exactly as strict, which
-    is what keeps a package regression a failure.
+    A hook around the setup and call phases sees the failure wherever it surfaces, and the match stays
+    exactly as strict, which keeps a package regression a failure.
     """
 
     @staticmethod
@@ -457,7 +446,7 @@ class TestTheOutageSkipsWhereverItSurfaces:
         """Both phases, because a fixture that provisions indexes fails in the first one.
 
         A failure in setup is reported as an *error* rather than a failure, which reads as "the suite is
-        broken" -- the worst of the three readings for something an operator fixes with a restart.
+        broken", the wrong reading for something an operator fixes with a restart.
         """
         import conftest
 
@@ -471,11 +460,11 @@ class TestTheOutageSkipsWhereverItSurfaces:
 
     @pytest.mark.parametrize("phase", ["setup", "call"])
     def test_every_other_failure_comes_out_as_it_went_in(self, phase: str) -> None:
-        """The half that keeps it honest: the hook is a filter, not a net.
+        """The hook is a filter, not a net: anything else passes through unchanged.
 
         An ``AssertionError`` is what a real defect looks like arriving here, and it has to survive the
-        wrapper unchanged -- same type, same message -- or every red test in the suite would be one
-        wrapper bug away from reading green.
+        wrapper with the same type and the same message, or a real failure could be reported as a
+        skip.
         """
         import conftest
 
@@ -492,8 +481,8 @@ class TestTheEnvFileFillsTierVariables:
     """A URI written down in `.env` is configuration the harness should find.
 
     The gate above decides what happens when a variable is missing. This decides which variables exist,
-    which is the earlier question and the one that silently skipped a whole suite: a cloud cluster sat in
-    a `.env` file for a day while every tier reported "not configured".
+    which is the earlier question: without it, a cluster named in `.env` would leave every tier reporting
+    "not configured".
     """
 
     def test_only_the_three_tier_variables_are_read(self, tmp_path: Path) -> None:
@@ -608,9 +597,8 @@ class TestTheEnvFileFillsTierVariables:
     def test_the_locations_are_the_package_directory_then_the_repository_root(self) -> None:
         """Both are `.gitignore`d, and that is asserted rather than trusted.
 
-        A harness that reads credentials from a path the repository would commit is a harness that
-        teaches people to commit credentials. The file this feature was built for holds a live Atlas
-        password.
+        A harness that read credentials from a path the repository would commit would encourage
+        committing them, and a `.env` typically holds a connection string with a password in it.
         """
         package_directory = Path(__file__).resolve().parent.parent
         assert list(ENV_FILE_LOCATIONS) == [package_directory / ".env", package_directory.parent / ".env"]
@@ -634,17 +622,17 @@ class TestTheEnvFileFillsTierVariables:
 
 
 class TestAFailureReportNeverCarriesThePassword:
-    """AT-103 / REQ-E-103 — a credential in a failure report, on the harness side of the line `REQ-E-014` draws.
+    """AT-103 — the connection string the harness reads never reaches a test report with its password.
 
-    `REQ-E-014` binds the package, and the package holds up: pymongo strips credentials from its own
-    ``repr`` and nothing here formats a config. The value pytest prints is the one the harness read out
-    of the environment before any package code ran, so no requirement on the package could have caught
-    it. Measured in the all-tiers run of 2026-09-02, where six failures each printed the development
-    cluster's user and password in full, from the fixture header alone.
+    The package keeps credentials out of its own output: pymongo strips them from its ``repr`` and
+    nothing in the package formats a config. The value pytest prints for a failing test is a different
+    one: the URI the harness read out of the environment before any package code ran. Pytest prints every
+    fixture a failing test requested, so without redaction the user and password would appear in the
+    fixture header of every failure.
 
     Two halves, because the mechanism and the outcome fail differently. The first asserts what the value
     does; the second runs a session that fails on purpose and reads the report, which is the artifact
-    that actually reaches a CI log.
+    that reaches a CI log.
     """
 
     _SECRET = "Sup3rS3cret"
@@ -659,8 +647,7 @@ class TestAFailureReportNeverCarriesThePassword:
         assert self._SECRET not in repr(value)
         assert self._SECRET not in f"{value!r}"
         assert "cluster0.example.mongodb.net" in repr(value), "the host is what makes a failure diagnosable"
-        # The string still has to be the string. A wrapper that changed it would turn a disclosure bug
-        # into a connection bug, which is worse: the first is visible in a log, the second in production.
+        # The value itself is unchanged, so it still connects; only its repr is redacted.
         assert value == self._URI
         assert str(value) == self._URI
 
@@ -669,8 +656,8 @@ class TestAFailureReportNeverCarriesThePassword:
     ) -> None:
         """AT-103, the outcome. The report is what reaches a CI log, so the report is what is asserted.
 
-        The nested test both requests the fixture and fails, which is the shape the real run hit: pytest
-        prints every fixture a failing test requested, using ``repr``.
+        The nested test both requests the fixture and fails: pytest prints every fixture a failing test
+        requested, using ``repr``.
         """
         monkeypatch.setenv("MONGODB_URI", self._URI)
         gated.makepyfile(
@@ -687,23 +674,22 @@ class TestAFailureReportNeverCarriesThePassword:
         result = gated.runpytest()
 
         result.assert_outcomes(failed=1)
-        assert self._SECRET not in result.stdout.str(), "REQ-E-103: the password reached the report"
+        assert self._SECRET not in result.stdout.str(), "the password reached the report"
         result.stdout.fnmatch_lines(["*cluster0.example.mongodb.net*"])
 
 
 @pytest.mark.contract
 class TestALegPromisedASearchProcessGotOne:
-    """``AT-187`` / ``REQ-E-182`` -- the guard on the half of the contract tier that can pass vacuously.
+    """``AT-187`` -- the guard on the half of the contract tier that can pass vacuously.
 
     The contract tier runs twice, over a deployment with a search process and one without, because the
     rules about which search tier a store resolves are all true for a trivial reason where nothing can
     search: the store resolves no tier at all and every branch about fusion takes its quiet side. The leg
     with mongot is what reads the other side.
 
-    Which makes that leg's value entirely dependent on it really having mongot. If the image changed, or
-    the service came up before its search process did, or somebody copied the job and forgot the image,
-    the tests would take the same quiet branches and the job would still be green -- a check that reports
-    on nothing, which is the failure the whole two-leg arrangement exists to fix one level down.
+    That leg's value depends entirely on it really having mongot. If the image changed, or the service
+    came up before its search process did, or a copied job used the wrong image, the tests would take
+    the same quiet branches and the job would still be green.
 
     So the promise is made explicit in the environment and read back here. This belongs with the other
     tests of the harness rather than with the tests that use it: what it asserts is that the gate is
@@ -713,7 +699,7 @@ class TestALegPromisedASearchProcessGotOne:
     async def test_the_deployment_has_the_search_process_the_environment_promised(
         self, contract_uri: str, test_database_name: str, unique_collection_name: str, contract_database: Any
     ) -> None:
-        """``AT-187`` -- set the variable and the absence of mongot is a failure rather than a skip."""
+        """``AT-187`` -- with the variable set, the absence of mongot is a failure rather than a skip."""
         if not os.environ.get(EXPECT_SEARCH_VARIABLE):
             pytest.skip(f"{EXPECT_SEARCH_VARIABLE} is unset, so this deployment promised nothing")
 

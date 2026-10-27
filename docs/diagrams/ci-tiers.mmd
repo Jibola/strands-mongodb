@@ -1,0 +1,20 @@
+---
+title: Where each test tier runs on GitHub Actions
+---
+graph LR
+  change(["Pull request or merge"])
+  weekly(["Weekly cron or manual run"])
+  subgraph every[Every change]
+    unit["Unit tier<br/>Python 3.10 to 3.14, no database"]
+    plain["Contract tier<br/>mongo:8 container"]
+    local["Contract and integration tiers<br/>mongodb-atlas-local container"]
+  end
+  subgraph atlas[Atlas tiers job]
+    up["Create a MongoDB Atlas M10<br/>Newest release, this runner's IP only"]
+    tiers["integration and autoembed tiers"]
+    down["Delete the cluster<br/>Runs even when tests fail"]
+  end
+  change --> unit
+  change --> plain
+  change --> local
+  weekly --> up --> tiers --> down

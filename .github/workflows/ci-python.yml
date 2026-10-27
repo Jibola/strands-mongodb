@@ -1,32 +1,21 @@
 name: CI - Python
 
-# Five gates on a change and two jobs on the weekly cron or on demand. Asserted by tests/test_ci.py
-# (AT-104 to AT-109, AT-130, AT-131, AT-139, AT-140), because this file is the one part of the repository
-# nothing else in the suite can execute: the tests read it as YAML and check that it says what the
-# requirements ask it to say.
+# Five gates on a change and two jobs on the weekly cron or on demand. tests/test_ci.py reads this file
+# as YAML and checks its structure.
 #
-# The contract tier runs on every change against a service container rather than a credential. The tier's
-# own definition is "any real MongoDB, including a plain mongod", and this package opens no transaction, no
-# session and no change stream, so a container satisfies it by definition and costs nothing. The two tiers
-# that genuinely need a cluster -- integration and autoembed, which need mongot and a registered embedding
-# model -- run on the schedule instead, because a pull request from a fork receives no secret and would
-# report the resulting skip as a pass.
+# The contract and integration tiers run on every change against service containers, so they need no
+# secret: this package opens no transaction, session or change stream, and the Atlas local image carries
+# mongot. Only autoembed needs a real Atlas cluster, so the `atlas` job runs it, with integration again,
+# on the schedule.
 
 on:
   pull_request:
-    # No `branches:` filter, deliberately, and it is the one narrowing this trigger does not get. A pull
-    # request based on another topic branch -- one change stacked on an earlier one still under review --
-    # matched `branches: [ main ]` in neither trigger and ran no gate job at all: one check on the page, from
-    # an organisation-level scanner, in the same green as five passing gates. `AT-138` could not see it,
-    # because `paths` and `branches` narrow independently and every path that change touched was watched.
-    # Retargeting does not rescue it either: when the base merges, GitHub moves the base here on its own and
-    # emits `pull_request` with the `edited` activity type, which is not one of the three a workflow receives
-    # unless it asks. There is no run to re-run. `AT-182`.
+    # No `branches:` filter, deliberately. A pull request stacked on another topic branch would otherwise
+    # run no gate job, and when its base merges GitHub retargets it with an `edited` event this workflow
+    # does not receive, so it would never run one.
     paths:
-      # Every file the suite asserts something about, which is more than the package directory and is
-      # checked rather than remembered: `AT-138` walks the test modules for the paths they name and fails
-      # when one of them is not watched here. A pull request that touches only an unwatched file runs no
-      # job at all, and a pull request with no checks looks exactly like one whose checks passed.
+      # Every file the suite asserts something about; a test fails when one is not listed. A change that
+      # touches only an unlisted file runs no job, which looks the same as passing.
       - 'python/**'
       - '.github/workflows/ci-python.yml'
       - '.github/workflows/release-python.yml'
@@ -37,15 +26,12 @@ on:
       - 'SECURITY.md'
       - '.gitignore'
   push:
-    # This one keeps the filter. A push to a topic branch is already graded by that branch's pull request, and
-    # grading it here as well would run the whole matrix twice on one commit for one verdict -- the group
-    # below keys a push on the run id rather than the ref, so neither copy would supersede the other.
+    # Push keeps the filter: a topic branch is already graded by its pull request, and the concurrency
+    # group keys a push on the run id, so a second copy would not supersede the first.
     branches: [ main ]
     paths:
-      # Every file the suite asserts something about, which is more than the package directory and is
-      # checked rather than remembered: `AT-138` walks the test modules for the paths they name and fails
-      # when one of them is not watched here. A pull request that touches only an unwatched file runs no
-      # job at all, and a pull request with no checks looks exactly like one whose checks passed.
+      # Every file the suite asserts something about; a test fails when one is not listed. A change that
+      # touches only an unlisted file runs no job, which looks the same as passing.
       - 'python/**'
       - '.github/workflows/ci-python.yml'
       - '.github/workflows/release-python.yml'
@@ -56,37 +42,25 @@ on:
       - 'SECURITY.md'
       - '.gitignore'
   schedule:
-    # Weekly canary against the newest SDK release, and the only mitigation for an unpinned SDK floor. The floor
-    # here is strands-agents>=1.54.0 with no upper bound, so a new user resolves whatever is current; this
-    # is what sees a removed export or an added Protocol member before they do. Its opposite number is the
-    # `floors` job, which resolves the other end of that range; between them the two ends of every declared
-    # floor are exercised and the middle is inferred.
+    # Weekly canary against the newest SDK release. strands-agents has no upper bound, so a new user resolves
+    # whatever is current; this sees a removed export or an added Protocol member first. The `floors` job
+    # tests the other end of the range.
     - cron: '0 6 * * 1'
-  # The same two jobs, on demand. A cron is a trigger no person can pull: across the first thirty-four runs
-  # of this workflow the schedule had fired zero times against eighteen pull requests and sixteen pushes,
-  # so the canary and the Atlas tiers had never run once and reported `skipping` on every pull request --
-  # which sits beside a pass in the same colour. A job reachable only by waiting also cannot be debugged,
-  # because the answer to "did that fix it" is another week away. Dispatch requires write access and runs a
-  # ref already in the repository, so it is exactly as far out of a fork's reach as the cron is; `AT-140`
-  # asserts that rather than trusting it. No `inputs:` -- a dispatch runs every job, which is the useful
-  # meaning of a "run CI now" button.
+  # On demand, so the scheduled jobs can be run and debugged without waiting a week. Dispatch needs write
+  # access and runs a ref already in the repository, so a fork cannot reach it. No `inputs:`: a dispatch
+  # runs every job.
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  # Keyed on the event as well, because `github.ref` is `refs/heads/main` for a push to main, for a
-  # dispatch against main and for the weekly cron alike. Keying on the ref alone put all three in one
-  # group, where `cancel-in-progress` made whichever started last kill the others. The job that lost was
-  # always `Atlas tiers`: 36 minutes, startable only by the cron or by hand, and destroyed by any merge
-  # that landed while it ran. The fallback is the run id rather than the ref so that two dispatches are
-  # two questions rather than one asked twice; a pull request still keys on its number, below.
+  # Keyed on the event, because a push to main, a dispatch and the cron share the same `github.ref`; on the
+  # ref alone a merge would cancel a running `Atlas tiers` job. Pull requests key on their number, and
+  # everything else on the run id, so two dispatches do not cancel each other.
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
-  # Superseding is right for a pull request and wrong everywhere else. A second push to a branch makes
-  # the first run's verdict worthless -- it grades a commit nobody will merge. A push, a dispatch and a
-  # cron each grade a commit that is already on main, where the run being cancelled is the only verdict
-  # that commit will ever get.
+  # Cancel only for a pull request, where a new push makes the old run moot. A push, a dispatch and the cron
+  # grade a commit already on main, and cancelling would leave that commit with no result.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
@@ -98,22 +72,17 @@ jobs:
     name: Lint
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    # Every job in this file declares one of these. The default is six hours -- not a number anybody
-    # chose, just what a job inherits by saying nothing -- and a runner that hangs on a network read
-    # spends all of it before anyone is told. Each budget below is a little above the slowest run this
-    # job has had, which is tight enough that a hang fails and loose enough that a slow runner does not.
-    # `AT-165`.
-    timeout-minutes: 10  # Lint: under a minute in practice.
+    # Every job declares a budget, because GitHub's default is six hours and a hung network read would
+    # spend all of it. Each is tight enough that a hang fails and loose enough for a slow runner.
+    timeout-minutes: 10
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          # The credential `actions/checkout` otherwise writes into `.git/config` as an `http.extraheader`
-          # and leaves readable by every later step in the job. Nothing in either workflow pushes, tags or
-          # comments, so no step after a checkout has a use for it. `REQ-E-163` -- all nine checkouts
-          # across the two files set this, and `AT-169` reads both files rather than this one.
+          # Otherwise `actions/checkout` leaves its token in `.git/config`, readable by every later step.
+          # Nothing in either workflow pushes, tags or comments. Every checkout in both files sets this.
           persist-credentials: false
 
       - name: Set up Python
@@ -125,10 +94,8 @@ jobs:
       - name: Install hatch
         run: pip install hatch
 
-      # The manifest against the packaging schemas, which `hatch build` does not check and the tests here
-      # do not either -- `test_packaging.py` reads the values this package cares about, not the shape PyPI's
-      # validators require. The release gate runs the same command; this copy is what turns a manifest
-      # defect into a comment on a diff rather than a red job after a tag exists. `AT-183`.
+      # `hatch build` and the tests do not check the manifest against PyPI's schemas. The release gate runs
+      # this too; running it here catches a defect before a tag exists.
       - name: Validate the manifest
         run: |
           pip install --quiet validate-pyproject
@@ -150,12 +117,11 @@ jobs:
     name: Test - Python ${{ matrix.python-version }}
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # The slowest leg runs a little over three minutes.
+    timeout-minutes: 15
     strategy:
       matrix:
-        # Quoted, because unquoted 3.10 is the float 3.1 in YAML and setup-python would resolve it to 3.1.
-        # This list must equal the Programming Language :: Python :: classifiers in pyproject.toml, and
-        # AT-105 compares the two as sets in both directions.
+        # Quoted, because unquoted 3.10 is the float 3.1 in YAML. A test requires this list to equal the
+        # Python version classifiers in pyproject.toml.
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
       fail-fast: false
 
@@ -180,19 +146,15 @@ jobs:
       - name: Run tests
         run: hatch run test
 
-  # The other end of the range `sdk-compat` tests. That job resolves the newest `strands-agents` every
-  # Monday; nothing resolved the oldest, and the floors in pyproject.toml are as much a shipped artefact as
-  # the code -- they are what a user's resolver reads. The first run of this job found the declared floor
-  # was wrong by six releases: `storage.py` imports `strands.storage.search.keyword`, which does not exist
-  # before 1.54.0, so `pip install strands-mongodb[storage]` resolving 1.48.0 produced a package that could
-  # not be imported. `REQ-E-168`, asserted by `AT-174`.
+  # The other end of the range `sdk-compat` tests: every declared floor, installed and run against. A floor
+  # is what a user's resolver reads, and one set too low ships a package that cannot be imported.
   floors:
     name: Dependency floors
-    # On a change rather than on the schedule, which is the mirror of `sdk-compat`: a floor stops being true
-    # when an import is added to a module, and that arrives in a pull request. Nothing upstream can break it.
+    # On a change rather than on the schedule: a floor stops being true when this package adds an import,
+    # and nothing upstream can break it.
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # An install that resolves nothing current, then the unit tier. Budgeted as `test`.
+    timeout-minutes: 15
 
     steps:
       - name: Checkout code
@@ -204,15 +166,13 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7.0.0
         with:
-          # Quoted for the same reason the matrix is: unquoted 3.10 is the float 3.1 in YAML. The oldest
-          # interpreter rather than the newest, because a resolver that hands a user the floors is usually
-          # one an old Python constrained, and `AT-174` compares this against `requires-python`.
+          # Quoted, as in the matrix. The oldest interpreter, because an old Python is what usually resolves
+          # a user to the floors. A test compares this against `requires-python`.
           python-version: "3.10"
           cache: 'pip'
 
-      # Written out rather than generated from pyproject.toml, so the pinned set is visible in the diff and
-      # in the log. `AT-174` reads the floors out of the manifest and requires each one to appear here, so
-      # a floor added to an extra and not added below fails on the change that adds it.
+      # Written out rather than generated, so the pinned set is visible in the diff and the log. A test
+      # requires every floor in pyproject.toml to appear here.
       - name: Pin every declared floor
         run: |
           cat > "${RUNNER_TEMP}/floors.txt" <<'EOF'
@@ -223,18 +183,11 @@ jobs:
           pymongo-search-utils==0.3.0
           EOF
           cat "${RUNNER_TEMP}/floors.txt"
-          # pip reads PIP_CONSTRAINT on every invocation, including the ones hatch makes when it builds its
-          # environment, which is what makes `hatch run test` below run against the pinned set rather than
-          # against whatever the `>=` specifiers resolve to. `UV_CONSTRAINT` is the same file for the same
-          # reason, so this keeps working if hatch's installer is ever switched. Under `$RUNNER_TEMP` rather
-          # than in the checkout, so the job leaves the working tree alone.
+          # pip and uv read these on every install, including the ones hatch makes, so `hatch run test` runs
+          # against the pinned set. Under `$RUNNER_TEMP` so the working tree stays clean.
           #
-          # Exported into `$GITHUB_ENV` from a step, rather than declared in a job-level `env:` block, which
-          # is where this started and where it cannot work: `runner` is not one of the contexts available to
-          # `jobs.<job_id>.env`, and a workflow that names it there does not fail the job -- it fails the
-          # whole run at startup, before any job exists to report it. Observed on the first push: a run that
-          # completed in 0s with no jobs, no annotations and no log. `AT-175` is the gate that catches it
-          # without a push.
+          # Exported from a step, not a job-level `env:`: the `runner` context is not available there, and
+          # naming it fails the whole run at startup with no job and no log.
           {
             echo "PIP_CONSTRAINT=${RUNNER_TEMP}/floors.txt"
             echo "UV_CONSTRAINT=${RUNNER_TEMP}/floors.txt"
@@ -246,8 +199,7 @@ jobs:
       - name: Show what resolved
         run: hatch run pip list
 
-      # The unit tier, as the matrix runs it. A job that installed the floors and stopped would assert that
-      # pip can solve them, which is not the claim being made to anybody who installs this package.
+      # Running the tests, not just installing, is what shows the package works on its floors.
       - name: Run tests against the floors
         run: hatch run test
 
@@ -255,18 +207,11 @@ jobs:
     name: Contract tier (${{ matrix.deployment.label }})
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # A container start plus the contract tier: about a minute and a half.
+    timeout-minutes: 15
 
-    # Twice, over two deployments, because half of what this tier asserts is invisible on one of them.
-    # `mongo:8` has no search process, so every claim about which search tier a store resolves is true
-    # there for the trivial reason that it resolves none -- and the tier resolution rules are exactly what
-    # nothing on a change trigger was grading. The Atlas local image carries mongot, so the same tests read
-    # the other side of every branch they contain. Measured 2026-09-17: 99 pass on `mongo:8` in 12s, 94
-    # pass and 5 skip on the search image in 27s, and the skips are guards that already existed for a
-    # contract deployment with search -- the suite was written for both and only ever given one.
-    #
-    # `fail-fast: false` because the two legs answer different questions and the answer to one is not a
-    # reason to stop asking the other. `AT-187`.
+    # Two deployments, because `mongo:8` has no search process and the Atlas local image does, so the tests
+    # that branch on search capability cover both sides only across the two. `fail-fast: false` because the
+    # legs check different things.
     strategy:
       fail-fast: false
       matrix:
@@ -279,24 +224,16 @@ jobs:
             expect_search: ''
           - label: with a search process
             image: mongodb/mongodb-atlas-local:8
-            # The image's own health check rather than a ping, because a ping answers as soon as `mongod`
-            # is up and mongot is the part this leg exists for. `runner healthcheck` is what the image
-            # declares in its own HEALTHCHECK, and GitHub's service options replace that declaration
-            # rather than adding to it, so naming it here is what keeps it.
+            # The image's own HEALTHCHECK command rather than a ping, which answers before mongot is up.
+            # GitHub's service options replace the image's declaration, so it is named here.
             health: /usr/local/bin/runner healthcheck
-            # `directConnection=true` is not decoration, and it is the connection string MongoDB's own
-            # Docker instructions give for this image. The image is a single-node replica set and it
-            # initiates itself with the container's hostname as the member's host -- `30b29039c38d:27017`
-            # in the run that found this. A driver that discovers the topology therefore learns one member
-            # it cannot resolve from the runner, and every operation ends in server selection rather than
-            # in an error anybody can read: measured as 30 seconds per test and a job cancelled at the
-            # 15-minute timeout. Direct means the driver talks to the address it was handed.
+            # `directConnection=true`, as MongoDB's Docker instructions give for this image. It is a
+            # single-node replica set whose member host is the container's hostname, which the runner
+            # cannot resolve; without it every operation times out in server selection.
             uri: mongodb://localhost:27017/?directConnection=true
             expect_search: '1'
 
-    # A real MongoDB, supplied by the runner rather than by a secret. The tier gate in conftest.py asks only
-    # that MONGODB_URI point at something that answers, and nothing in this package needs a replica set --
-    # though one of these two images is one, which is what the `uri` in each matrix entry is about.
+    # A real MongoDB from the runner rather than a secret. Nothing in this package needs a replica set.
     services:
       mongodb:
         image: ${{ matrix.deployment.image }}
@@ -308,14 +245,11 @@ jobs:
           --health-timeout 60s
           --health-retries 20
 
-    # Under env: rather than on the command line. REQ-E-108 is written about every connection string rather
-    # than only the secret ones: a rule with an exception is a rule somebody has to remember.
+    # Under env: rather than on the command line, the rule for every connection string, secret or not.
     env:
       MONGODB_URI: ${{ matrix.deployment.uri }}
-      # Empty on the leg without a search process, and `1` on the leg with one. The tests that branch on
-      # what the deployment can do read it and fail rather than take the quiet branch, because a leg that
-      # exists to grade the search side of every branch and silently grades the other side is a green job
-      # asserting nothing -- which is the failure this whole tier arrangement is about. `REQ-E-182`.
+      # `1` on the leg with a search process. Tests that branch on search capability fail, rather than
+      # take the other branch, when the deployment does not match.
       STRANDS_MONGODB_EXPECT_SEARCH: ${{ matrix.deployment.expect_search }}
 
     steps:
@@ -334,18 +268,22 @@ jobs:
       - name: Install hatch
         run: pip install hatch
 
-      # -m contract rather than the whole suite: the matrix job above already runs the unit tier on four
-      # interpreters, and this job exists for the assertions that need a server. It also selects the
-      # storage quickstart, which carries `contract` beside `example`, so one of the two shipped examples
-      # is executed here rather than merely linted.
+      # -m contract rather than the whole suite: the matrix runs the unit tier. This also runs the storage
+      # example, which carries the `contract` marker.
       - name: Run the contract tier
         run: hatch run test -m contract
 
-      # The contract tier is the only tier that runs shipped code against a real server, so it is the
-      # tier with something to leave behind: a `.env` a fixture wrote, an index definition dumped for
-      # debugging, a cache directory `.gitignore` does not name. Anything the run created that git can
-      # still see is either an artifact that belongs in `.gitignore` or an example writing into the
-      # working tree of whoever runs it, and both are defects worth a red job. `REQ-E-167`.
+      # The integration tier needs mongot, which only the Atlas local image carries, so it runs on every
+      # change on that leg instead of against a cloud cluster. `autoembed` stays with the Atlas job below:
+      # automated embedding needs an Atlas cluster.
+      - name: Run the integration tier
+        if: matrix.deployment.expect_search == '1'
+        env:
+          MONGODB_ATLAS_URI: ${{ matrix.deployment.uri }}
+        run: hatch run test -m integration
+
+      # Anything the run left that git can see is either missing from `.gitignore` or an example writing
+      # into the user's working tree.
       - name: Assert the tier left the working tree clean
         run: |
           dirty="$(git status --porcelain)"
@@ -359,11 +297,10 @@ jobs:
     name: Coverage floors
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # Two suites under coverage, which is the slowest of the change-trigger jobs.
+    timeout-minutes: 15
 
-    # The build tier, which builds a wheel and an sdist and resolves dependencies from PyPI. It is the one
-    # tier gate that is not a connection string, so a runner with network is all it needs. Set here rather
-    # than in the matrix job because the artifact is the same artifact on every interpreter.
+    # The build tier: builds a wheel and an sdist and installs from PyPI, so it needs only network. Here
+    # rather than in the matrix because the artifact is the same on every interpreter.
     env:
       STRANDS_MONGODB_BUILD_TIER: '1'
 
@@ -383,11 +320,8 @@ jobs:
       - name: Install hatch
         run: pip install hatch
 
-      # Two commands: the 90% aggregate floor and the 70% per-module floor. Deliberately not part of
-      # `test`, so this job is the only thing that enforces either. Measured at 98.10% aggregate and
-      # 89.47% for the weakest module on the unit tier alone, which is why no credential is needed. The
-      # aggregate is printed by this step on every run, and the run is the authority: a number written
-      # into a comment is one nothing checks, and this one had already been stale for two changes.
+      # The 90% aggregate and 70% per-module floors, met by the unit tier alone, so no credential is
+      # needed. Not part of `test`, so this job is what enforces them.
       - name: Enforce both coverage floors
         run: hatch run cov
 
@@ -395,11 +329,9 @@ jobs:
     name: Latest SDK compatibility
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # A resolve against the unpinned SDK, then the unit tier.
+    timeout-minutes: 15
 
-    # The same container the contract job uses, for the same reason it costs nothing. The canary is
-    # specified to run the contract tier beside both protocol checks; that clause was unmet while the
-    # tier needed a credential, and a service container is not a credential.
+    # The same container the contract job uses, so the canary runs the contract tier with no secret.
     services:
       mongodb:
         image: mongo:8
@@ -435,23 +367,19 @@ jobs:
           hatch run pip install --upgrade strands-agents
           hatch run pip show strands-agents
 
-      # The load-bearing half. AT-052 asserts the store satisfies a nine-member Protocol subset by
-      # assignment under mypy, so a member added upstream surfaces here and nowhere else.
+      # The store is assigned to the SDK's Protocol types under mypy, so a member added upstream fails here.
       - name: Type check
         run: hatch run typecheck
 
       - name: Run the compat tier
         run: hatch run test -m compat
 
-      # Separate step rather than `-m "compat or contract"`, so a failure names which of the two broke and
-      # the compat selector stays readable as the thing AT-107 asserts. Against the upgraded SDK and a real
-      # server, which is the combination nothing else in this file produces.
+      # A separate step rather than `-m "compat or contract"`, so a failure names which one broke. No other
+      # job runs the upgraded SDK against a real server.
       - name: Run the contract tier against the upgraded SDK
         run: hatch run test -m contract
 
-      # Same gate as the `contract` job above, against the resolved-latest SDK rather than the pinned
-      # one, because an upstream release is exactly the thing that starts writing somewhere new.
-      # `REQ-E-167`.
+      # As in the `contract` job, since a new SDK release could start writing somewhere new.
       - name: Assert the tier left the working tree clean
         run: |
           dirty="$(git status --porcelain)"
@@ -463,25 +391,24 @@ jobs:
 
   atlas:
     name: Atlas tiers
-    # `push` is here because the schedule alone leaves up to seven days between a merge and the first
-    # run of the only tiers that touch a real cluster, and a `$rankFusion` pipeline or an index
-    # definition that a fake accepts and Atlas rejects is invisible until then. `pull_request` stays
-    # off the list: the secrets a fork cannot read would make every fork PR fail on this job.
-    # `REQ-E-165`, and affordable because `REQ-E-152` keys the concurrency group on the event name,
-    # so a merge cancels the previous merge's run rather than the pull request's.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    # The weekly cron and a manual dispatch only. Every run creates a billed cluster, and a fork's pull
+    # request receives no secret, so it would only ever skip. Before a release, dispatch this workflow on
+    # the commit to be tagged and wait for this job.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 60  # The long pole: two tiers against a real cluster, 36 minutes at its slowest.
+    # About ten minutes to create an M10, up to forty for the two tiers, and the teardown.
+    timeout-minutes: 75
+    # One cluster at a time, so the reaper in `up` can never delete a cluster another run is still using.
+    concurrency:
+      group: atlas-ci-cluster
+      cancel-in-progress: false
 
-    # The two tiers a container cannot stand in for: integration needs mongot, and autoembed needs a
-    # cluster with a registered embedding model. Off the change triggers, because a fork's pull request
-    # receives neither secret and conftest.py would report both tiers as skipped -- which a green check
-    # reads as passed. The cron and workflow_dispatch both need write access or no party at all, which is
-    # the property AT-140 asserts rather than the literal condition. pull_request_target is the trigger
-    # that would hand a fork's code these values, and it is deliberately not among the triggers above.
     env:
-      MONGODB_ATLAS_URI: ${{ secrets.MONGODB_ATLAS_URI }}
-      MONGODB_AUTOEMBED_URI: ${{ secrets.MONGODB_AUTOEMBED_URI }}
+      # Named from the run before anything is created, so the teardown step can delete it even when
+      # `up` fails half way.
+      ATLAS_CI_CLUSTER: strands-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      DO_NOT_TRACK: '1'
+      MONGODB_ATLAS_SKIP_UPDATE_CHECK: 'yes'
 
     steps:
       - name: Checkout code
@@ -499,7 +426,39 @@ jobs:
       - name: Install hatch
         run: pip install hatch
 
-      # Both tiers in one job, because they share a cluster and the second would queue behind the first
-      # anyway. Measured at 33 minutes of wall clock, which is the other reason this is weekly.
+      # A pinned release, verified against the checksum MongoDB publishes for it.
+      - name: Install the Atlas CLI
+        env:
+          ATLAS_CLI_VERSION: 1.49.0
+          ATLAS_CLI_SHA256: 045948133107b87f4b3af670ab3931f8a7ac82e5fbe21204943adb336d5e11d4
+        run: |
+          archive="mongodb-atlas-cli_${ATLAS_CLI_VERSION}_linux_x86_64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/mongodb/mongodb-atlas-cli/releases/download/atlascli%2Fv${ATLAS_CLI_VERSION}/${archive}"
+          echo "${ATLAS_CLI_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/mongodb-atlas-cli_${ATLAS_CLI_VERSION}_linux_x86_64/bin" >> "$GITHUB_PATH"
+
+      # The service account needs the Project Owner role on the project, which is what creating a
+      # cluster takes. CONTRIBUTING.md describes the setup.
+      - name: Create the cluster
+        id: cluster
+        env:
+          MONGODB_ATLAS_CLIENT_ID: ${{ secrets.ATLAS_CLIENT_ID }}
+          MONGODB_ATLAS_CLIENT_SECRET: ${{ secrets.ATLAS_CLIENT_SECRET }}
+          MONGODB_ATLAS_PROJECT_ID: ${{ secrets.ATLAS_PROJECT_ID }}
+        run: hatch run python scripts/atlas_ci_cluster.py up
+
       - name: Run the tiers that need a cluster
+        env:
+          MONGODB_ATLAS_URI: ${{ steps.cluster.outputs.uri }}
+          MONGODB_AUTOEMBED_URI: ${{ steps.cluster.outputs.uri }}
         run: hatch run test -m "integration or autoembed"
+
+      - name: Delete the cluster
+        if: always()
+        env:
+          MONGODB_ATLAS_CLIENT_ID: ${{ secrets.ATLAS_CLIENT_ID }}
+          MONGODB_ATLAS_CLIENT_SECRET: ${{ secrets.ATLAS_CLIENT_SECRET }}
+          MONGODB_ATLAS_PROJECT_ID: ${{ secrets.ATLAS_PROJECT_ID }}
+        run: hatch run python scripts/atlas_ci_cluster.py down

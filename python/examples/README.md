@@ -96,8 +96,8 @@ memory/     a knowledge file, from FileMemoryStore(storage=...)
 
 `run` produces all three in one turn, then prints a census of the collection: every top-level prefix
 with a document count and a byte total. The census is read back from MongoDB with a plain
-`AsyncMongoClient`, not assembled from a list in the script, which is the honest way to make the point
-that these are ordinary documents. `mongosh` would give the same answer.
+`AsyncMongoClient`, not assembled from a list in the script, because these are ordinary documents.
+`mongosh` would give the same answer.
 
 `resume` starts a new interpreter, restores the session from `session/` alone, and prints how many
 messages came back.

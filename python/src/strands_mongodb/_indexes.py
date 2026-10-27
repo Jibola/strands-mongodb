@@ -492,8 +492,9 @@ def storage_specs() -> tuple[IndexSpec, ...]:
 def memory_specs() -> tuple[IndexSpec, ...]:
     """Return the ordinary indexes the ``memory`` collection needs.
 
-    The TTL index exists whether or not ``ttl_seconds`` is set, so a store that gains one later expires
-    its documents without a migration. It is inert for documents without ``expires_at``.
+    The TTL index exists whether or not ``ttl_seconds`` is set, so a store that sets one later needs no index
+    change: its memories expire from the first write after that. Memories written before carry no
+    ``expires_at`` and never expire, because the index is inert for documents without the field.
 
     Returns:
         Three specs: the unique partial dedup index, the recency index, and the TTL index.

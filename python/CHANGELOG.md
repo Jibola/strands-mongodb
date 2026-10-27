@@ -5,14 +5,9 @@ format does not cover: **no version below carries a date, because none of them h
 
 The repository's landing page publishes a version table saying what `0.0.1` and `0.1.0` contain, and
 both `README.md` files carry a marker above their install blocks saying the package is not on PyPI
-yet. A changelog is the third document making claims about the same thing, and three documents that
-nobody compares is how a release note comes to describe a version that does not exist.
-
-So the comparison is a test. `AT-164` asserts that the versions here are exactly the versions the
-landing page publishes, in both directions, and that nothing here is dated while either README still
-says the package is unpublished. The day the name is claimed on PyPI, removing those markers without
-dating a release fails the suite — which is the point, because that is the day the two documents are
-most likely to drift.
+yet. A test keeps the three in step: the versions here must be exactly the versions the landing page
+publishes, and nothing here may carry a date while either README still says the package is
+unpublished. Removing those markers without dating a release fails the suite.
 
 Versions are `MAJOR.MINOR.PATCH` per [Semantic Versioning](https://semver.org/spec/v2.0.0.html), and
 a release is cut by pushing a `python-v` tag. [RELEASING.md](RELEASING.md) is the procedure.
@@ -41,8 +36,9 @@ The first version with working code in it. Planned, not released.
   TTL index itself, while `MongoDBStorage` leaves it to an explicit `await storage.ensure_indexes()`
   at startup, because an `Agent` builds its storage where an operator never sees it and DDL should
   not be issued from there. A negative `ttl_seconds` is rejected at construction.
-- `appName` attribution on every client the package builds from a connection string: `strands-mongodb`,
-  or the caller's own value with `-strands-mongodb` appended. An injected client is left as it is.
+- Driver attribution in the connection handshake: every client carries `Strands-MongoDB` and the package
+  version in its driver metadata, as MongoDB's handshake specification asks of a wrapping library.
+  `appName` is left to the application.
 - OpenTelemetry spans for every public operation of both stores, and for the index work they cause,
   on your application's tracer provider. The package configures no provider. Keys, content, queries,
   scopes and credentials are never recorded. Every log record also carries a stable
@@ -67,5 +63,4 @@ not released.
 - The `strands_mongodb` import path and the public names it exports.
 
 <!-- No link reference definitions below. Keep a Changelog puts compare links here; this repository
-     has no tags to compare, and a link to a tag that does not exist is a claim that it does. They go
-     in with the first release, alongside that release's date. -->
+     has no tags to compare yet. They go in with the first release, alongside that release's date. -->

@@ -1,14 +1,10 @@
 name: Release - Python
 
-# The half of packaging that publishes. Trusted publishing over OIDC: no API token exists in
-# this repository, so there is no long-lived credential to leak or rotate. PyPI verifies the identity of
-# this workflow file, in this repository, running in the `pypi` environment, and mints a token good for
-# one upload. Change the filename or the environment name and the upload stops working until the
-# publisher on PyPI is updated to match — that coupling is the security property, not an inconvenience.
+# Trusted publishing over OIDC: no API token exists in this repository. PyPI verifies this workflow file,
+# in this repository, running in the `pypi` environment, and mints a token good for one upload. Renaming
+# the file or the environment breaks the upload until the publisher on PyPI is updated to match.
 #
-# Asserted by tests/test_release_ci.py (AT-134 to AT-137), on the same principle as ci-python.yml: this
-# file is the one part of the repository nothing else in the suite can execute, so the suite reads it as
-# YAML and checks that it says what it has to say.
+# tests/test_release_ci.py reads this file as YAML and checks its structure.
 
 on:
   push:
@@ -29,16 +25,12 @@ jobs:
   gate:
     name: Release gate
     runs-on: ubuntu-latest
-    # The same scheme `ci-python.yml` uses, and for the same reason: nothing here should be allowed to
-    # sit for six hours. `publish` is the one to read twice -- see the note on its own budget. `AT-165`.
+    # Every job has a budget well under GitHub's six-hour default; see the note on `publish`.
     timeout-minutes: 20  # The whole unit tier on one interpreter, plus the gate's own checks.
 
-    # The build tier, so the wheel and sdist are resolved from PyPI exactly as CI does it. Set here for
-    # the same reason `ci-python.yml` sets it on one job: the artifact is the same on every interpreter.
-    # No MONGODB_URI, deliberately: the contract tier has a job of its own below. Setting both here
-    # would leave `hatch run cov` running the contract tier too, and then the selector running it a
-    # second time -- twice the wall clock, and a coverage number measured against a different set of
-    # tests than the one `ci-python.yml` measures.
+    # The build tier runs here, on one interpreter, because the artifact is the same on all of them.
+    # No MONGODB_URI, deliberately: `hatch run cov` would then also run the contract tier, which has its
+    # own job below, and the coverage number would differ from the one `ci-python.yml` measures.
     env:
       STRANDS_MONGODB_BUILD_TIER: '1'
 
@@ -46,9 +38,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
         with:
-          # hatch-vcs reads the tag from git metadata. A shallow clone has no tags, and the version
-          # silently falls back to 0.0.0 — which is exactly the mistake `fallback_version` was made
-          # unmistakable to catch.
+          # hatch-vcs reads the tag from git metadata. A shallow clone has no tags, so the version would
+          # fall back to 0.0.0.
           fetch-depth: 0
           persist-credentials: false
 
@@ -61,10 +52,7 @@ jobs:
       - name: Install hatch
         run: pip install hatch
 
-      # The manifest against the schemas packaging tools validate it with, which `hatch build` does not do:
-      # a build succeeds on metadata PyPI's own validators refuse, and the refusal arrives at the upload.
-      # Subsecond, and it runs before the checks that take minutes so a manifest defect is reported first.
-      # `AT-183`.
+      # `hatch build` accepts metadata that PyPI refuses at upload. This check is fast, so it runs first.
       - name: Validate the manifest
         run: |
           pip install --quiet validate-pyproject
@@ -88,10 +76,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15  # A container start plus the contract tier, as in CI.
 
-    # A real MongoDB, supplied by the runner rather than by a secret -- the same container
-    # `ci-python.yml` gives its contract job, for the same reason it costs nothing. A release workflow
-    # holding a cluster credential would reintroduce by the back door the long-lived secret that
-    # trusted publishing exists to remove.
+    # A service container rather than a cluster secret: a release workflow holding a cluster credential
+    # would bring back the long-lived secret that trusted publishing removes.
     services:
       mongodb:
         image: mongo:8
@@ -103,8 +89,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
-    # Under env: rather than on the command line, because REQ-E-108 is written about every connection
-    # string rather than only the secret ones.
+    # Under env: rather than on the command line, the rule for every connection string, secret or not.
     env:
       MONGODB_URI: mongodb://localhost:27017
 
@@ -124,18 +109,13 @@ jobs:
       - name: Install hatch
         run: pip install hatch
 
-      # The tier that needs a real server. It was absent from this workflow while it was absent from
-      # CI, on the reasoning that a tag is not the moment to discover a credential is missing -- which
-      # was right about a credential and wrong about the tier, because the tier never needed one.
-      # `-m contract` rather than a bare `hatch run test`: without the selector an unanswered server
-      # reports the tier as skipped, and a skip is indistinguishable from a pass at exactly the moment
-      # that matters.
+      # `-m contract` rather than a bare `hatch run test`: without the selector an unreachable server
+      # reports the tier as skipped, and a skip looks like a pass.
       - name: Run the contract tier
         run: hatch run test -m contract
 
-      # Here the gate guards the build rather than the tier: `build` checks out afresh, but a tier that
-      # writes into the tree is a tier that could write into what gets packaged, and a tag is the worst
-      # moment to find out. `REQ-E-167`.
+      # `build` checks out afresh, but a tier that writes into the tree could write into what gets
+      # packaged.
       - name: Assert the tier left the working tree clean
         run: |
           dirty="$(git status --porcelain)"
@@ -170,10 +150,8 @@ jobs:
       - name: Build the wheel and the sdist
         run: hatch build
 
-      # The built version has to be the tag, not near it. Compared as PEP 440 objects
-      # rather than as strings, so `python-v0.1.0-rc1` and `python-v0.1.0rc1` are the same answer and a
-      # genuinely different version still fails. A mismatch here means hatch-vcs saw a dirty tree or no
-      # tag at all, and publishing it would put a `.dev` or `0.0.0` artifact on PyPI permanently.
+      # Compared as PEP 440 versions, not strings, so `python-v0.1.0-rc1` and `python-v0.1.0rc1` match.
+      # A mismatch means hatch-vcs saw a dirty tree or no tag, and would publish a `.dev` or `0.0.0`.
       - name: The built version must equal the tag
         run: |
           python -m pip install --quiet packaging
@@ -192,11 +170,8 @@ jobs:
           print(f"{wheels[0].name} matches tag {tag}")
           PY
 
-      # The description PyPI will render, rendered here instead. `--strict`, not the bare form: `twine
-      # check` prints a warning about an unrenderable description and exits 0, which is the same shape as
-      # `ruff format` against `ruff format --check` and just as useless as a gate. The metadata is part of
-      # the version and a version is spent permanently, so this is the last moment it can be fixed for
-      # free. `AT-183`.
+      # `--strict`: without it `twine check` only warns about an unrenderable description and exits 0.
+      # The metadata cannot be changed after upload.
       - name: The artifacts must render on PyPI
         run: |
           pip install --quiet twine
@@ -213,28 +188,23 @@ jobs:
     name: Publish to PyPI
     needs: build
     runs-on: ubuntu-latest
-    # This does not cut the approval short. A job waiting on an environment's required reviewers has not
-    # started, and the budget only begins counting when it does; GitHub cancels an unapproved run after
-    # thirty days on its own clock. What this bounds is the upload, once somebody has said yes.
+    # This does not cut the approval short: the budget starts when the job starts, after a reviewer
+    # approves. GitHub cancels an unapproved run after thirty days on its own clock.
     timeout-minutes: 10
 
     # The environment PyPI's publisher is bound to, and where the required reviewers live. A tag alone
-    # does not publish: a human approves the deployment first, which is the last stop before an upload
-    # that can never be replaced, only yanked.
+    # does not publish: a person approves the deployment first.
     environment:
       name: pypi
       url: https://pypi.org/p/strands-mongodb
 
     permissions:
-      # The OIDC token PyPI exchanges for a one-upload credential. The only permission raised anywhere
-      # in this file, and the reason no secret appears in it.
+      # The OIDC token PyPI exchanges for a one-upload credential. The only permission raised in this file.
       id-token: write
 
     steps:
-      # Both actions in this job are pinned to a digest rather than to a tag, which is a stricter rule
-      # than the one the rest of these workflows follow and is deliberately scoped to this job alone.
-      # MongoDB's own zizmor policy is `actions/*: ref-pin`, so `actions/checkout@v7` elsewhere is correct
-      # by that standard; what makes this job different is `id-token: write` below. `REQ-E-164`.
+      # Both actions in this job are pinned to a digest because this job holds `id-token: write`. Elsewhere
+      # `actions/*` are pinned to a tag, which MongoDB's zizmor policy (`actions/*: ref-pin`) allows.
       - name: Download the artifact the build job verified
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
@@ -243,10 +213,8 @@ jobs:
 
       # No `password:`. Trusted publishing supplies the credential; supplying a token here would defeat
       # the point of the environment binding above.
-      # `release/v1` is a branch: whoever can move it can change what runs in the only job in this
-      # repository holding the token PyPI exchanges for an upload credential, and the blast radius is
-      # every install of this package. This digest is that branch as of 2026-07-28, and is the pin
-      # `mongo-python-driver` carries for this same action.
+      # `release/v1` is a branch, and whoever can move it could change what runs with the upload
+      # credential. The digest is the same pin `mongo-python-driver` uses for this action.
       - name: Publish
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # release/v1
         with:

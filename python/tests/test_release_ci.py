@@ -1,12 +1,11 @@
 """The release workflow, asserted by reading it, because nothing in this suite can run it.
 
-Covers ``AT-134`` through ``AT-137`` (``REQ-E-134`` to ``REQ-E-137``). Same principle as
-``test_ci.py``: a workflow is a YAML document on disk, so these are unit-tier tests with no tier and
+Same principle as ``test_ci.py``: a workflow is a YAML document on disk, so these are unit-tier tests with no tier and
 no network, and they read the file the way ``test_packaging.py`` reads ``pyproject.toml``.
 
 **Why this file is worth more than the CI one.** ``ci-python.yml`` is wrong for as long as it takes
 somebody to open a pull request. This file is wrong until a tag is pushed, and the failure it
-produces is either a release that does not happen or -- far worse -- a wheel on PyPI that cannot be
+produces is either a release that does not happen or, at greater cost, a wheel on PyPI that cannot be
 replaced, only yanked. There is no rehearsal: the first execution of this workflow is a real upload
 of a real version number that is then permanently spent.
 
@@ -14,8 +13,7 @@ of a real version number that is then permanently spent.
 ``pypi`` environment exists, whether it has required reviewers, and whether PyPI has a trusted
 publisher bound to this repository and this filename are all settings outside the repository, and no
 test here can see any of them. A green run of this file means the workflow is correct and says
-nothing about whether an upload would succeed. That limit is stated rather than implied, because a
-green test file about publishing reads like evidence publishing works.
+nothing about whether an upload would succeed.
 """
 
 from __future__ import annotations
@@ -58,7 +56,7 @@ def workflow() -> dict[str, Any]:
     Fails rather than skips when the file is absent, for the reason ``test_ci.py``'s fixture gives:
     absence is the defect these tests exist to catch, and a skip reports the same green as a pass.
     """
-    assert WORKFLOW_PATH.is_file(), f"REQ-E-134: no release workflow at {WORKFLOW_PATH}"
+    assert WORKFLOW_PATH.is_file(), f"no release workflow at {WORKFLOW_PATH}"
     parsed = yaml.safe_load(WORKFLOW_PATH.read_text())
     assert isinstance(parsed, dict), "the workflow did not parse as a mapping"
     return parsed
@@ -69,10 +67,10 @@ def raw() -> str:
     """The unparsed text, for the two questions YAML cannot answer.
 
     ``yaml.safe_load`` discards comments, and one assertion below is about a string that must not
-    appear anywhere at all -- including in a comment, where a commented-out ``password:`` is a
+    appear anywhere at all, including in a comment, where a commented-out ``password:`` is a
     suggestion to the next person rather than a safeguard.
     """
-    assert WORKFLOW_PATH.is_file(), f"REQ-E-134: no release workflow at {WORKFLOW_PATH}"
+    assert WORKFLOW_PATH.is_file(), f"no release workflow at {WORKFLOW_PATH}"
     return WORKFLOW_PATH.read_text()
 
 
@@ -129,7 +127,7 @@ def _jobs_running(jobs: dict[str, dict[str, Any]], fragment: str) -> set[str]:
 
 
 class TestOnlyThePythonTagTriggersARelease:
-    """AT-134 / REQ-E-134 -- what starts an upload, and everything that must not.
+    """AT-134 -- what starts an upload, and everything that must not.
 
     The repository is laid out to hold a second language beside ``python/``, and the version scheme
     is per-prefix. A trigger broad enough to catch the other language's tag publishes this package
@@ -166,7 +164,7 @@ class TestOnlyThePythonTagTriggersARelease:
 
         ``fnmatch`` is the semantics GitHub applies to a tag filter, so this asks the question the
         way the platform answers it. The previous test could pass on a pattern like
-        ``python-v*`` alongside a stray ``*`` -- this one could not.
+        ``python-v*`` alongside a stray ``*``; this one could not.
         """
         patterns = _triggers(workflow)["push"]["tags"]
         foreign = ["typescript-v1.0.0", "v1.0.0", "1.0.0", "release-1.0.0"]
@@ -186,7 +184,7 @@ class TestOnlyThePythonTagTriggersARelease:
 
 
 class TestNothingHereIsALongLivedCredential:
-    """AT-135 / REQ-E-135 -- the security property trusted publishing is actually about.
+    """AT-135 -- publishing uses trusted publishing over OIDC, and no long-lived credential exists.
 
     Trusted publishing is not "a nicer way to store the token". It is the absence of a token: PyPI
     verifies an OIDC assertion naming this repository, this workflow filename and this environment,
@@ -260,7 +258,7 @@ class TestNothingHereIsALongLivedCredential:
 
 
 class TestThePublishedArtifactIsTheVerifiedArtifact:
-    """AT-136 / REQ-E-136 -- the version check, enforced at the only moment it still matters.
+    """AT-136 -- the uploaded wheel's version equals the tag, checked at the only moment it still matters.
 
     A version on PyPI is spent permanently: yanking hides it, nothing replaces it. So the check that
     the wheel's version equals the tag has to sit between the build and the upload, and the upload
@@ -342,18 +340,15 @@ class TestThePublishedArtifactIsTheVerifiedArtifact:
 
 
 class TestTheReleaseGateIsNoWeakerThanCI:
-    """AT-137 / REQ-E-137 -- a tag must clear at least what a pull request clears.
+    """AT-137 -- a tag must clear at least what a pull request clears.
 
     The gate exists because the two runs answer different questions. CI answers "is this branch
     healthy" and can be re-run on a fix. The release gate answers "is this the artifact we are about
     to spend a version number on", and a failure discovered afterwards has no re-run.
 
-    So every gate that guards a pull request guards a tag, and the contract tier is among them. That
-    last clause is new. It could not be written while the contract tier needed a credential, and a
-    tag is the worst possible moment to discover a credential is missing -- which is what the comment
-    in this file used to say, correctly, about a situation that no longer exists. A service container
-    is not a credential, the tier's own definition admits a plain ``mongod``, and the whole tier costs
-    about eighteen seconds.
+    So every gate that guards a pull request guards a tag, and the contract tier is among them. The
+    contract tier needs no credential: its server is a service container, and the tier's own definition
+    admits a plain ``mongod``.
     """
 
     def test_the_gate_runs_every_static_check(self, workflow: dict[str, Any]) -> None:
@@ -377,7 +372,7 @@ class TestTheReleaseGateIsNoWeakerThanCI:
         assert "hatch run cov" in runs, "no step enforces the coverage floors"
 
     def test_the_gate_runs_the_contract_tier(self, workflow: dict[str, Any]) -> None:
-        """The tier that needs a real server, which a tag now clears before spending a version.
+        """The tier that needs a real server, which a tag clears before spending a version.
 
         Selected rather than implied: ``hatch run test`` without ``-m contract`` reports the tier as
         skipped when no deployment answers, and a skip reads as green. The selector is what makes an
@@ -417,16 +412,14 @@ UPLOAD_ACTION = "actions/upload-artifact"
 
 
 class TestTheArtifactIsCheckedAndNotOnlyTheCodeInIt:
-    """``AT-183`` / ``REQ-E-178`` -- two checks that a release answered for the first time on the release.
+    """``AT-183`` -- the manifest and the rendered description are checked before the upload.
 
-    ``AT-136`` and ``AT-137`` are about the code the artifact contains: the gate is no weaker than CI, and
-    the version equals the tag. Neither looks at the distribution. Whether the manifest satisfies the
-    schemas packaging tools validate against, and whether the description PyPI renders actually renders,
-    were both first answered by the upload -- after a person had approved a deployment, and against a
-    version number that is spent whatever happens next.
-
-    Both pass in this tree today, which is why they are worth adding now rather than later: the run that
-    fails is the change that breaks them, and there is no backlog of existing failures to work through.
+    ``TestThePublishedArtifactIsTheVerifiedArtifact`` and ``TestTheReleaseGateIsNoWeakerThanCI`` are about
+    the code the artifact contains: the gate is no weaker than CI, and the version equals the tag. Neither
+    looks at the distribution. Without these checks, whether the manifest satisfies the schemas packaging
+    tools validate against, and whether the description PyPI renders actually renders, would first be
+    answered by the upload: after a person has approved a deployment, and against a version number that is
+    spent whatever happens next.
     """
 
     def test_the_manifest_is_validated_against_the_packaging_schemas(self, workflow: dict[str, Any]) -> None:
@@ -447,8 +440,8 @@ class TestTheArtifactIsCheckedAndNotOnlyTheCodeInIt:
         """``twine check`` warns and exits 0; ``twine check --strict`` fails.
 
         The same distinction this file already asserts for ``ruff format`` against ``ruff format --check``,
-        and it is worth asserting twice because the two tools make the same mistake available: a gate whose
-        failing case exits 0 is not a gate, it is a log line nobody reads.
+        asserted again because the two tools make the same mistake available: a check whose failing case
+        exits 0 cannot stop a release.
         """
         invocations = [
             block
@@ -498,14 +491,14 @@ class TestTheArtifactIsCheckedAndNotOnlyTheCodeInIt:
 
 
 class TestTheArtifactTheUploadWroteIsTheOneThePublisherReads:
-    """``AT-184`` / ``REQ-E-179`` -- three strings that have to match, none of which anything checked.
+    """``AT-184`` -- three strings that have to match, and nothing else in the workflow checks them.
 
     The upload's ``name`` and the download's ``name``; the download's ``path`` and the publish action's
     ``packages-dir``. A typo in any of them produces a publish job that downloads nothing and hands an
-    empty directory to the uploader, at the single moment in this repository's life when somebody has
-    already clicked approve.
+    empty directory to the uploader, after somebody has already approved the deployment.
 
-    ``AT-136`` walks ``needs:`` from the publishing job and would not see it. That graph is about which
+    ``test_every_job_reaches_the_upload_through_the_gate`` walks ``needs:`` from the publishing job and would
+    not see it. That graph is about which
     jobs run in what order and it is correct; this is about whether the payload arrives.
     """
 
@@ -560,8 +553,8 @@ class TestTheArtifactTheUploadWroteIsTheOneThePublisherReads:
     def test_an_upload_that_finds_nothing_fails_rather_than_succeeding_empty(self, workflow: dict[str, Any]) -> None:
         """``if-no-files-found`` defaults to ``warn``, which is a green job and an empty artifact.
 
-        The build step could fail to produce a wheel for a reason the version check never reaches -- a
-        renamed output directory, a hatch configuration change -- and the default turns that into a
+        The build step could fail to produce a wheel for a reason the version check never reaches, such as
+        a renamed output directory or a hatch configuration change, and the default turns that into a
         release that uploads nothing to PyPI rather than into a red job.
         """
         upload, _ = self._pair(workflow)
@@ -581,22 +574,21 @@ RELEASING_PATH = PROJECT_ROOT / "RELEASING.md"
 CHANGELOG_PATH = PROJECT_ROOT / "CHANGELOG.md"
 
 #: The marker both READMEs carry above their install blocks while nothing is on PyPI. It is the
-#: repository's own statement about its publication state, and ``AT-164`` makes the changelog answer to it.
+#: repository's own statement about its publication state, and
+#: ``TestTheChangelogAndTheRepositoryAgreeAboutWhatExists`` makes the changelog answer to it.
 UNPUBLISHED_MARKER = "<!-- skip: these reach PyPI for a package that is not published yet -->"
 
 #: ``## [Unreleased]`` or ``## [0.1.0] - 2026-09-16``. The bracketed form is Keep a Changelog's, and the
 #: date group is what distinguishes a section that describes a release from one that describes a plan.
 _CHANGELOG_HEADING = re.compile(r"^##\s+\[(?P<version>[^\]]+)\](?:\s*-\s*(?P<date>\S+))?\s*$", re.MULTILINE)
 
-#: The version table in the repository-root README -- ``| `0.1.0` | ... |``. Read rather than duplicated,
-#: for the reason ``AT-161`` gives about that file: it is the landing page, and it is what a reader believes.
+#: The version table in the repository-root README, ``| `0.1.0` | ... |``. Read rather than duplicated,
+#: because that file is the landing page, and it is what a reader believes.
 _VERSION_ROW = re.compile(r"^>?\s*\|\s*`(?P<version>\d+\.\d+\.\d+)`\s*\|", re.MULTILINE)
 
 #: What a reader of a red run needs to be told, once, in the first line.
-_RELEASING_DEFECT = (
-    "REQ-E-157: the release workflow exists and is asserted, but nothing in this tree tells a person how to run it"
-)
-_CHANGELOG_DEFECT = "REQ-E-158: the repository publishes a version table and describes no version"
+_RELEASING_DEFECT = "the release workflow exists and is asserted, but nothing in this tree tells a person how to run it"
+_CHANGELOG_DEFECT = "the repository publishes a version table and describes no version"
 
 
 def _document(path: Path, requirement: str) -> str:
@@ -604,25 +596,23 @@ def _document(path: Path, requirement: str) -> str:
 
     A fixture would do this too, and the ``workflow`` fixture above is one. The difference matters while
     the file is absent: a fixture that fails reports every test in the class as an *error*, and an error
-    reads as "the suite is broken" where a failure reads as "the thing under test is missing". These
-    documents are missing exactly once -- before they are written -- and that is the run whose first line
-    should say which file and which requirement.
+    reads as "the suite is broken" where a failure reads as "the thing under test is missing". When a
+    document is missing, the first line of the run should say which file and what that leaves undone.
     """
     assert path.is_file(), f"{requirement}: no document at {path}"
     return path.read_text()
 
 
 class TestSomebodyCanActuallyPerformARelease:
-    """AT-163 / REQ-E-157 -- the release document, held to the workflow rather than to itself.
+    """AT-163 -- the release document, held to the workflow rather than to itself.
 
-    ``AT-134``…``AT-137`` assert that ``release-python.yml`` says what it must say. Nothing asserted that
-    a person could follow it. Four jobs run on a tag and only the last one does anything irreversible,
+    The classes above assert that ``release-python.yml`` says what it must say. This one asserts that a
+    person can follow it. Four jobs run on a tag and only the last one does anything irreversible,
     which means the cost of not knowing the order is paid exactly once, at the only moment it cannot be
     undone.
 
     Every assertion here reads its expectation out of the parsed workflow. A document that restates the
-    workflow passes the day it is written and drifts silently afterwards, which is the failure mode the
-    root ``README.md`` demonstrated for thirteen tasks with a passing test over it.
+    workflow passes the day it is written and drifts silently afterwards.
     """
 
     def test_it_names_every_job_the_workflow_runs(self, workflow: dict[str, Any]) -> None:
@@ -642,7 +632,9 @@ class TestSomebodyCanActuallyPerformARelease:
         """AT-163 -- the prefix is read from the trigger, not from this file's own constant."""
         releasing = _document(RELEASING_PATH, _RELEASING_DEFECT)
         patterns = [str(tag) for tag in (_triggers(workflow).get("push") or {}).get("tags") or []]
-        assert patterns, "the workflow declares no tag trigger, which AT-134 should have caught first"
+        assert patterns, (
+            "the workflow declares no tag trigger, which TestOnlyThePythonTagTriggersARelease should have caught first"
+        )
 
         for pattern in patterns:
             prefix = pattern.rstrip("*")
@@ -664,7 +656,9 @@ class TestSomebodyCanActuallyPerformARelease:
             for job in _jobs(workflow).values()
             if job.get("environment")
         ]
-        assert environments, "no job binds an environment, which AT-135 should have caught first"
+        assert environments, (
+            "no job binds an environment, which TestNothingHereIsALongLivedCredential should have caught first"
+        )
 
         for environment in environments:
             assert str(environment) in releasing, (
@@ -674,16 +668,15 @@ class TestSomebodyCanActuallyPerformARelease:
 
 
 class TestTheChangelogAndTheRepositoryAgreeAboutWhatExists:
-    """AT-164 / REQ-E-158 -- two documents that both claim to say what a version contains.
+    """AT-164 -- two documents that both claim to say what a version contains.
 
     The version table lives on the repository's landing page; the changelog is the file a packager
-    reads. Nothing derives either from the other, which is the same condition that let the ``dev``
-    extra and the hatch environment drift until ``AT-160`` compared them.
+    reads. Nothing derives either from the other, the same condition ``test_packaging.py`` guards
+    against for the ``dev`` extra and the hatch environment.
 
-    The second test is the one that earns its place. Both READMEs carry a marker saying the package is
-    not on PyPI. That marker becomes false the moment the name is claimed, and until now the only thing
-    tracking it was a line in a planning document outside this repository. Here it is a gate: the
-    changelog may not date a release while the repository says none has happened.
+    Both READMEs carry a marker saying the package is not on PyPI. That marker becomes false the moment
+    the name is claimed, and the second test makes it a gate: the changelog may not date a release while
+    the repository says none has happened.
     """
 
     def test_its_versions_are_the_versions_the_landing_page_publishes(self) -> None:
@@ -709,8 +702,7 @@ class TestTheChangelogAndTheRepositoryAgreeAboutWhatExists:
         """AT-164 -- the install-block marker and the changelog change on the same day or neither does.
 
         Both directions are asserted. While the marker is present no section may carry a date, and once
-        it is gone at least one must — so the test fails whichever half of the pair is forgotten, which
-        is the only arrangement that survives the claim being made by a person in a hurry.
+        it is gone at least one must, so the test fails whichever half of the pair is forgotten.
         """
         changelog = _document(CHANGELOG_PATH, _CHANGELOG_DEFECT)
         readmes = {
@@ -753,26 +745,25 @@ class TestTheChangelogAndTheRepositoryAgreeAboutWhatExists:
 
 
 class TestNoReleaseJobCanRunForSixHours:
-    """AT-165 / REQ-E-159 — the release half of the same requirement, with one job that is not like the others.
+    """AT-165 — the release workflow's half of the job time ceiling, with one job that is not like the others.
 
-    ``test_ci.py``'s class carries the argument and the measured numbers; the ceiling is imported from it
-    rather than written twice, because two copies of a number nothing compares is the drift ``AT-160``
-    exists to catch.
+    ``TestNoJobCanRunForSixHours`` in ``test_ci.py`` carries the argument; the ceiling is imported from it
+    rather than written twice, so the two workflows cannot drift onto different numbers.
 
     The job worth a sentence is ``publish``. It sits behind the ``pypi`` environment's required reviewers,
-    and a budget looks like it would cut the approval off — it does not. A job pending a deployment
+    and a budget looks like it would cut the approval off, but it does not. A job pending a deployment
     protection rule has not started, so ``timeout-minutes`` has not begun counting; GitHub cancels an
     unapproved run after thirty days on its own clock, and that is not a number this file can set. The
-    budget here bounds the upload once somebody has said yes, which takes seconds.
+    budget here bounds the upload once somebody has approved it.
     """
 
     def test_every_job_declares_one(self, workflow: dict[str, Any]) -> None:
-        """AT-165 — including the two that have never run, since nothing has ever been released."""
+        """AT-165 — every release job, including the ones that run only after an approval."""
         undeclared = sorted(name for name, job in _jobs(workflow).items() if job.get("timeout-minutes") is None)
         assert undeclared == [], (
             f"these release jobs declare no timeout-minutes and so inherit GitHub's "
-            f"{_DEFAULT_TIMEOUT_MINUTES}: {undeclared}. This workflow has never run — there is no release "
-            f"— so a hang here would be discovered by a maintainer watching a tag they just pushed"
+            f"{_DEFAULT_TIMEOUT_MINUTES}: {undeclared}. A hang here would hold a release open for hours "
+            f"after a tag is pushed"
         )
 
     def test_none_of_them_is_the_default_in_disguise(self, workflow: dict[str, Any]) -> None:
@@ -795,9 +786,10 @@ _DIGEST = re.compile(r"\A[0-9a-f]{40}\Z")
 
 
 class TestTheActionThatUploadsIsPinnedToContentRatherThanToAPlace:
-    """``AT-170`` / ``REQ-E-164`` -- the one mutable reference that matters.
+    """``AT-170`` -- the actions in the job holding the upload credential are pinned to a digest.
 
-    ``pypa/gh-action-pypi-publish@release/v1`` is a branch: not a tag, not a digest. It runs in the only
+    A reference such as ``pypa/gh-action-pypi-publish@release/v1`` is a branch: not a tag, not a digest.
+    The publish action runs in the only
     job in the repository that raises ``id-token: write``, the token PyPI exchanges for an upload
     credential for ``strands-mongodb``, so whoever controls that branch controls what runs there and the
     blast radius is every install of this package.
@@ -808,8 +800,8 @@ class TestTheActionThatUploadsIsPinnedToContentRatherThanToAPlace:
     digests would be a deviation from it. PyMongo hash-pins this one action and ref-pins the rest. The
     scope of this gate is therefore the job holding the credential, not the file.
 
-    **What a pin costs.** A digest does not update itself. ``REQ-E-166`` is what keeps it current, and the
-    two requirements are worth less apart than together.
+    **What a pin costs.** A digest does not update itself. Dependabot's ``github-actions`` updates keep it
+    current, and the pin is worth less without them.
     """
 
     def test_exactly_one_job_holds_the_publishing_credential(self, workflow: dict[str, Any]) -> None:
@@ -823,7 +815,7 @@ class TestTheActionThatUploadsIsPinnedToContentRatherThanToAPlace:
         )
 
     def test_every_action_it_runs_is_pinned_to_a_digest(self, workflow: dict[str, Any]) -> None:
-        """AT-170 -- the finding."""
+        """AT-170 -- every action in the credential-holding job is pinned to a digest."""
         for name, job in workflow["jobs"].items():
             if (job.get("permissions") or {}).get("id-token") != "write":
                 continue
