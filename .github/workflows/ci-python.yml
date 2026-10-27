@@ -206,7 +206,9 @@ jobs:
   contract:
     name: Contract tier (${{ matrix.deployment.label }})
     if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: from runner image 20261025 its kernel is 6.19 or newer, where MongoDB 8.x refuses to
+    # start (log id 12257600, SERVER-125742). ubuntu-22.04 runs kernel 6.8. Move back once MongoDB lifts the guard.
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
 
     # Two deployments, because `mongo:8` has no search process and the Atlas local image does, so the tests
@@ -328,7 +330,9 @@ jobs:
   sdk-compat:
     name: Latest SDK compatibility
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: from runner image 20261025 its kernel is 6.19 or newer, where MongoDB 8.x refuses to
+    # start (log id 12257600, SERVER-125742). ubuntu-22.04 runs kernel 6.8. Move back once MongoDB lifts the guard.
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
 
     # The same container the contract job uses, so the canary runs the contract tier with no secret.

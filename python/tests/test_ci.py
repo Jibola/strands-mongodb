@@ -2332,3 +2332,18 @@ class TestTheThrowawayClusterIsAlwaysDeleted:
         assert re.fullmatch(r"\d+\.\d+\.\d+", str(install["env"]["ATLAS_CLI_VERSION"]))
         assert re.fullmatch(r"[0-9a-f]{64}", str(install["env"]["ATLAS_CLI_SHA256"]))
         assert "sha256sum --check" in install["run"]
+
+
+class TestEveryMongoDBContainerRunsOnAKernelItAccepts:
+    """AT-235 / ``REQ-E-227`` -- MongoDB 8.x refuses to start on Linux kernel 6.19 and newer.
+
+    ``ubuntu-latest`` moved to such a kernel with runner image 20261025, and a service container that cannot
+    start fails its job before a test runs. Until MongoDB lifts the guard (SERVER-125742), every job that starts
+    a MongoDB container runs on ``ubuntu-22.04``, whose kernel is 6.8.
+    """
+
+    def test_jobs_with_a_mongodb_container_avoid_the_newest_kernel(self) -> None:
+        for path in (WORKFLOW_PATH, RELEASE_WORKFLOW_PATH):
+            for name, job in yaml.safe_load(path.read_text())["jobs"].items():
+                if job.get("services"):
+                    assert job.get("runs-on") == "ubuntu-22.04", f"{path.name}:{name} runs on {job.get('runs-on')}"

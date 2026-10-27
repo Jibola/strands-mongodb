@@ -73,7 +73,9 @@ jobs:
 
   contract:
     name: Contract tier
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: from runner image 20261025 its kernel is 6.19 or newer, where MongoDB 8.x refuses to
+    # start (log id 12257600, SERVER-125742). ubuntu-22.04 runs kernel 6.8. Move back once MongoDB lifts the guard.
+    runs-on: ubuntu-22.04
     timeout-minutes: 15  # A container start plus the contract tier, as in CI.
 
     # A service container rather than a cluster secret: a release workflow holding a cluster credential
