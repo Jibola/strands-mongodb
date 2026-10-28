@@ -117,7 +117,7 @@ class TestVectorModeIsResolvedFromTheConfig:
     @pytest.mark.parametrize("dimensions", [0, -1, 8193])
     def test_dimensions_outside_the_atlas_bounds_are_rejected_here(self, dimensions: int) -> None:
         """The server answers ``numDimensions`` outside ``[1..8192]`` with code 8. Same reasoning as the
-        similarity check. ``-1`` is included because langchain-mongodb uses it as a placeholder."""
+        similarity check. ``-1`` is included because some client libraries use it as a placeholder."""
         with pytest.raises(ValueError, match=r"1\.\.8192"):
             _indexes.vector_mode({"database": "d", "embedding_dimensions": dimensions, "similarity": "cosine"})
 
@@ -154,8 +154,8 @@ class TestTheVectorIndexDefinition:
         }
 
     def test_no_definition_ever_emits_the_placeholder_dimension_count(self) -> None:
-        """langchain-mongodb uses ``numDimensions: -1`` as a placeholder for the server-side path. That
-        is its constructor validation, not a wire format: the server answers ``-1`` with code 8.
+        """Some client libraries use ``numDimensions: -1`` as a placeholder for the server-side path. That
+        is client-side validation, not a wire format: the server answers ``-1`` with code 8.
         ``vector_mode`` cannot produce it, so this asserts the emitted dict as well."""
         configs: tuple[MongoDBConfig, ...] = ({"database": "d"}, {"database": "d", "embedding_model": "m"})
         for config in configs:
@@ -296,9 +296,9 @@ class TestTheSearchIndexInventory:
         assert [spec.type for spec in specs] == ["vectorSearch", "search"]
 
     def test_the_default_index_names_are_the_reference_implementation_names(self) -> None:
-        """Sourced rather than chosen: ``vector_index`` from langchain-mongodb
-        ``vectorstores.py:219``, ``text_index`` from ``retrievers/parent_document.py:218``. A caller
-        pointing this package at a collection langchain already indexed then finds its indexes."""
+        """Sourced rather than chosen: ``vector_index`` and ``text_index`` are the names existing MongoDB
+        integrations create. A caller pointing this package at a collection another library already
+        indexed then finds its indexes."""
         specs = _indexes.memory_search_specs({"database": "d"})
 
         assert [spec.name for spec in specs] == ["vector_index", "text_index"]
@@ -1389,7 +1389,7 @@ class TestSearchIndexesAgainstAFake:
 
     async def test_a_text_index_mapped_over_a_different_field_is_a_mismatch(self) -> None:
         """The reason tolerating the rewrite cannot become tolerating anything. A ``text_index`` that
-        langchain built over its own field name is present, healthy, and answers every search this
+        another library built over its own field name is present, healthy, and answers every search this
         package issues with nothing."""
         from strands.types.exceptions import StorageError
 
