@@ -651,15 +651,15 @@ class TestAttributionHappensAtMostOncePerClient:
         """AT-232. pymongo's own name has three entries and its version one, so pairing from the left would
         match this package's name against another library's version."""
         injected: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/")
-        injected.append_metadata(DriverInfo("Langchain", _client._package_version()))
+        injected.append_metadata(DriverInfo("OtherLibrary", _client._package_version()))
         injected.append_metadata(DriverInfo(_client._DRIVER_NAME, "0.0.0-another"))
 
         assert _client._already_attributed(injected) is False
 
-        injected.append_metadata(DriverInfo("Langgraph", "1.0"))
+        injected.append_metadata(DriverInfo("ThirdLibrary", "1.0"))
         bare: AsyncMongoClient[Any] = AsyncMongoClient("mongodb://127.0.0.1:1/")
         bare.append_metadata(_client._driver_info())
-        bare.append_metadata(DriverInfo("Langgraph", "1.0"))
+        bare.append_metadata(DriverInfo("ThirdLibrary", "1.0"))
 
         assert _client._already_attributed(bare) is True
 

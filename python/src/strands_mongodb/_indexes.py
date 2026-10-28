@@ -111,10 +111,10 @@ DEFAULT_EMBEDDING_MODEL: Final[str] = "voyage-4-lite"
 """Atlas embedding model used when the config names none. Matches the community ``strands-mongodb-store``."""
 
 DEFAULT_VECTOR_INDEX_NAME: Final[str] = "vector_index"
-"""Default Atlas Vector Search index name, the same as langchain-mongodb's."""
+"""Default Atlas Vector Search index name."""
 
 DEFAULT_TEXT_INDEX_NAME: Final[str] = "text_index"
-"""Default Atlas Search index name, the same as langchain-mongodb's."""
+"""Default Atlas Search index name."""
 
 SIMILARITIES: Final[tuple[str, ...]] = ("cosine", "dotProduct", "euclidean")
 """Distance metrics an Atlas vector index accepts. Mirrors ``types.VectorSimilarity`` at runtime."""
