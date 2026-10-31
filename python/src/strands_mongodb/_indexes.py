@@ -414,9 +414,10 @@ def drop_index_command(collection_name: str, index_name: str) -> str:
         index_name: Name the deployment reported for it.
 
     Returns:
-        A single-line ``db.runCommand({...})``.
+        A single-line ``db.runCommand({...})`` whose argument is valid JSON.
     """
-    return f'db.runCommand({{"dropIndexes": "{collection_name}", "index": "{index_name}"}})'
+    # Encoded, not interpolated: the name is whatever the deployment reports, and an operator pastes this.
+    return f"db.runCommand({json.dumps({'dropIndexes': collection_name, 'index': index_name})})"
 
 
 @dataclass(frozen=True)
@@ -464,9 +465,9 @@ class SearchIndexSpec:
             collection_name: Collection the index sits on.
 
         Returns:
-            A single-line ``db.runCommand({...})``.
+            A single-line ``db.runCommand({...})`` whose argument is valid JSON.
         """
-        return f'db.runCommand({{"dropSearchIndex": "{collection_name}", "name": "{self.name}"}})'
+        return f"db.runCommand({json.dumps({'dropSearchIndex': collection_name, 'name': self.name})})"
 
 
 def storage_specs() -> tuple[IndexSpec, ...]:
