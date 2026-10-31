@@ -373,6 +373,22 @@ class TestTheCreationCommandsHandedToAnOperator:
             assert body is not None, command
             json.loads(body.group(1))
 
+    def test_a_drop_command_keeps_a_hostile_index_name_inside_its_string(self) -> None:
+        """The name in a drop command comes from the deployment, so whoever created the index chose it."""
+        import json
+        import re
+
+        name = 'x"}); db.dropDatabase(); ({"a":"\\'
+        spec = _indexes.SearchIndexSpec(name=name, definition={}, type="search")
+
+        for command, key in (
+            (_indexes.drop_index_command("memory", name), "index"),
+            (spec.drop_command("memory"), "name"),
+        ):
+            body = re.fullmatch(r"db\.runCommand\((.*)\)", command)
+            assert body is not None, command
+            assert json.loads(body.group(1))[key] == name
+
 
 class FakeSearchIndexCursor:
     """The cursor ``list_search_indexes`` returns, which is async-iterable and not iterable.

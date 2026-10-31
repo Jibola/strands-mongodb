@@ -331,7 +331,7 @@ and behave as they do for any store, with one exception noted below.
 |---|---|---|---|---|
 | `name` | `str` | yes | | Identifies the store. Stamped on every document as `store_name` and part of every read predicate. |
 | `description` | `str` | no | | Passed to the SDK, which shows it to the model when it chooses a store. |
-| `max_search_results` | `int` | no | `10` | Result ceiling. A per-call `limit` overrides it. Below 1 raises. |
+| `max_search_results` | `int` | no | `10` | Default result count, not a ceiling. A per-call `limit` overrides it, and so does the SDK `search_memory` tool's `max_search_results` argument, which the model chooses. Below 1 raises. |
 | `writable` | `bool` | no | `False` | Gates `add`, `delete` and `delete_all`. `False` here, unlike `FileMemoryStore`: the cost of the wrong default is a retrieval store that starts accepting model-written memories. |
 | `extraction` | `ExtractionConfig \| bool` | no | | Passed to the SDK's extractor. This package never extracts anything itself. |
 | `config` | `MongoDBConfig` | yes | | The connection, nested. Share one across stores. |
@@ -504,6 +504,12 @@ caller cannot set it through `filter` or `metadata`; an absent scope resolves to
 rather than to no predicate; a caller `filter` composes as a narrowing conjunction and cannot widen the
 read; and `delete()` reaches exactly as far as `search()` does. The tests for these run two stores in
 one collection and check isolation in both directions.
+
+On storage, `prefix` and `namespace()` differ in one way that matters to an agent. A `namespace()` view
+tells the SDK it is already namespaced, so the SDK's session manager and context offloader share its key
+space, and the offloader's `retrieve_offloaded_content` tool reads whatever key the model names in it,
+session snapshots included. Do not share one `namespace()` view as `Agent(storage=...)` across sessions
+that use the offloader; pass a `MongoDBStorage` or one built with `prefix=` instead.
 
 ![What every memory write and read goes through: a write is stamped with scope and store name and deduplicated by content hash; a read passes the filter guard and is limited to the store's scope](https://raw.githubusercontent.com/mongodb/strands-mongodb/main/docs/images/memory-guards.png)
 
