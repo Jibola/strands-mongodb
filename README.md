@@ -11,10 +11,10 @@ One MongoDB deployment behind the SDK's two extension points:
 
 The SDK accepts a single top-level `storage` on `Agent`, and **five** subsystems inherit it. One
 `MongoDBStorage` is therefore the backend for session management and context offloading. Each is still
-turned on with the SDK's own objects (`SnapshotSessionManager`, and `ContextOffloader` or
-`context_manager="auto"`), and neither needs a MongoDB-specific class.
+turned on with the SDK's own objects (`SnapshotSessionManager`, and `context_manager="auto"`), and
+neither needs a MongoDB-specific class.
 
-![strands-mongodb in a Strands agent: the SDK's session manager, context offloader and memory manager use MongoDBStorage and MongoDBMemoryStore, which store to MongoDB](docs/images/architecture.png)
+![strands-mongodb in a Strands agent: the SDK's session manager, context manager and memory manager use MongoDBStorage and MongoDBMemoryStore, which store to MongoDB](docs/images/architecture.png)
 
 ## Status
 

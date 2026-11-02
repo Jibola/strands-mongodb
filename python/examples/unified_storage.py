@@ -9,7 +9,7 @@ Agent(storage=...) takes one backend and hands it to every subsystem that does n
 MongoDBStorage serves three writers, each under its own key prefix:
 
     session/    conversation snapshots, from SnapshotSessionManager
-    offloader/  an oversized tool result, moved out of context by ContextOffloader
+    context/    an oversized tool result, stashed by the context manager
     memory/     a knowledge file, from FileMemoryStore(storage=...)
 
 The run step runs a turn that writes all three, then prints a census of the collection read back from
@@ -17,8 +17,8 @@ MongoDB: each top-level prefix with its document count and byte total. The resum
 process, restores the session from session/ and prints how many messages came back.
 
 The memory/ documents are not vector memory. Storage holds opaque bytes under a string key, and on this
-backend FileMemoryStore recalls by token overlap over the keys alone. MongoDBMemoryStore, shown in
-memory_recall.py, uses a separate collection with typed fields and a vector index.
+backend FileMemoryStore recalls by token overlap. MongoDBMemoryStore,
+shown in memory_recall.py, uses a separate collection with typed fields and a vector index.
 
 Needs MONGODB_URI. Any MongoDB deployment works; Atlas Search is not needed. Pass --dry-run to see what
 a step would do without connecting.
@@ -34,7 +34,6 @@ from pymongo import AsyncMongoClient
 from strands import Agent, tool
 from strands.session import SnapshotSessionManager
 from strands.vended_memory_stores.file_memory_store import FileMemoryStore
-from strands.vended_plugins.context_offloader import ContextOffloader
 
 from _support import (
     ExampleError,
@@ -55,10 +54,8 @@ from strands_mongodb import MongoDBStorage
 SCRIPT = "unified_storage.py"
 STEPS = ("run", "resume")
 
-#: Far below the SDK's default of 2500 tokens, so the example tool result is offloaded and ``offloader/``
-#: appears.
-MAX_RESULT_TOKENS = 60
-PREVIEW_TOKENS = 20
+#: Enough rows that the tool result is over ``context_manager="auto"``'s offload threshold.
+BOOKINGS = 200
 
 MEMORY_STORE = "kitchen_notes"
 KNOWLEDGE = (
@@ -66,7 +63,7 @@ KNOWLEDGE = (
     "for ten minutes before setting the alarm."
 )
 
-#: The first reply calls the tool, giving ``ContextOffloader`` an oversized result to move. The second
+#: The first reply calls the tool, giving the context manager an oversized result to move. The second
 #: ends the turn.
 REPLIES: list[dict[str, Any]] = [
     {
@@ -85,8 +82,7 @@ PROMPT = "Pull up tonight's reservation book and file the closing checklist."
 def reservation_book(service: str) -> str:
     """Return every booking for one service, which is more text than a turn should carry.
 
-    The 70 lines come to a few thousand characters, well over :data:`MAX_RESULT_TOKENS`, so the
-    offloader moves the result out of context.
+    The :data:`BOOKINGS` lines are long enough that the context manager moves the result out of context.
 
     Args:
         service: Which service to list. Only used in the heading.
@@ -97,7 +93,7 @@ def reservation_book(service: str) -> str:
     rows = [
         f"table {number:>2} | {19 + number % 4}:{(number * 15) % 60:02d} | party of {2 + number % 6} | "
         f"guest {number:03d} | {'window' if number % 3 == 0 else 'main room'}"
-        for number in range(1, 71)
+        for number in range(1, BOOKINGS + 1)
     ]
     return f"{service} service, {len(rows)} bookings\n" + "\n".join(rows)
 
@@ -148,8 +144,8 @@ async def census_lines(arguments: Any, uri: str) -> list[dict[str, Any]]:
 def build_agent(arguments: Any, storage: MongoDBStorage) -> tuple[Agent, SnapshotSessionManager]:
     """Assemble the agent and the session manager that shares its storage.
 
-    Neither the session manager nor the offloader gets a backend of its own. Both use ``agent.storage``:
-    one connection pool, one collection, and the subsystems kept apart by key prefix.
+    Neither the session manager nor the context manager's stash gets a backend of its own. Both use
+    ``agent.storage``: one connection pool, one collection, and the subsystems kept apart by key prefix.
 
     Args:
         arguments: Parsed command line.
@@ -159,11 +155,10 @@ def build_agent(arguments: Any, storage: MongoDBStorage) -> tuple[Agent, Snapsho
         The agent and the session manager, which ``run`` uses again to save a snapshot.
     """
     sessions = SnapshotSessionManager(session_id=arguments.session_id)
-    offloader = ContextOffloader(max_result_tokens=MAX_RESULT_TOKENS, preview_tokens=PREVIEW_TOKENS)
     agent = Agent(
         model=resolve_model(arguments.model, REPLIES),
         tools=[reservation_book],
-        plugins=[offloader],
+        context_manager="auto",
         session_manager=sessions,
         storage=storage,
     )
@@ -205,7 +200,7 @@ async def run(arguments: Any, uri: str) -> dict[str, Any]:
         census = await census_lines(arguments, uri)
 
         prefixes = [entry["prefix"] for entry in census]
-        missing = [expected for expected in ("session/", "offloader/", "memory/") if expected not in prefixes]
+        missing = [expected for expected in ("session/", "context/", "memory/") if expected not in prefixes]
         if missing:
             raise ExampleError(
                 f"nothing was written under {missing}, so this run does not show what it claims. The "
@@ -252,8 +247,8 @@ async def resume(arguments: Any, uri: str) -> dict[str, Any]:
         census = await census_lines(arguments, uri)
         say(
             "on the memory/ prefix: Storage moves opaque bytes under a string key, and FileMemoryStore "
-            "recall is token overlap over that key space, so it matches file names and "
-            "not the text inside them. MongoDBMemoryStore is a different collection with typed fields "
+            "recall is token overlap, with no notion of meaning. "
+            "MongoDBMemoryStore is a different collection with typed fields "
             "and a vector index. See memory_recall.py for that one."
         )
 
@@ -279,10 +274,9 @@ def describe(step: str) -> list[str]:
     if step == "run":
         return [
             "build one MongoDBStorage and pass it as Agent(storage=...)",
-            f"add a SnapshotSessionManager and a ContextOffloader(max_result_tokens={MAX_RESULT_TOKENS}), "
-            "neither carrying storage of its own",
+            'add a SnapshotSessionManager and context_manager="auto", neither carrying storage of its own',
             f"run one turn in which the model calls {reservation_book.tool_name!r}, whose result is far "
-            "over that threshold, so the offloader moves it out of context",
+            "over the offload threshold, so the context manager stashes it under context/",
             f"write one knowledge file through FileMemoryStore({MEMORY_STORE!r}, storage=...)",
             "save an immutable snapshot, then read the prefix census back with a plain driver",
         ]

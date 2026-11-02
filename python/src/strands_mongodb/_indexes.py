@@ -999,6 +999,10 @@ def _missing_ordinary_message(collection_name: str, namespace: str, missing: Seq
     )
 
 
+class SearchIndexNotReady(StorageError):
+    """A search index exists but did not report ``READY`` within the timeout."""
+
+
 async def _ensure_search(
     collection: AsyncCollection[Any],
     specs: tuple[SearchIndexSpec, ...],
@@ -1055,7 +1059,7 @@ async def _ensure_search(
         stuck = await _wait_until_ready(collection, waiting, namespace, timeout=timeout, interval=interval)
         _telemetry.annotate("strands_mongodb.indexes.outcome", "ready" if stuck is None else "timed_out")
     if stuck is not None:
-        raise StorageError(
+        raise SearchIndexNotReady(
             f"strands_mongodb: waited {timeout}s for {len(stuck)} search index(es) on "
             f"{namespace} to report READY and they did not: {', '.join(stuck)}. BUILDING at this point means "
             f"a build slower than the timeout. A store with a named search_type can call initialize() "

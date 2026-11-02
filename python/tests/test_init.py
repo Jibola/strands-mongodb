@@ -28,7 +28,12 @@ class TestPublicSurface:
         of it would make the root import undocumented even though the lazy root import works. The cost
         of listing them is pinned by ``TestStarImportIsTheOneEagerPath`` in ``test_lazy_exports.py``.
         """
-        assert strands_mongodb.__all__ == ["MongoDBMemoryStore", "MongoDBStorage", "__version__"]
+        assert strands_mongodb.__all__ == [
+            "MongoDBMemoryStore",
+            "MongoDBStorage",
+            "MongoDBVectorSearchStrategy",
+            "__version__",
+        ]
 
     def test_dir_lists_the_lazy_names_before_anything_has_imported_them(self) -> None:
         """AT-009 — tab completion and ``help()`` walk ``__dir__``, which does not see ``__getattr__``.

@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 LAZY_NAMES = [
     ("MongoDBStorage", "strands_mongodb.storage"),
     ("MongoDBMemoryStore", "strands_mongodb.memory_store"),
+    ("MongoDBVectorSearchStrategy", "strands_mongodb.vector_search"),
 ]
 
 

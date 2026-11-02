@@ -90,7 +90,7 @@ one `MongoDBStorage` ends up serving three writers at once:
 
 ```
 session/    conversation snapshots, from SnapshotSessionManager
-offloader/  an oversized tool result, moved out of context by ContextOffloader
+context/    an oversized tool result, stashed by the context manager
 memory/     a knowledge file, from FileMemoryStore(storage=...)
 ```
 
@@ -103,8 +103,7 @@ with a document count and a byte total. The census is read back from MongoDB wit
 messages came back.
 
 One thing the key names invite you to get wrong: the `memory/` documents are **not** vector memory.
-`Storage` moves opaque bytes under a string key, and `FileMemoryStore`'s recall is token overlap over the
-key space, so it matches file names rather than the text inside them. `MongoDBMemoryStore` is a different
+`FileMemoryStore`'s recall is token overlap, with no notion of meaning. `MongoDBMemoryStore` is a different
 collection with typed fields and a vector index on it. That is what `memory_recall.py` shows.
 
 `--session-id` gives a run its own session.

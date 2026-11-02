@@ -62,6 +62,13 @@ def _named(exporter: InMemorySpanExporter, name: str) -> list[ReadableSpan]:
     return [span for span in exporter.get_finished_spans() if span.name == name]
 
 
+def _top_level(exporter: InMemorySpanExporter) -> list[ReadableSpan]:
+    """The finished storage spans not nested inside another storage span, in the order they ended."""
+    spans = [span for span in exporter.get_finished_spans() if span.name.startswith("strands_mongodb.storage.")]
+    ids = {span.context.span_id for span in spans}
+    return [span for span in spans if span.parent is None or span.parent.span_id not in ids]
+
+
 def _one(exporter: InMemorySpanExporter, name: str) -> ReadableSpan:
     """The single finished span called ``name``, failing with every span name if there is not exactly one."""
     spans = _named(exporter, name)
@@ -271,21 +278,17 @@ class TestEveryStorageOperationRecordsOneSpan:
     async def test_each_operation_records_one_internal_span_on_its_namespace(
         self, exported_spans: InMemorySpanExporter
     ) -> None:
-        storage = unit_storage(
-            FakeStorageCollection(aggregate_result=[{"_id": "notes/a", "score": 2}]), collection="sessions"
-        )
+        storage = unit_storage(collection="sessions")
 
         await storage.write("notes/a", b"x")
         await storage.read("notes/a")
         await storage.list("notes/")
-        await storage.search("dark mode")
+        await storage.search("notes")
         await storage.delete("notes/a")
         await storage.delete_prefix("notes/")
         await storage.ensure_indexes()
 
-        spans = [
-            span for span in exported_spans.get_finished_spans() if span.name.startswith("strands_mongodb.storage.")
-        ]
+        spans = _top_level(exported_spans)
         called = ("write", "read", "list", "search", "delete", "delete_prefix", "ensure_indexes")
         assert sorted(called) == sorted(STORAGE_OPERATIONS)
         assert [span.name for span in spans] == [f"strands_mongodb.storage.{op}" for op in called]
@@ -296,21 +299,38 @@ class TestEveryStorageOperationRecordsOneSpan:
             assert attributes["strands_mongodb.collection"] == "sessions"
             assert [key for key in attributes if key.startswith("db.")] == []
 
+    async def test_keyword_search_records_its_list_and_reads_as_children(
+        self, exported_spans: InMemorySpanExporter
+    ) -> None:
+        """The SDK's keyword strategy goes through the public ``list`` and ``read``, one round trip each."""
+        storage = unit_storage()
+        await storage.write("notes/a", b"x")
+        exported_spans.clear()
+
+        await storage.search("notes")
+
+        search = _one(exported_spans, "strands_mongodb.storage.search")
+        children = [
+            span.name
+            for span in exported_spans.get_finished_spans()
+            if span.parent is not None and span.parent.span_id == search.context.span_id
+        ]
+        assert children == ["strands_mongodb.storage.list", "strands_mongodb.storage.read"]
+
     async def test_each_outcome_is_a_count_or_a_flag(self, exported_spans: InMemorySpanExporter) -> None:
-        fake = FakeStorageCollection(aggregate_result=[{"_id": "notes/a", "score": 2}])
-        storage = unit_storage(fake)
+        storage = unit_storage()
         await storage.write("notes/a", b"x")
         await storage.write("notes/b", b"y")
 
         await storage.read("notes/a")
         await storage.read("notes/missing")
         await storage.list("notes/")
-        await storage.search("dark mode")
+        await storage.search("y")
         await storage.delete("notes/a")
         await storage.delete_prefix("notes/")
 
         def attribute(name: str, key: str) -> list[Any]:
-            return [(span.attributes or {}).get(key) for span in _named(exported_spans, name)]
+            return [(span.attributes or {}).get(key) for span in _top_level(exported_spans) if span.name == name]
 
         assert attribute("strands_mongodb.storage.read", "strands_mongodb.found") == [True, False]
         assert attribute("strands_mongodb.storage.list", "strands_mongodb.result_count") == [2]

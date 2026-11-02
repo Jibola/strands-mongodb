@@ -17,6 +17,19 @@ a release is cut by pushing a `python-v` tag. [RELEASING.md](RELEASING.md) is th
 Work that has landed on `main` and is not yet inside a tagged version. Entries move down into a
 version heading when that version is tagged.
 
+### Added
+
+- `MongoDBStorage(search_strategy=...)`, as on the SDK's `S3Storage`.
+- `MongoDBVectorSearchStrategy`: Atlas Vector Search for `MongoDBStorage`, using any SDK `Embedder`.
+- `embedder` on `MongoDBMemoryStore`'s manual-vector path, so `add` and string `search` embed.
+
+### Changed
+
+- `MongoDBStorage.search` defaults to the SDK's `KeywordSearchStrategy`, which also scores payloads, so
+  `FileMemoryStore` recalls by body text.
+- Under `search_type="auto"`, `initialize()` no longer waits for index builds; the first `search` does.
+- Examples use `context_manager="auto"` instead of `ContextOffloader`.
+
 ## [0.1.0]
 
 The first version with working code in it. Planned, not released.

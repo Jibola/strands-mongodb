@@ -32,8 +32,9 @@ from typing import TYPE_CHECKING, Any, Final
 
 import bson
 import pytest
-from strands.storage import Storage
-from strands.storage.storage import _NAMESPACED, _resolve_namespace
+from strands.storage import InMemoryStorage, Storage
+from strands.storage.search import KeywordSearchStrategy
+from strands.storage.storage import _NAMESPACED, StorageSearchResult, _resolve_namespace
 from strands.types.exceptions import StorageError
 
 from strands_mongodb import _client, _indexes
@@ -224,6 +225,12 @@ class FakeStorageCollection:
     async def replace_one(self, filter: Mapping[str, Any], replacement: Mapping[str, Any], upsert: bool = False) -> Any:
         self._record("replace_one", filter, replacement, upsert=upsert)
         self.documents[str(replacement["_id"])] = dict(replacement)
+        return None
+
+    async def update_one(self, filter: Mapping[str, Any], update: Mapping[str, Any]) -> Any:
+        self._record("update_one", filter, update)
+        for document in self.matching(filter):
+            document.update(update.get("$set", {}))
         return None
 
     async def find_one(self, filter: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
@@ -1094,114 +1101,67 @@ class TestNoStorageMethodRendersThePassword:
         assert_no_leak(str(caught.value), caught.value)
 
 
-class TestSearchIsOneAggregation:
-    """AT-032a, AT-032c — the pipeline this package emits, and the round trips it does not make.
+class RecordingStrategy:
+    """A ``SearchStrategy`` that records what ``MongoDBStorage`` hands it and answers a fixed result."""
 
-    The guarantee is a count: **one** server-side aggregation where the SDK's default does ``list("")``
-    plus one ``read`` per key. So the primary assertion is a call count, not a result set. What MongoDB
-    computes from the pipeline is the contract tier's job (``TestSearchAgainstARealDeployment``); this
-    tier asserts the four stages, their order, and the two cases where a stage is absent.
+    def __init__(self, *, results: Sequence[StorageSearchResult] = (), error: BaseException | None = None) -> None:
+        self.indexed: list[tuple[MongoDBStorage, str, bytes]] = []
+        self.searched: list[tuple[MongoDBStorage, str]] = []
+        self._results = list(results)
+        self._error = error
+
+    async def index(self, storage: MongoDBStorage, key: str, data: bytes, **kwargs: Any) -> None:
+        self.indexed.append((storage, key, data))
+        if self._error is not None:
+            raise self._error
+
+    async def search(self, storage: MongoDBStorage, query: str, **kwargs: Any) -> list[StorageSearchResult]:
+        self.searched.append((storage, query))
+        if self._error is not None:
+            raise self._error
+        return self._results
+
+
+class TestSearchUsesTheSdkKeywordStrategyByDefault:
+    """AT-032a, AT-032c — with no ``search_strategy``, ``search`` is the SDK's ``KeywordSearchStrategy``.
+
+    Keys and payloads are both scored, so ``FileMemoryStore`` finds a fact stored under a heading that
+    does not contain the query's words. What the SDK scores is the SDK's concern; this tier asserts the
+    delegation and the results reaching the caller.
     """
 
-    WORD = r"[\p{L}\p{N}_]+"
+    async def test_a_word_only_in_the_payload_matches(self) -> None:
+        """``AT-032a``. The ``FileMemoryStore`` shape: the fact is in the body, the key is a heading slug."""
+        collection = FakeStorageCollection(
+            documents=[{"_id": "memory/m/user-preferences.md", "data": b"# User preferences\nprefers dark mode"}]
+        )
 
-    @staticmethod
-    def _stages(collection: FakeStorageCollection) -> list[str]:
-        """The stage names in order, which is the part of the pipeline worth naming in a failure."""
-        return [next(iter(stage)) for stage in collection.pipelines[0]]
+        found = await unit_storage(collection).search("dark mode")
 
-    async def test_search_issues_one_aggregate_and_no_find(self) -> None:
-        """``AT-032a``. The assertion that separates this from the inherited default: a store answering
-        with ``find`` at all has fallen back to reading the key space into Python."""
-        collection = FakeStorageCollection(aggregate_result=[{"_id": "notes/dark.md", "score": 2}])
+        assert [result.key for result in found] == ["memory/m/user-preferences.md"]
+        assert found[0].data == b"# User preferences\nprefers dark mode"
 
-        await unit_storage(collection).search("dark mode")
-
-        assert collection.names_called == ["aggregate"]
-
-    async def test_the_pipeline_is_project_match_sort_with_no_match_for_an_unnamespaced_store(self) -> None:
-        """``_range_for("")`` is ``{}`` for a store with no prefix, and an empty ``$match`` is a stage the
-        server still has to run. It is dropped rather than sent."""
-        collection = FakeStorageCollection()
-
-        await unit_storage(collection).search("dark")
-
-        assert self._stages(collection) == ["$project", "$match", "$sort"]
-
-    async def test_a_namespaced_store_bounds_the_scan_with_its_prefix_range_first(self) -> None:
-        """The measured difference between a covered ``IXSCAN`` and a ``COLLSCAN``: with the range in
-        front, ``explain`` reports ``IXSCAN(_id_)``; without it, ``COLLSCAN`` (``AT-032e``)."""
-        collection = FakeStorageCollection()
-
-        await unit_storage(collection, prefix="tenant-a").search("dark")
-
-        pipeline = collection.pipelines[0]
-        assert self._stages(collection) == ["$match", "$project", "$match", "$sort"]
-        assert pipeline[0] == {"$match": {"_id": {"$gte": "tenant-a/", "$lt": "tenant-a0"}}}
-
-    async def test_a_namespaced_store_scores_keys_without_its_own_prefix(self) -> None:
-        """AT-229. The prefix is cut off before tokenizing, by code point, so a query naming
-        the namespace does not match every key in it."""
-        collection = FakeStorageCollection()
-
-        await unit_storage(collection, prefix="tenant-a").search("dark")
-
-        tokenized = collection.pipelines[0][1]["$project"]["score"]["$size"]["$setIntersection"][0]["$map"]
-        assert tokenized["input"]["$regexFindAll"]["input"] == {
-            "$toLower": {"$substrCP": ["$_id", len("tenant-a/"), {"$strLenCP": "$_id"}]}
+    async def test_results_match_the_sdk_strategy_over_in_memory_storage(self) -> None:
+        """Same entries, same query, same ranking as the SDK's reference backend."""
+        entries = {
+            "notes/dark-mode-toggle.md": b"enable the toggle",
+            "notes/toggle-dark.md": b"x",
+            "notes/unrelated.md": b"dark",
+            "sessions/s1/state.json": b"{}",
         }
+        collection = FakeStorageCollection(documents=[{"_id": key, "data": data} for key, data in entries.items()])
+        reference = InMemoryStorage()
+        for key, data in entries.items():
+            await reference.write(key, data)
 
-    async def test_the_tokenizer_regex_is_the_unicode_property_form_not_backslash_w(self) -> None:
-        """MongoDB's ``\\w`` is ASCII-only by default, so the
-        obvious translation of the SDK's ``re.split(r"\\W+", ...)`` tokenizes ``café`` to ``caf`` and
-        drops ``日本語`` entirely. ``AT-032d`` proves the parity against a deployment; this pins the
-        pattern so a refactor cannot quietly swap it back.
-        """
-        collection = FakeStorageCollection()
+        found = await unit_storage(collection).search("dark mode toggle")
+        expected = await KeywordSearchStrategy().search(reference, "dark mode toggle")
 
-        await unit_storage(collection).search("dark")
+        assert [(result.key, result.score) for result in found] == [(result.key, result.score) for result in expected]
 
-        # Matched against the values rather than ``repr``, which doubles every backslash and would make
-        # this pass for a pattern that is not the one being sent.
-        strings = set(_strings(collection.pipelines[0]))
-        assert self.WORD in strings
-        assert not any("\\w" in text for text in strings)
-
-    async def test_query_tokens_are_lowercased_deduplicated_and_sorted(self) -> None:
-        """Sorted for one reason only: two callers asking the same question should produce the same
-        pipeline, so the server's plan cache sees one shape rather than one per token order."""
-        collection = FakeStorageCollection()
-
-        await unit_storage(collection).search("Dark DARK mode")
-
-        assert ["dark", "mode"] in [operand for stage in collection.pipelines[0] for operand in _string_lists(stage)]
-
-    async def test_only_keys_scoring_above_zero_survive_and_ties_break_by_key(self) -> None:
-        collection = FakeStorageCollection()
-
-        await unit_storage(collection).search("dark")
-
-        pipeline = collection.pipelines[0]
-        assert pipeline[-2] == {"$match": {"score": {"$gt": 0}}}
-        assert pipeline[-1] == {"$sort": {"score": -1, "_id": 1}}
-
-    async def test_the_projection_asks_for_no_field_that_would_end_the_covered_scan(self) -> None:
-        """``AT-032e``'s unit-tier half. ``docsExamined`` is 0 only while ``_id`` is the sole field the
-        pipeline reads; naming ``data`` here would make the server fetch every matching document, and no
-        assertion about results would change."""
-        collection = FakeStorageCollection()
-
-        await unit_storage(collection).search("dark")
-
-        assert "$data" not in set(_strings(collection.pipelines[0]))
-        assert set(_strings(collection.pipelines[0])) & {"$_id", "$$this.match"} == {"$_id", "$$this.match"}
-
-    @pytest.mark.parametrize("query", ["", "   ", "!!! ---", "\n\t"])
-    async def test_a_query_that_tokenizes_to_nothing_costs_zero_round_trips(self, query: str) -> None:
-        """``AT-032c``. The result is ``[]`` either way, which is why this needs its own
-        assertion: without the short circuit the server scans the whole namespace, scores every key zero
-        and the ``$match`` throws all of it away. Matches ``KeywordSearchStrategy``'s own behaviour.
-        """
+    @pytest.mark.parametrize("query", ["", "   ", "!!! ---", "what is the"])
+    async def test_a_query_with_no_scoring_tokens_costs_zero_round_trips(self, query: str) -> None:
+        """``AT-032c``. Stop words and punctuation leave nothing to score, so nothing is read."""
         collection = FakeStorageCollection(documents=[{"_id": "notes/dark.md", "data": b"x"}])
 
         found = await unit_storage(collection).search(query)
@@ -1209,69 +1169,93 @@ class TestSearchIsOneAggregation:
         assert found == []
         assert collection.names_called == []
 
-    async def test_results_carry_the_key_without_the_instance_prefix(self) -> None:
-        """The same strip ``list`` does. A caller has to be able to hand the key straight back to
-        ``read``, and the prefix is this instance's business rather than theirs."""
-        collection = FakeStorageCollection(aggregate_result=[{"_id": "tenant-a/notes/dark.md", "score": 2}])
+    async def test_a_namespaced_store_returns_keys_without_its_prefix(self) -> None:
+        """AT-229. Keys come back relative to the instance, ready to hand to ``read``."""
+        collection = FakeStorageCollection(documents=[{"_id": "tenant-a/notes/dark.md", "data": b"dark"}])
 
         found = await unit_storage(collection, prefix="tenant-a").search("dark")
 
         assert [result.key for result in found] == ["notes/dark.md"]
 
-    async def test_the_score_is_a_float_and_data_is_left_unset(self) -> None:
-        """``$size`` returns a BSON int32 and ``StorageSearchResult.score`` is annotated
-        ``float``; the SDK's own strategy passes the ``int`` through, so honouring the annotation is a
-        deliberate divergence and ``3 == 3.0`` means only a ``type`` check can see it.
-        """
-        collection = FakeStorageCollection(aggregate_result=[{"_id": "notes/dark.md", "score": 2}])
-
-        found = await unit_storage(collection).search("dark")
-
-        assert type(found[0].score) is float
-        assert found[0].data is None
-
-    async def test_a_failing_aggregation_becomes_a_storage_error(self) -> None:
-        """Driver-error wrapping covers all five contract methods, ``search`` included."""
+    async def test_a_failing_scan_becomes_a_storage_error(self) -> None:
+        """Driver-error wrapping covers ``search`` as it covers the other contract methods."""
         collection = FakeStorageCollection(error=network_failure())
 
         with pytest.raises(StorageError) as caught:
             await unit_storage(collection).search("dark")
 
-        assert str(caught.value).startswith("strands_mongodb: searching 'dark' in appdb.storage failed:")
         assert isinstance(caught.value.__cause__, Exception)
 
 
-def _strings(value: Any) -> Iterator[str]:
-    """Every string anywhere inside a nested pipeline stage, keys included.
+class TestAConfiguredSearchStrategyIsCalledOnWriteAndSearch:
+    """AT-236 — ``search_strategy`` follows the SDK's ``S3Storage`` contract.
 
-    Assertions here compare values rather than ``repr(pipeline)``, because ``repr`` escapes the
-    backslashes in the tokenizer pattern and a substring test against it passes for the wrong regex.
+    ``write`` indexes after its upsert with the normalized key relative to the instance, ``search``
+    delegates, and ``namespace()`` views share the strategy.
     """
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, list):
-        for item in value:
-            yield from _strings(item)
-    elif isinstance(value, Mapping):
-        for key, item in value.items():
-            yield str(key)
-            yield from _strings(item)
 
+    async def test_write_indexes_the_normalized_relative_key_after_the_upsert(self) -> None:
+        collection = FakeStorageCollection()
+        strategy = RecordingStrategy()
+        storage = unit_storage(collection, prefix="tenant-a", search_strategy=strategy)
 
-def _string_lists(value: Any) -> Iterator[list[str]]:
-    """Every list-of-strings anywhere inside a nested pipeline stage.
+        await storage.write("/notes//one.md", b"text")
 
-    The query tokens sit several levels down inside ``$setIntersection``, and a test that walked the
-    exact path would break on any reshaping of the stage while telling us nothing about the tokens.
-    """
-    if isinstance(value, list):
-        if value and all(isinstance(item, str) for item in value):
-            yield [str(item) for item in value]
-        for item in value:
-            yield from _string_lists(item)
-    elif isinstance(value, Mapping):
-        for item in value.values():
-            yield from _string_lists(item)
+        assert collection.names_called[-1] == "replace_one"
+        assert [(key, data) for _, key, data in strategy.indexed] == [("notes/one.md", b"text")]
+        assert strategy.indexed[0][0] is storage
+
+    async def test_an_indexing_failure_raises_and_the_value_stays_written(self) -> None:
+        collection = FakeStorageCollection()
+        storage = unit_storage(collection, search_strategy=RecordingStrategy(error=RuntimeError("embedder down")))
+
+        with pytest.raises(StorageError, match="but indexing it for search failed") as caught:
+            await storage.write("k", b"v")
+
+        assert isinstance(caught.value.__cause__, RuntimeError)
+        assert collection.documents["k"]["data"] == b"v"
+
+    async def test_a_strategy_without_index_is_only_searched(self) -> None:
+        """strands-agents releases before 1.56.0 define ``SearchStrategy`` with ``search`` alone."""
+
+        class SearchOnly:
+            async def search(self, storage: Any, query: str, **kwargs: Any) -> list[StorageSearchResult]:
+                return []
+
+        collection = FakeStorageCollection()
+        storage = unit_storage(collection, search_strategy=SearchOnly())  # type: ignore[arg-type]
+
+        await storage.write("k", b"v")
+
+        assert collection.names_called == ["replace_one"]
+
+    async def test_search_returns_what_the_strategy_returns(self) -> None:
+        answer = [StorageSearchResult(key="k", score=0.9, data=b"v")]
+        strategy = RecordingStrategy(results=answer)
+        collection = FakeStorageCollection()
+        storage = unit_storage(collection, search_strategy=strategy)
+
+        found = await storage.search("query")
+
+        assert found == answer
+        assert strategy.searched == [(storage, "query")]
+        assert collection.names_called == []
+
+    async def test_a_strategy_error_becomes_a_storage_error_with_the_cause_chained(self) -> None:
+        storage = unit_storage(search_strategy=RecordingStrategy(error=RuntimeError("embedder down")))
+
+        with pytest.raises(StorageError, match=r"searching in appdb\.storage failed") as caught:
+            await storage.search("query")
+
+        assert isinstance(caught.value.__cause__, RuntimeError)
+
+    def test_namespace_views_share_the_strategy(self) -> None:
+        strategy = RecordingStrategy()
+
+        scoped = unit_storage(search_strategy=strategy).namespace("memory")
+
+        assert scoped._search_strategy is strategy
+        assert scoped.prefix == "memory/"
 
 
 class TestEnsureIndexesIsExplicitAndIdempotent:
@@ -1414,7 +1398,6 @@ class TestNoOrdinaryOperationTouchesAnIndex:
             "find_one",
             "delete_one",
             "find",
-            "aggregate",
             "delete_many",
         }
 
@@ -2112,26 +2095,25 @@ class TestTheFiveMethodsAgainstARealDeployment:
 
 @pytest.mark.contract
 class TestSearchAgainstARealDeployment:
-    """AT-032b, AT-032d, AT-032e, AT-033 — ``search`` on a server, the half no fake can carry.
+    """AT-032b, AT-032d, AT-033 — the default keyword ``search`` over values a server actually stored.
 
-    Everything that makes the aggregation worth writing lives on the server: whether the tokenizer
-    agrees with the SDK's, whether the scan is covered, and what order the ``$sort`` actually returns.
-    The unit tier asserts the stages this package emits and deliberately asserts nothing about scores.
+    The scoring is the SDK's; what a server adds is the round trip: the range scan ``list`` issues, the
+    bytes ``read`` gets back, and keys outside the store's prefix staying out.
     """
 
-    KEYS = (
-        "notes/dark-mode-toggle.md",
-        "notes/toggle-dark.md",
-        "notes/café-münchen.md",
-        "notes/日本語.md",
-        "sessions/s1/state.json",
-    )
+    ENTRIES = {
+        "notes/dark-mode-toggle.md": b"enable it from settings",
+        "notes/toggle-dark.md": b"x",
+        "notes/café-münchen.md": "kaffee und kuchen".encode(),
+        "notes/日本語.md": "テキスト".encode(),
+        "memory/m/user-preferences.md": b"# User preferences\nprefers dark mode",
+        "sessions/s1/state.json": b"{}",
+    }
 
     @staticmethod
-    async def _seed(storage: MongoDBStorage) -> None:
-        """Payloads large enough that a document fetch would be visible in ``docsExamined``."""
-        for key in TestSearchAgainstARealDeployment.KEYS:
-            await storage.write(key, b"x" * 400)
+    async def _seed(storage: Storage) -> None:
+        for key, data in TestSearchAgainstARealDeployment.ENTRIES.items():
+            await storage.write(key, data)
 
     async def test_a_namespaced_store_does_not_match_its_own_prefix(self, contract_storage: MongoDBStorage) -> None:
         """AT-229. On ``namespace("sessions")`` the query "sessions" matches no key, because
@@ -2143,119 +2125,42 @@ class TestSearchAgainstARealDeployment:
         assert await scoped.search("sessions") == []
         assert [result.key for result in await scoped.search("dark")] == ["s2/dark-mode.json"]
 
-    async def test_results_are_keys_and_scores_with_no_payload(self, contract_storage: MongoDBStorage) -> None:
-        """``AT-032b``. Keys in score order, each score a ``float``, and no payload fetched."""
+    async def test_results_carry_the_stored_payload(self, contract_storage: MongoDBStorage) -> None:
+        """``AT-032b``. A word only in the body matches, and the body comes back as ``data``."""
         await self._seed(contract_storage)
 
-        found = await contract_storage.search("dark mode")
+        found = await contract_storage.search("prefers")
 
-        assert [result.key for result in found] == ["notes/dark-mode-toggle.md", "notes/toggle-dark.md"]
-        assert all(type(result.score) is float for result in found)
-        assert all(result.data is None for result in found)
+        assert [(result.key, result.data) for result in found] == [
+            ("memory/m/user-preferences.md", b"# User preferences\nprefers dark mode")
+        ]
+        assert found[0].score > 0
 
     @pytest.mark.parametrize(
         "query",
-        ["dark mode toggle", "münchen café", "日本語", "state json", "toggle", "nothing at all here"],
+        ["dark mode toggle", "münchen café", "日本語", "state json", "kuchen", "nothing at all here"],
     )
-    async def test_the_server_scores_exactly_as_the_sdk_would(
-        self, contract_storage: MongoDBStorage, query: str
-    ) -> None:
-        """``AT-032d``, and the reason ``[\\p{L}\\p{N}_]+`` is not ``\\w+``.
-
-        MongoDB's ``\\w`` is ASCII-only by default while Python's is every character ``str.isalnum()``
-        accepts, so ``\\w+`` tokenizes ``café`` to ``caf``, ``m``, ``nchen`` and drops ``日本語``
-        altogether. Both mangled forms still return *results*, which is what makes this invisible without
-        a comparison against the SDK's own scorer. The comparison is against ``token_overlap_score`` over
-        the key text alone, because this package scores the key space rather than the payload.
-        """
-        from strands.storage.search.keyword import token_overlap_score, tokenize
-
+    async def test_results_match_the_sdk_reference_backend(self, contract_storage: MongoDBStorage, query: str) -> None:
+        """``AT-032d``. Same entries in ``InMemoryStorage``, same query, same keys and scores."""
+        reference = InMemoryStorage()
+        await self._seed(reference)
         await self._seed(contract_storage)
-        tokens = tokenize(query)
-        expected = sorted(
-            ((key, token_overlap_score(tokens, key)) for key in self.KEYS if token_overlap_score(tokens, key) > 0),
-            key=lambda pair: (-pair[1], pair[0]),
-        )
 
         found = await contract_storage.search(query)
+        expected = await reference.search(query)
 
-        assert [(result.key, int(result.score)) for result in found] == expected
+        assert [(result.key, result.score) for result in found] == [(result.key, result.score) for result in expected]
 
-    async def test_a_mixed_case_key_matches_a_lowercase_query(self, contract_storage: MongoDBStorage) -> None:
-        """The ``$toLower`` on the key side, which no other test exercises.
-
-        Every other key in this file is already lowercase, so the stage does no work anywhere else the
-        suite can see. The SDK's ``tokenize`` lowercases whatever it is given, meaning the query side is
-        always folded and the key side has to be folded to meet it. ``_normalize_key`` collapses slashes
-        and rejects ``..`` and deliberately does **not** change case, so a caller writing
-        ``Sessions/Agent-1/State.json`` keeps that ``_id`` and, without the stage, would never match
-        ``sessions agent``.
-        """
-        await contract_storage.write("Sessions/Agent-1/State.json", b"x")
-
-        found = await contract_storage.search("sessions agent")
-
-        assert [result.key for result in found] == ["Sessions/Agent-1/State.json"]
-        assert found[0].score == 2.0
-
-    async def test_a_token_only_in_a_payload_does_not_match(self, contract_storage: MongoDBStorage) -> None:
-        """The trade of scoring keys rather than payloads, asserted rather than only documented.
-
-        The SDK's default scores ``f"{key} {content}"`` and would return this key; we score the key space
-        alone, so a word that appears only inside a payload finds nothing. This is the one intended
-        behavioural divergence in the method, and it is what buys the covered scan asserted below: reading
-        payload text server-side means fetching every document. The unit tier pins the mechanism (no
-        ``$data`` in the projection); this pins the consequence.
-        """
-        await contract_storage.write("notes/one.md", b"needle")
-
-        assert await contract_storage.search("needle") == []
-        assert [result.key for result in await contract_storage.search("notes one")] == ["notes/one.md"]
-
-    async def test_scores_never_increase_and_ties_break_by_ascending_key(
-        self, contract_storage: MongoDBStorage
-    ) -> None:
-        """``AT-033``. A token-overlap count is already similarity-oriented, so nothing is inverted here;
-        the inversion clause in the requirement is for ``$vectorSearch``, where a ``euclidean`` metric
-        does need it. What this asserts is the ordering promise and the absence of a negative score.
-        """
+    async def test_scores_are_positive_and_never_increase(self, contract_storage: MongoDBStorage) -> None:
+        """``AT-033``. Best first, and nothing that did not match comes back with a zero score."""
         await self._seed(contract_storage)
 
-        found = await contract_storage.search("notes toggle")
-        pairs = [(result.score, result.key) for result in found]
+        found = await contract_storage.search("notes toggle dark")
+        scores = [result.score for result in found]
 
-        assert all(result.score > 0 for result in found)
-        assert pairs == sorted(pairs, key=lambda pair: (-pair[0], pair[1]))
-
-    async def test_the_scan_is_covered_by_the_id_index_and_fetches_no_documents(
-        self, contract_storage: MongoDBStorage, contract_database: Any, unique_collection_name: str
-    ) -> None:
-        """``AT-032e``. The measurement the whole design rests on, asserted rather than trusted.
-
-        A namespaced store's range gives the planner an ``IXSCAN`` on ``_id_``, and because ``_id`` is the
-        only field the pipeline reads, the server never fetches a document: ``docsExamined`` is 0 even
-        though every key here carries a 400-byte payload. Naming one more field in the ``$project`` turns
-        that into one fetch per matching key and no other assertion in this file would change.
-        """
-        from strands.storage.search.keyword import tokenize
-
-        scoped = contract_storage.namespace("tenant-a")
-        await self._seed(scoped)
-
-        plan = await contract_database.command(
-            "explain",
-            {
-                "aggregate": unique_collection_name,
-                "pipeline": scoped._search_pipeline(tokenize("dark mode")),
-                "cursor": {},
-            },
-            verbosity="executionStats",
-        )
-        stats = plan["stages"][0]["$cursor"]["executionStats"]
-
-        assert stats["totalDocsExamined"] == 0
-        assert "IXSCAN" in str(plan["stages"][0]["$cursor"]["queryPlanner"]["winningPlan"])
-        assert "COLLSCAN" not in str(plan["stages"][0]["$cursor"]["queryPlanner"]["winningPlan"])
+        assert found
+        assert all(score > 0 for score in scores)
+        assert scores == sorted(scores, reverse=True)
 
     async def test_aggregate_is_awaited_where_find_is_not(
         self, contract_database: Any, unique_collection_name: str
@@ -2264,7 +2169,7 @@ class TestSearchAgainstARealDeployment:
 
         ``AsyncCollection.find`` returns a cursor directly and ``aggregate`` returns a coroutine, so the
         missing ``await`` here produces ``AttributeError: 'coroutine' object has no attribute ...`` rather
-        than anything that names the real problem. This is the call shape ``search`` depends on.
+        than anything that names the real problem. ``MongoDBVectorSearchStrategy`` depends on this shape.
         """
         collection = contract_database[unique_collection_name]
         await collection.replace_one({"_id": "a/one"}, {"_id": "a/one", "data": b"x"}, upsert=True)

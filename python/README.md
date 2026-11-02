@@ -30,10 +30,9 @@ included.
 The `Storage` protocol is what makes this possible: the SDK accepts a single top-level `storage` on
 `Agent`, and five subsystems inherit it. One `MongoDBStorage` is therefore the backend for session
 management and context offloading. Each is still turned on with the SDK's own objects
-(`SnapshotSessionManager`, and `ContextOffloader` or `context_manager="auto"`), and neither needs a
-MongoDB-specific class.
+(`SnapshotSessionManager`, and `context_manager="auto"`), and neither needs a MongoDB-specific class.
 
-![strands-mongodb in a Strands agent: the SDK's session manager, context offloader and memory manager use MongoDBStorage and MongoDBMemoryStore, which store to MongoDB](https://raw.githubusercontent.com/mongodb/strands-mongodb/main/docs/images/architecture.png)
+![strands-mongodb in a Strands agent: the SDK's session manager, context manager and memory manager use MongoDBStorage and MongoDBMemoryStore, which store to MongoDB](https://raw.githubusercontent.com/mongodb/strands-mongodb/main/docs/images/architecture.png)
 
 **Already using another MongoDB backend for Strands?** Three exist: the archived `mongodb_memory` tool
 in `strands-agents-tools`, and the community `strands-mongodb-store` and `strands-mongodb-storage`
@@ -183,8 +182,7 @@ asyncio.run(main())
 ```
 
 The query shares no word with the stored fact. That is the point of the vector tier, and it is also why
-the first run of this snippet is slower than the rest: `initialize()` waits for a new Atlas Search index
-to finish building before it returns.
+the first run of this snippet is slower: its first `search` waits for the new index to build.
 
 To give an agent both surfaces, pass one config to both and let the SDK wire them:
 
@@ -213,8 +211,17 @@ store instead of, or as well as, `add_tool_config`.
 
 One `storage` on `Agent` serves five subsystems, but it doesn't turn them on. The `session_manager`
 line above is what persists the conversation under its session ID. To offload context as well, pass
-`context_manager="auto"` or a `ContextOffloader` plugin. Both use this storage, and
-`examples/unified_storage.py` wires all three.
+`context_manager="auto"`:
+
+<!-- skip: needs a model provider and its credentials, which no test tier configures -->
+```python
+agent = Agent(
+    model=your_model,
+    storage=MongoDBStorage(connection),
+    session_manager=SnapshotSessionManager(session_id="support-ticket-4127"),
+    context_manager="auto",
+)
+```
 
 A type checker will reject `stores=[store]`, and the reason is the SDK's rather than yours: its
 `MemoryStore` protocol declares `add_messages` as a member while its own docstring calls it optional, so
@@ -341,6 +348,7 @@ and behave as they do for any store, with one exception noted below.
 | `min_score` | `float` | no | | Relevance floor. Applied after the search, so it drops results without changing their order. |
 | `max_score` | `float` | no | | Relevance ceiling. Mutually exclusive with `min_score`. |
 | `ttl_seconds` | `int` | no | | How long a memory lives, measured from its own `created_at`. Absent means it never expires and stamps no field; `0` means "at the next sweep" and is a real value, not a disabled one; a negative value raises `ValueError`. Set on insert, so re-remembering a fact does not extend it. Needs no `ensure_indexes()` call here: `initialize()` already creates the TTL index. |
+| `embedder` | `TextEmbedder` | no | | Manual-vector path only: embeds on `add()` and string `search()`. See [Supplying your own vectors](#supplying-your-own-vectors). |
 
 ### `MongoDBSearchQuery`
 
@@ -360,8 +368,8 @@ key in each of its two pipelines; anywhere else it raises `ValueError`.
 
 ### `MongoDBStorage`
 
-`MongoDBStorage(config, /, *, collection="storage", prefix="", ttl_seconds=None)`. The config comes first
-and positionally, and can be the same object a memory store holds.
+`MongoDBStorage(config, /, *, collection="storage", prefix="", ttl_seconds=None, search_strategy=None)`.
+The config comes first and positionally, and can be the same object a memory store holds.
 
 | Argument | Type | Default | What it does |
 |---|---|---|---|
@@ -369,6 +377,26 @@ and positionally, and can be the same object a memory store holds.
 | `collection` | `str` | `storage` | Collection holding this instance's documents. |
 | `prefix` | `str` | `""` | Prepended to every key, scoping this instance inside the collection. Normalized to end in one `/`. |
 | `ttl_seconds` | `int \| None` | `None` | Lifetime of the documents this instance writes. Needs the TTL index; see Limits. A negative value raises `ValueError`. |
+| `search_strategy` | `SearchStrategy \| None` | `None` | What `search()` runs. Defaults to the SDK's `KeywordSearchStrategy`, which reads every value under the prefix. Shared by `namespace()` views. |
+
+#### Vector search over storage
+
+`MongoDBVectorSearchStrategy` is the MongoDB counterpart of the SDK's `S3VectorSearchStrategy`. It
+stores each value's vector on the value's own document. Empty and non-UTF-8 values aren't indexed.
+`VoyageEmbedder` is defined in [Supplying your own vectors](#supplying-your-own-vectors).
+
+<!-- skip: it needs an embedding model and Atlas Vector Search -->
+```python
+from strands_mongodb import MongoDBStorage, MongoDBVectorSearchStrategy
+
+storage = MongoDBStorage(
+    connection,
+    search_strategy=MongoDBVectorSearchStrategy(
+        embedder=VoyageEmbedder(), dimensions=1024, similarity="cosine"
+    ),
+)
+await storage.ensure_indexes()  # also creates the vector index
+```
 
 ### What the methods return
 
@@ -453,23 +481,35 @@ Setting `embedding_dimensions` and `similarity` selects the manual path, where t
 `embedding` field on each document instead of asking Atlas to embed `content`.
 
 <!-- manual-vectors -->
-On that path this package indexes the `embedding` field and queries it, and **never produces a vector to
-put in it**. Client-side embedding is a non-goal, so nothing here calls a model. `add()` takes content and
-metadata and has no vector parameter, and `MemoryManager` would not pass one if it had: a memory written
-through `MongoDBMemoryStore` carries no `embedding`, and the store's own vector index cannot retrieve it.
-Writing that field is yours, through the driver, against the same collection:
+The package indexes and queries `embedding` but never fills it on its own. Pass an `embedder` and `add()`
+and string `search()` embed for you, so `MemoryManager` works unchanged.
+Any SDK `Embedder` works. The SDK ships `BedrockEmbedder`; for Voyage AI, subclass `Embedder`:
 
-<!-- skip: it needs a collection, an embedding model and a document that the reader supplies -->
+<!-- skip: it needs a Voyage AI API key -->
 ```python
-await collection.update_one(
-    {"_id": entry_id},
-    {"$set": {"embedding": await your_embedding_model.embed(text)}},
+import voyageai
+from strands.storage.search import Embedder
+
+
+class VoyageEmbedder(Embedder):
+    def __init__(self, model: str = "voyage-4-lite") -> None:
+        self._client = voyageai.AsyncClient()  # reads VOYAGE_API_KEY
+        self._model = model
+
+    async def embed(self, text: str) -> list[float]:
+        return (await self._client.embed([text], model=self._model)).embeddings[0]
+
+
+store = MongoDBMemoryStore(
+    name="facts",
+    config={**connection, "embedding_dimensions": 1024, "similarity": "cosine"},
+    embedder=VoyageEmbedder(),
+    writable=True,
 )
 ```
 
-So in `0.1.0` the manual path is only half of a `MongoDBMemoryStore` configuration: the read half works
-and the write half is the caller's. The AutoEmbeddings default is unaffected, and is the supported memory
-configuration: there mongot embeds the indexed `content` field and the document carries no vector by design.
+Without one, memories get no `embedding` and only a `MongoDBSearchQuery` with a precomputed `vector`
+can use the vector tier. AutoEmbeddings needs no `embedder` and rejects one.
 
 ### Reserved metadata keys
 
@@ -506,10 +546,8 @@ read; and `delete()` reaches exactly as far as `search()` does. The tests for th
 one collection and check isolation in both directions.
 
 On storage, `prefix` and `namespace()` differ in one way that matters to an agent. A `namespace()` view
-tells the SDK it is already namespaced, so the SDK's session manager and context offloader share its key
-space, and the offloader's `retrieve_offloaded_content` tool reads whatever key the model names in it,
-session snapshots included. Do not share one `namespace()` view as `Agent(storage=...)` across sessions
-that use the offloader; pass a `MongoDBStorage` or one built with `prefix=` instead.
+tells the SDK it is already namespaced, so as a context manager `stash` it becomes the stash root, and
+`retrieve_context` can read any key under it. Give the stash a view of its own.
 
 ![What every memory write and read goes through: a write is stamped with scope and store name and deduplicated by content hash; a read passes the filter guard and is limited to the store's scope](https://raw.githubusercontent.com/mongodb/strands-mongodb/main/docs/images/memory-guards.png)
 
@@ -526,8 +564,8 @@ anywhere except the deployment you connected it to.
   the embedding model named by `embedding_model`, `voyage-4-lite` unless you set it. That is a call the
   deployment makes, not this package; the package only names the model in the index definition. The
   `text` tier sends nothing to a model.
-- **The manual path.** With `embedding_dimensions` and `similarity` set, no model sees your text through
-  this package. Whatever produces the vectors is yours, and runs where you run it.
+- **The manual path.** The deployment sends your text to no model. Your `embedder`, if any, sees each
+  memory and string query.
 
 On both paths `content` is stored in the deployment as written, and `MongoDBStorage` payloads are stored
 the same way. Processing region, storage location and retention, for the text and for any vectors, are
@@ -633,12 +671,10 @@ is visible only in your logs, so read the warnings.
 any operation: its collection has one ordinary index and no search index, so `ensure_indexes: False`
 there raises with the command for `strands_expires_at_ttl` and creates nothing.
 
-Waiting is bounded. `initialize()` polls a new search index every 0.5 s for up to 300 s per index, and
-past that the index counts as unavailable. Under a named `search_type` that raises `StorageError`, and
-calling `initialize()` again keeps waiting. Under `"auto"` the tier is skipped with a warning, as a
-missing one is, and the store tries it again on a later operation: first after 60 s, then after twice the
-previous delay each time it is still missing, up to an hour. A retry reads the index status and does not
-wait for a build, so it never holds up the operation that triggers it.
+Waiting is bounded. Under a named `search_type`, `initialize()` waits up to 300 s per index, then raises
+`StorageError`. Under `"auto"` it doesn't wait (it runs during `Agent` construction): building tiers are
+skipped, and the first `search` waits up to 300 s if none is ready. Skipped tiers are retried with
+backoff from 60 s up to an hour.
 
 ### Privileges
 
@@ -707,7 +743,7 @@ to the package: it is named so the value can be traced, not so it can be importe
 | Results per search | 10 by default. Raise `max_search_results` on the store, or `limit` on a single query. | `DEFAULT_MAX_SEARCH_RESULTS` |
 | Vector candidates considered | 10 per result requested. Raise `oversampling_factor` for recall, lower it for latency. | `DEFAULT_OVERSAMPLING_FACTOR` |
 | Vector candidates per query | 10000, the server's `numCandidates` ceiling. A `limit` times `oversampling_factor` above it raises `ValueError` before the query is sent. Lower one of the two. | `MAX_NUM_CANDIDATES` |
-| Waiting for a search index | 300 s per index. Past that, `initialize()` raises `StorageError` under a named `search_type`, and under `"auto"` skips the tier with a warning and tries it again later, from 60 s up to an hour apart. The index keeps building either way. Set `index_ready_timeout` to change it. | `READY_TIMEOUT_SECONDS` |
+| Waiting for a search index | 300 s per index. Set `index_ready_timeout` to change it. | `READY_TIMEOUT_SECONDS` |
 
 ## Observability
 

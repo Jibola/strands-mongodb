@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from typing_extensions import Unpack
 
     from ._indexes import SearchIndexSpec, VectorMode
-    from .types import MongoDBMemoryStoreConfig, MongoDBSearchQuery, ResolvedSearchType, SearchType
+    from .types import MongoDBMemoryStoreConfig, MongoDBSearchQuery, ResolvedSearchType, SearchType, TextEmbedder
 
 __all__ = ["DEFAULT_COLLECTION", "TIER_RETRY_MAX_SECONDS", "TIER_RETRY_SECONDS", "UNSCOPED", "MongoDBMemoryStore"]
 
@@ -126,6 +126,19 @@ _NO_TIER_PREPARED = (
     "each with the server's own reason."
 )
 """Raised under ``auto`` when no search tier could be prepared, after each failure was logged."""
+
+_EMBEDDER_ON_AUTO_EMBED = (
+    "strands_mongodb: 'embedder' is set, but this store is on the Atlas AutoEmbeddings path, where the "
+    "deployment embeds the text. Remove 'embedder', or set 'embedding_dimensions' and 'similarity' in the "
+    "connection config to embed client-side."
+)
+"""Raised at construction when an ``embedder`` would have nothing to embed for."""
+
+_EMBEDDER_DIMENSIONS = (
+    "strands_mongodb: the embedder returned a %d-dimension vector and 'embedding_dimensions' is %d. "
+    "Set 'embedding_dimensions' to the length the embedding model produces."
+)
+"""Raised when an ``embedder`` vector would be silently skipped by the index, or rejected by a query."""
 
 _BELOW_VECTOR = (
     "strands_mongodb: 'search_type' is 'auto' and the vector tier is not available on %s, so queries "
@@ -381,8 +394,8 @@ class MongoDBMemoryStore:
         ```
     """
 
-    # Satisfies `MemoryStore` structurally instead of inheriting it: inheriting a `Protocol` makes every
-    # member this class leaves out abstract, and mypy then refuses to instantiate it.
+    # Satisfies `MemoryStore` structurally. Older SDK releases declare the optional members without bodies,
+    # so inheriting the `Protocol` there would make the omitted ones abstract.
     #
     # `add_messages` is deliberately absent, not a stub. `AddMessagesContext` has no run-unique id to
     # deduplicate retried writes by, so the manager falls back to its own extractor, which writes through
@@ -406,8 +419,9 @@ class MongoDBMemoryStore:
                 configured ``filter`` names an operator key, a regex value or an undeclared path; if the
                 vector configuration selects two paths at once, sets only one of ``embedding_dimensions``
                 and ``similarity``, or gives either a value Atlas rejects; or if ``ttl_seconds`` is
-                negative. A ``ttl_seconds`` of ``0`` is accepted. Also raised by the driver for a
-                connection option it rejects, such as an out-of-range port.
+                negative. A ``ttl_seconds`` of ``0`` is accepted. Also raised if ``embedder`` is set on the
+                AutoEmbeddings path, and by the driver for a connection option it rejects, such as an
+                out-of-range port.
             pymongo.errors.ConfigurationError: If the driver cannot parse ``connection_string`` or
                 rejects a ``client_args`` key.
         """
@@ -447,6 +461,9 @@ class MongoDBMemoryStore:
         # Resolved here because both raise `ValueError` on a contradictory config, which should surface at
         # construction rather than inside the first `add` or `search`.
         self._mode: VectorMode = _indexes.vector_mode(connection)
+        self._embedder: TextEmbedder | None = config.get("embedder")
+        if self._embedder is not None and self._mode.auto_embed:
+            raise ValueError(_EMBEDDER_ON_AUTO_EMBED)
         vector_spec, text_spec = _indexes.memory_search_specs(connection)
         specs: tuple[tuple[ResolvedSearchType, SearchIndexSpec], ...] = (
             ("vector", vector_spec),
@@ -486,14 +503,14 @@ class MongoDBMemoryStore:
     async def initialize(self) -> None:
         """Probe the deployment and create this store's indexes.
 
-        ``add``, ``search``, ``delete`` and ``delete_all`` call this themselves, so callers need not
-        (``MemoryManager`` never does). It is idempotent and safe to call concurrently. After the first
-        call it returns at once, unless a search tier skipped under ``auto`` is due for a retry.
+        ``MemoryManager`` calls this while the ``Agent`` is constructed, and ``add``, ``search``,
+        ``delete`` and ``delete_all`` call it themselves. It is idempotent and safe to call concurrently.
+        After the first call it returns at once, unless a search tier skipped under ``auto`` is due for a
+        retry.
 
-        Under ``auto`` a tier that cannot be prepared (an index still building, say) is skipped with a
-        warning. A later call retries it after :data:`TIER_RETRY_SECONDS`, and the delay doubles up to
-        :data:`TIER_RETRY_MAX_SECONDS` while the tier stays missing. A retry never waits for a build, and
-        a retry that fails keeps the tiers the store already has.
+        Under ``auto`` this never waits for an index build: building tiers are skipped, and the first
+        ``search`` waits if none is ready. Missing tiers are retried with backoff. A named ``search_type``
+        waits for its index, up to ``index_ready_timeout``.
 
         On a deployment without Atlas Search this logs a warning, once per connection, and ``search``
         raises later. Writes still work there.
@@ -574,15 +591,15 @@ class MongoDBMemoryStore:
             )
 
             self._rank_fusion = capabilities.rank_fusion
+            # Don't wait for builds under `auto`: this holds the shared lock during Agent construction.
+            timeout = 0 if self._search_type == "auto" else self._index_ready_timeout
             self._tiers = (
-                await self._ensure_search_tiers(
-                    collection, rank_fusion=capabilities.rank_fusion, timeout=self._index_ready_timeout
-                )
+                await self._ensure_search_tiers(collection, rank_fusion=capabilities.rank_fusion, timeout=timeout)
                 if capabilities.search
                 else ()
             )
             if self._missing_a_tier(self._tiers):
-                self._tier_retry_at = time.monotonic() + self._tier_retry_delay
+                self._schedule_tier_retry()
 
             # The collation check above cannot verify a collection that does not exist yet. Creating the
             # indexes created it, so check again now: this block never runs again for this store, and this
@@ -598,8 +615,9 @@ class MongoDBMemoryStore:
     async def _retry_search_tiers(self) -> None:
         """Try the tiers ``initialize()`` skipped again, reading build status without waiting.
 
-        A retry that fails, or still finds a tier missing, keeps the tiers the store has and doubles the
-        delay before the next one, up to :data:`TIER_RETRY_MAX_SECONDS`.
+        A retry that fails, or still finds a tier missing, keeps the tiers the store has. While the store
+        has one, the delay before the next retry doubles, up to :data:`TIER_RETRY_MAX_SECONDS`; while it
+        has none, the next call retries.
         """
         try:
             tiers = await self._ensure_search_tiers(self._collection(), rank_fusion=self._rank_fusion, timeout=0)
@@ -608,11 +626,32 @@ class MongoDBMemoryStore:
         if tiers is not None:
             self._tiers = tiers
         if tiers is None or self._missing_a_tier(tiers):
-            self._tier_retry_delay = min(self._tier_retry_delay * 2, TIER_RETRY_MAX_SECONDS)
-            self._tier_retry_at = time.monotonic() + self._tier_retry_delay
+            if self._tiers:
+                self._tier_retry_delay = min(self._tier_retry_delay * 2, TIER_RETRY_MAX_SECONDS)
+            self._schedule_tier_retry()
         else:
             self._tier_retry_at = None
         _telemetry.annotate("strands_mongodb.search.tiers", ",".join(self._tiers))
+
+    def _can_search(self) -> bool:
+        """Whether the deployment has Atlas Search, from the cached capability probe."""
+        capabilities = self._connection.capabilities
+        return capabilities is not None and capabilities.search
+
+    async def _wait_for_a_tier(self) -> None:
+        """Wait, outside the connection's lock, for the tiers ``initialize()`` found still building."""
+        self._tiers = await self._ensure_search_tiers(
+            self._collection(), rank_fusion=self._rank_fusion, timeout=self._index_ready_timeout
+        )
+        if self._missing_a_tier(self._tiers):
+            self._schedule_tier_retry()
+        else:
+            self._tier_retry_at = None
+        _telemetry.annotate("strands_mongodb.search.tiers", ",".join(self._tiers))
+
+    def _schedule_tier_retry(self) -> None:
+        """Set when to retry a missing tier: on the next call while no tier can answer, else after the delay."""
+        self._tier_retry_at = time.monotonic() + (self._tier_retry_delay if self._tiers else 0)
 
     def _missing_a_tier(self, tiers: tuple[ResolvedSearchType, ...]) -> bool:
         """Whether ``auto`` skipped a configured tier, which is the only case a retry is for."""
@@ -638,14 +677,16 @@ class MongoDBMemoryStore:
 
         Returns:
             The tiers that can answer, in preference order. Hybrid first where it is on offer, then
-            vector, then text.
+            vector, then text. Empty under ``auto`` when no tier is ready and one is still building.
 
         Raises:
-            StorageError: If no tier could be prepared, if a named ``search_type``'s own tier failed, or if
-                ``search_type`` is ``"hybrid"`` and the deployment cannot run it.
+            StorageError: If no tier could be prepared and none is still building, if a named
+                ``search_type``'s own tier failed, or if ``search_type`` is ``"hybrid"`` and the deployment
+                cannot run it.
         """
         available: list[ResolvedSearchType] = []
         refused: StorageError | None = None
+        building = False
         for tier, spec in self._specs:
             try:
                 await _indexes.ensure(
@@ -665,9 +706,12 @@ class MongoDBMemoryStore:
                     extra=_telemetry.event_extra("tier_unavailable", namespace=self._target, tier=tier),
                 )
                 refused = error
+                building = building or isinstance(error, _indexes.SearchIndexNotReady)
                 continue
             available.append(tier)
 
+        if not available and building:
+            return ()
         if not available:
             # Chained to the last failure so the reason reaches callers who do not log at `WARNING`.
             raise StorageError(_NO_TIER_PREPARED % self._target) from refused
@@ -750,7 +794,8 @@ class MongoDBMemoryStore:
             with ``inserted=0`` and ``duplicates=1``.
 
         Raises:
-            ValueError: If this store is not writable. Raised before any network call.
+            ValueError: If this store is not writable, raised before any network call, or if ``embedder``
+                returns a vector whose length is not ``embedding_dimensions``.
             StorageError: If :meth:`initialize` fails, or if a driver call fails.
         """
         # Before `initialize()`, so a read-only store rejects a write without connecting or creating an index.
@@ -758,6 +803,8 @@ class MongoDBMemoryStore:
             raise ValueError(_NOT_WRITABLE % (self.name, "add()"))
 
         await self.initialize()
+        # Before the upsert, so a failed embedding stores nothing rather than a memory no vector search finds.
+        vector = await self._embed(content) if self._embedder is not None else None
 
         # These fields appear only in the upsert filter. The server copies a filter's equality fields onto
         # the inserted document, and naming them in the update as well would be a conflicting update. They
@@ -777,6 +824,8 @@ class MongoDBMemoryStore:
         # Nested, never merged into the root, so a caller's `{"scope": ...}` cannot write into another scope.
         if metadata:
             insert["metadata"] = dict(metadata)
+        if vector is not None:
+            insert[_indexes.VECTOR_FIELD] = vector
         # Derived from `created_at`, not a second clock read, so the two timestamps are exactly
         # `ttl_seconds` apart. In `$setOnInsert` too, so a duplicate does not extend the expiry.
         if self.ttl_seconds is not None:
@@ -870,6 +919,14 @@ class MongoDBMemoryStore:
         query_filter = _filter.compose(self.filter, caller_filter, scope=self.scope, store_name=self.name)
 
         await self.initialize()
+        if not self._tiers and self._can_search():
+            await self._wait_for_a_tier()
+        if self._embeds_query(query_text, query_vector):
+            assert query_text is not None
+            query_vector = await self._embed(query_text)
+            # Kept for hybrid, which feeds `text` to `$search`; anywhere else both keys would be refused.
+            if "hybrid" not in self._tiers:
+                query_text = None
         tier = self._pick_tier(query_text=query_text, query_vector=query_vector)
         _telemetry.annotate("strands_mongodb.search.tier", tier)
         if tier == "hybrid":
@@ -935,6 +992,20 @@ class MongoDBMemoryStore:
         results = self._within_bounds(scored)
         _telemetry.annotate("strands_mongodb.result_count", len(results))
         return results
+
+    def _embeds_query(self, query_text: str | None, query_vector: list[float] | None) -> bool:
+        """Whether ``search`` should embed ``query_text``: an ``embedder``, no caller vector, and a tier to use it."""
+        if self._embedder is None or query_text is None or query_vector is not None:
+            return False
+        return bool(self._tiers) and self._tiers[0] in ("hybrid", "vector")
+
+    async def _embed(self, text: str) -> list[float]:
+        """Embed ``text`` with the configured ``embedder`` and check the length against the index."""
+        assert self._embedder is not None
+        vector = [float(value) for value in await self._embedder.embed(text)]
+        if len(vector) != self._mode.dimensions:
+            raise ValueError(_EMBEDDER_DIMENSIONS % (len(vector), self._mode.dimensions))
+        return vector
 
     def _pick_tier(self, *, query_text: str | None, query_vector: list[float] | None) -> ResolvedSearchType:
         """Choose the first prepared tier, in preference order, that fits the query's keys.

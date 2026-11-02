@@ -26,7 +26,7 @@ except ImportError as error:
     missing_extra("storage", error, module=__name__)
 
 from pymongo.errors import PyMongoError
-from strands.storage.search.keyword import tokenize
+from strands.storage.search import KeywordSearchStrategy
 
 # Private in the SDK, but every shipped backend uses the same two normalizers: they make `a//b` and `a/b`
 # one key everywhere. A local copy that drifted would make keys collide on `LocalFileStorage` and not here.
@@ -35,11 +35,13 @@ from strands.types.exceptions import StorageError
 
 from . import _client, _indexes, _telemetry
 from ._indexes import EXPIRES_FIELD
+from .vector_search import MongoDBVectorSearchStrategy
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
 
     from pymongo.asynchronous.collection import AsyncCollection
+    from strands.storage.search import SearchStrategy
 
     from .types import MongoDBConfig
 
@@ -180,8 +182,8 @@ class MongoDBStorage:
     and trailing ``/`` are stripped, so ``a//b`` and ``/a/b/`` are the key ``a/b``. A key that is empty
     after that, or that contains a backslash or a ``..`` segment, raises ``StorageError``.
 
-    Every key operation (``write``, ``read``, ``delete``, ``list``, ``delete_prefix``, and ``search`` once
-    its query has tokens) and ``ensure_indexes`` raise ``StorageError`` if the collection's default
+    Every key operation (``write``, ``read``, ``delete``, ``list``, ``delete_prefix``, and the default
+    keyword ``search``) and ``ensure_indexes`` raise ``StorageError`` if the collection's default
     collation is not binary. Keys must compare byte by byte, or one prefix could read and delete another's
     documents.
 
@@ -205,6 +207,7 @@ class MongoDBStorage:
         collection: str = "storage",
         prefix: str = "",
         ttl_seconds: int | None = None,
+        search_strategy: SearchStrategy[MongoDBStorage] | None = None,
     ) -> None:
         """Create a storage over one collection.
 
@@ -222,6 +225,8 @@ class MongoDBStorage:
                 :meth:`ensure_indexes` once at startup, or run the ``createIndexes`` command in the
                 README's "Indexes and privileges" section. Documents written before the index exists
                 expire once it does.
+            search_strategy: What :meth:`search` runs. Defaults to the SDK's ``KeywordSearchStrategy``;
+                pass a :class:`MongoDBVectorSearchStrategy` for Atlas Vector Search.
 
         Raises:
             KeyError: If ``config`` has no ``database``. Mypy rejects a literal that omits it; this
@@ -243,12 +248,18 @@ class MongoDBStorage:
         normalized = _normalize_prefix(prefix).rstrip("/")
         self._prefix = f"{normalized}/" if normalized else ""
         self._ttl_seconds = ttl_seconds
+        self._search_strategy = search_strategy
         self._config = config
         # Only passed on to `_indexes.ensure`; read so a value set for a memory store is honoured here too.
         self._index_ready_timeout: float = config.get("index_ready_timeout", _indexes.READY_TIMEOUT_SECONDS)
         # Called only to fail fast on a config with no client or connection string. The result is
         # dropped: the registry is keyed by event loop, so each operation resolves its own connection.
         _client.resolve(config)
+
+    @property
+    def prefix(self) -> str:
+        """The normalized key prefix (ending in ``/``), or ``""`` when none was configured."""
+        return self._prefix
 
     @_telemetry.traced("storage", "write")
     @_reporting("writing")
@@ -265,8 +276,9 @@ class MongoDBStorage:
         Raises:
             StorageError: If the key is empty, contains a backslash or a ``..`` segment, exceeds
                 :data:`MAX_KEY_BYTES` with the prefix included, or would build a document over
-                :data:`MAX_DOCUMENT_BYTES`. Also if the collection's default collation is not binary, or
-                if the write fails, with the driver's error chained.
+                :data:`MAX_DOCUMENT_BYTES`. Also if the collection's default collation is not binary, if
+                the write fails, with the driver's error chained, or if the search strategy fails to index
+                the value (which is stored in that case).
         """
         await self._require_binary_keys()
         document_id = self._id_for(key)
@@ -288,6 +300,18 @@ class MongoDBStorage:
             document[EXPIRES_FIELD] = now + datetime.timedelta(seconds=self._ttl_seconds)
 
         await self._collection().replace_one({"_id": document_id}, document, upsert=True)
+
+        # `SearchStrategy` gained `index` in strands-agents 1.56.0; a strategy from an older release has none.
+        index = getattr(self._search_strategy, "index", None)
+        if index is None:
+            return
+        try:
+            await index(self, document_id[len(self._prefix) :], data)
+        except Exception as error:
+            raise StorageError(
+                f"strands_mongodb: wrote {_abbreviate(document_id)!r} in {self._target} but indexing it for "
+                f"search failed: {error}"
+            ) from error
 
     @_telemetry.traced("storage", "read")
     @_reporting("reading")
@@ -365,93 +389,31 @@ class MongoDBStorage:
     @_telemetry.traced("storage", "search")
     @_reporting("searching")
     async def search(self, query: str) -> builtins.list[StorageSearchResult]:
-        """Rank stored keys by how many of the query's tokens they contain.
+        """Rank stored values against ``query`` with the configured search strategy.
 
-        Scoring matches the SDK's ``KeywordSearchStrategy`` (token overlap), but **only keys are
-        scored, not payloads**: a word that appears only inside stored data does not match. In
-        exchange the search is one server-side aggregation that reads no documents, where the SDK's
-        default reads every payload.
 
         Args:
-            query: A natural-language string. One that tokenizes to nothing returns ``[]`` without a
-                round trip.
+            query: A natural-language string.
 
         Returns:
-            Matched keys with relevance scores, highest first, ties in ascending key order. ``data`` is
-            ``None``; the SDK's consumer reads back only the keys it keeps.
+            Matched keys relative to this instance's prefix, best first, with the stored bytes as
+            ``data``.
 
         Raises:
-            StorageError: If the query has tokens and the collection's default collation is not binary,
-                or if the aggregation fails, including part way through draining the cursor.
+            StorageError: If the collection's default collation is not binary, if a driver call fails, or
+                if the search strategy raises, with its error chained.
         """
-        tokens = tokenize(query)
-        if not tokens:
-            # Same short circuit as `KeywordSearchStrategy`: scoring every key zero would cost a full scan.
-            return []
-        # After the short circuit, so an empty query costs no round trip at all.
-        await self._require_binary_keys()
-        cursor = await self._collection().aggregate(self._search_pipeline(tokens))
-        offset = len(self._prefix)
-        results = [
-            StorageSearchResult(key=str(document["_id"])[offset:], score=float(document["score"]))
-            async for document in cursor
-        ]
+        if self._search_strategy is None:
+            results = await KeywordSearchStrategy().search(self, query)
+        else:
+            try:
+                results = await self._search_strategy.search(self, query)
+            except (StorageError, PyMongoError):
+                raise
+            except Exception as error:
+                raise StorageError(f"strands_mongodb: searching in {self._target} failed: {error}") from error
         _telemetry.annotate("strands_mongodb.result_count", len(results))
         return results
-
-    def _search_pipeline(self, tokens: set[str]) -> builtins.list[dict[str, Any]]:
-        """Build the pipeline ``search`` sends. Separate so a test can ``explain`` it.
-
-        Args:
-            tokens: The already-tokenized query. Sorted on the way in so the same question always
-                produces one plan-cache shape.
-
-        Returns:
-            The pipeline. The range ``$match`` is omitted when this instance has no prefix, since an empty
-            ``$match`` is still a stage to run.
-        """
-        stages: builtins.list[dict[str, Any]] = []
-        # Bounded by the instance prefix (not the query, which is prose). This makes the scan a covered
-        # IXSCAN on `_id_` instead of a COLLSCAN.
-        instance_range = self._range_for("")
-        if instance_range:
-            stages.append({"$match": instance_range})
-        # Score the key the caller wrote, without this instance's prefix, as the SDK's backends do.
-        # Cut by code point, which is how `len` counts the prefix.
-        key: Any = {"$substrCP": ["$_id", len(self._prefix), {"$strLenCP": "$_id"}]} if self._prefix else "$_id"
-        stages.append(
-            {
-                "$project": {
-                    "score": {
-                        "$size": {
-                            "$setIntersection": [
-                                {
-                                    "$map": {
-                                        # Not `\w+`: MongoDB's `\w` is ASCII-only, so `münchen` would split
-                                        # into `m` and `nchen` and `日本語` would vanish. The SDK tokenizer
-                                        # uses Python's Unicode `\w`, which is exactly this class (letters,
-                                        # digits and `_`).
-                                        "input": {
-                                            "$regexFindAll": {
-                                                "input": {"$toLower": key},
-                                                "regex": r"[\p{L}\p{N}_]+",
-                                            }
-                                        },
-                                        "in": "$$this.match",
-                                    }
-                                },
-                                sorted(tokens),
-                            ]
-                        }
-                    }
-                }
-            }
-        )
-        stages.append({"$match": {"score": {"$gt": 0}}})
-        # A blocking sort, unavoidably, since `score` is computed above. `_id` breaks ties, matching what
-        # the SDK's stable sort gives over an already-sorted listing.
-        stages.append({"$sort": {"score": -1, "_id": 1}})
-        return stages
 
     @_telemetry.traced("storage", "delete_prefix")
     @_reporting("deleting the prefix")
@@ -487,7 +449,7 @@ class MongoDBStorage:
             prefix: Prefix to prepend to every key, appended to any prefix already in force.
 
         Returns:
-            A new instance sharing this one's connection pool, collection and TTL.
+            A new instance sharing this one's connection pool, collection, TTL and search strategy.
 
         Raises:
             StorageError: If ``prefix`` contains a backslash or a ``..`` segment.
@@ -500,6 +462,7 @@ class MongoDBStorage:
             # `__init__` normalizes, so a leading slash here does not produce an empty path segment.
             prefix=f"{self._prefix}{prefix}",
             ttl_seconds=self._ttl_seconds,
+            search_strategy=self._search_strategy,
         )
         # The SDK reads this sentinel to tell that a storage is already scoped. Without it, memory keys
         # would land one level deeper here than on `LocalFileStorage`.
@@ -511,7 +474,8 @@ class MongoDBStorage:
         """Create the TTL index that makes ``ttl_seconds`` take effect, or verify it exists.
 
         The index is ``strands_expires_at_ttl`` over ``expires_at`` with ``expireAfterSeconds: 0``.
-        Without it, documents get an ``expires_at`` stamp but are never deleted.
+        Without it, documents get an ``expires_at`` stamp but are never deleted. Also creates a
+        :class:`MongoDBVectorSearchStrategy`'s vector index.
 
         **Nothing in this package calls this method.** An ``Agent`` builds its storage in code the
         operator does not see, and index creation there could run without the rights for it. Call it once
@@ -527,16 +491,19 @@ class MongoDBStorage:
         Raises:
             StorageError: If the collection's default collation is not binary, if an index over the same
                 keys exists with different options, if the index is absent and ``ensure_indexes`` is
-                ``False``, or if a driver call fails. The server's own code and message arrive chained.
+                ``False``, if the vector index build fails or does not finish in time, or if a driver
+                call fails. The server's own code and message arrive chained.
         """
         # The collation does not affect a TTL index, but a collection that cannot hold this key space is
         # not worth provisioning: it would only fail at its first write.
         await self._require_binary_keys()
         # No `@_reporting`: there is no key argument for its message, and `_indexes.ensure` already turns
         # driver errors into `StorageError`.
+        strategy = self._search_strategy
         await _indexes.ensure(
             self._collection(),
             ordinary=_indexes.storage_specs(),
+            search=(strategy.index_spec(),) if isinstance(strategy, MongoDBVectorSearchStrategy) else (),
             create=self._config.get("ensure_indexes", True),
             timeout=self._index_ready_timeout,
         )
