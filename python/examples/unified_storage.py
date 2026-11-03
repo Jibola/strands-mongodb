@@ -17,8 +17,8 @@ MongoDB: each top-level prefix with its document count and byte total. The resum
 process, restores the session from session/ and prints how many messages came back.
 
 The memory/ documents are not vector memory. Storage holds opaque bytes under a string key, and on this
-backend FileMemoryStore recalls by token overlap. MongoDBMemoryStore,
-shown in memory_recall.py, uses a separate collection with typed fields and a vector index.
+backend FileMemoryStore recalls by token overlap over the keys alone. MongoDBMemoryStore, shown in
+memory_recall.py, uses a separate collection with typed fields and a vector index.
 
 Needs MONGODB_URI. Any MongoDB deployment works; Atlas Search is not needed. Pass --dry-run to see what
 a step would do without connecting.
@@ -247,8 +247,8 @@ async def resume(arguments: Any, uri: str) -> dict[str, Any]:
         census = await census_lines(arguments, uri)
         say(
             "on the memory/ prefix: Storage moves opaque bytes under a string key, and FileMemoryStore "
-            "recall is token overlap, with no notion of meaning. "
-            "MongoDBMemoryStore is a different collection with typed fields "
+            "recall is token overlap over that key space, so it matches file names and "
+            "not the text inside them. MongoDBMemoryStore is a different collection with typed fields "
             "and a vector index. See memory_recall.py for that one."
         )
 

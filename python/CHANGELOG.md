@@ -25,8 +25,6 @@ version heading when that version is tagged.
 
 ### Changed
 
-- `MongoDBStorage.search` defaults to the SDK's `KeywordSearchStrategy`, which also scores payloads, so
-  `FileMemoryStore` recalls by body text.
 - Under `search_type="auto"`, `initialize()` no longer waits for index builds; the first `search` does.
 - Examples use `context_manager="auto"` instead of `ContextOffloader`.
 

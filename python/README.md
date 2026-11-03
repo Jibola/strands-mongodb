@@ -377,7 +377,14 @@ The config comes first and positionally, and can be the same object a memory sto
 | `collection` | `str` | `storage` | Collection holding this instance's documents. |
 | `prefix` | `str` | `""` | Prepended to every key, scoping this instance inside the collection. Normalized to end in one `/`. |
 | `ttl_seconds` | `int \| None` | `None` | Lifetime of the documents this instance writes. Needs the TTL index; see Limits. A negative value raises `ValueError`. |
-| `search_strategy` | `SearchStrategy \| None` | `None` | What `search()` runs. Defaults to the SDK's `KeywordSearchStrategy`, which reads every value under the prefix. Shared by `namespace()` views. |
+| `search_strategy` | `SearchStrategy \| None` | `None` | What `search()` runs instead of the default key-only scan. Shared by `namespace()` views. |
+
+#### Searching storage
+
+By default `search()` scores keys only, in one server-side query that reads no values. A word that is
+only inside a value doesn't match, and `FileMemoryStore` keeps its facts there, under keys named after
+their topic. For `FileMemoryStore`, pass a strategy that reads values: the SDK's
+`KeywordSearchStrategy()` matches shared words, and the vector strategy below matches by meaning.
 
 #### Vector search over storage
 

@@ -26,7 +26,7 @@ except ImportError as error:
     missing_extra("storage", error, module=__name__)
 
 from pymongo.errors import PyMongoError
-from strands.storage.search import KeywordSearchStrategy
+from strands.storage.search.keyword import tokenize
 
 # Private in the SDK, but every shipped backend uses the same two normalizers: they make `a//b` and `a/b`
 # one key everywhere. A local copy that drifted would make keys collide on `LocalFileStorage` and not here.
@@ -182,8 +182,8 @@ class MongoDBStorage:
     and trailing ``/`` are stripped, so ``a//b`` and ``/a/b/`` are the key ``a/b``. A key that is empty
     after that, or that contains a backslash or a ``..`` segment, raises ``StorageError``.
 
-    Every key operation (``write``, ``read``, ``delete``, ``list``, ``delete_prefix``, and the default
-    keyword ``search``) and ``ensure_indexes`` raise ``StorageError`` if the collection's default
+    Every key operation (``write``, ``read``, ``delete``, ``list``, ``delete_prefix``, and ``search`` once
+    its query has tokens) and ``ensure_indexes`` raise ``StorageError`` if the collection's default
     collation is not binary. Keys must compare byte by byte, or one prefix could read and delete another's
     documents.
 
@@ -225,8 +225,8 @@ class MongoDBStorage:
                 :meth:`ensure_indexes` once at startup, or run the ``createIndexes`` command in the
                 README's "Indexes and privileges" section. Documents written before the index exists
                 expire once it does.
-            search_strategy: What :meth:`search` runs. Defaults to the SDK's ``KeywordSearchStrategy``;
-                pass a :class:`MongoDBVectorSearchStrategy` for Atlas Vector Search.
+            search_strategy: What :meth:`search` runs instead of the default key-only scan, such as the
+                SDK's ``KeywordSearchStrategy`` or a :class:`MongoDBVectorSearchStrategy`.
 
         Raises:
             KeyError: If ``config`` has no ``database``. Mypy rejects a literal that omits it; this
@@ -389,31 +389,105 @@ class MongoDBStorage:
     @_telemetry.traced("storage", "search")
     @_reporting("searching")
     async def search(self, query: str) -> builtins.list[StorageSearchResult]:
-        """Rank stored values against ``query`` with the configured search strategy.
+        """Rank stored keys by how many of the query's tokens they contain, unless ``search_strategy`` is set.
 
+        Scoring matches the SDK's ``KeywordSearchStrategy`` (token overlap), but **only keys are
+        scored, not payloads**: a word that appears only inside stored data does not match. In
+        exchange the search is one server-side aggregation that reads no documents, where the SDK's
+        default reads every payload. ``FileMemoryStore`` keeps facts in payloads, so give it a
+        ``search_strategy``.
 
         Args:
-            query: A natural-language string.
+            query: A natural-language string. One that tokenizes to nothing returns ``[]`` without a
+                round trip.
 
         Returns:
-            Matched keys relative to this instance's prefix, best first, with the stored bytes as
-            ``data``.
+            Matched keys with relevance scores, highest first, ties in ascending key order. ``data`` is
+            ``None``; the SDK's consumer reads back only the keys it keeps. A ``search_strategy``'s
+            results are returned as it gives them.
 
         Raises:
-            StorageError: If the collection's default collation is not binary, if a driver call fails, or
-                if the search strategy raises, with its error chained.
+            StorageError: If the query has tokens and the collection's default collation is not binary,
+                if the aggregation fails, including part way through draining the cursor, or if the
+                search strategy raises, with its error chained.
         """
-        if self._search_strategy is None:
-            results = await KeywordSearchStrategy().search(self, query)
-        else:
+        if self._search_strategy is not None:
             try:
                 results = await self._search_strategy.search(self, query)
             except (StorageError, PyMongoError):
                 raise
             except Exception as error:
                 raise StorageError(f"strands_mongodb: searching in {self._target} failed: {error}") from error
+            _telemetry.annotate("strands_mongodb.result_count", len(results))
+            return results
+        tokens = tokenize(query)
+        if not tokens:
+            # Same short circuit as `KeywordSearchStrategy`: scoring every key zero would cost a full scan.
+            return []
+        # After the short circuit, so an empty query costs no round trip at all.
+        await self._require_binary_keys()
+        cursor = await self._collection().aggregate(self._search_pipeline(tokens))
+        offset = len(self._prefix)
+        results = [
+            StorageSearchResult(key=str(document["_id"])[offset:], score=float(document["score"]))
+            async for document in cursor
+        ]
         _telemetry.annotate("strands_mongodb.result_count", len(results))
         return results
+
+    def _search_pipeline(self, tokens: set[str]) -> builtins.list[dict[str, Any]]:
+        """Build the pipeline ``search`` sends. Separate so a test can ``explain`` it.
+
+        Args:
+            tokens: The already-tokenized query. Sorted on the way in so the same question always
+                produces one plan-cache shape.
+
+        Returns:
+            The pipeline. The range ``$match`` is omitted when this instance has no prefix, since an empty
+            ``$match`` is still a stage to run.
+        """
+        stages: builtins.list[dict[str, Any]] = []
+        # Bounded by the instance prefix (not the query, which is prose). This makes the scan a covered
+        # IXSCAN on `_id_` instead of a COLLSCAN.
+        instance_range = self._range_for("")
+        if instance_range:
+            stages.append({"$match": instance_range})
+        # Score the key the caller wrote, without this instance's prefix, as the SDK's backends do.
+        # Cut by code point, which is how `len` counts the prefix.
+        key: Any = {"$substrCP": ["$_id", len(self._prefix), {"$strLenCP": "$_id"}]} if self._prefix else "$_id"
+        stages.append(
+            {
+                "$project": {
+                    "score": {
+                        "$size": {
+                            "$setIntersection": [
+                                {
+                                    "$map": {
+                                        # Not `\w+`: MongoDB's `\w` is ASCII-only, so `münchen` would split
+                                        # into `m` and `nchen` and `日本語` would vanish. The SDK tokenizer
+                                        # uses Python's Unicode `\w`, which is exactly this class (letters,
+                                        # digits and `_`).
+                                        "input": {
+                                            "$regexFindAll": {
+                                                "input": {"$toLower": key},
+                                                "regex": r"[\p{L}\p{N}_]+",
+                                            }
+                                        },
+                                        "in": "$$this.match",
+                                    }
+                                },
+                                sorted(tokens),
+                            ]
+                        }
+                    }
+                }
+            }
+        )
+        stages.append({"$match": {"score": {"$gt": 0}}})
+        # A blocking sort, unavoidably, since `score` is computed above. `_id` breaks ties, matching what
+        # the SDK's stable sort gives over an already-sorted listing.
+        stages.append({"$sort": {"score": -1, "_id": 1}})
+        return stages
 
     @_telemetry.traced("storage", "delete_prefix")
     @_reporting("deleting the prefix")

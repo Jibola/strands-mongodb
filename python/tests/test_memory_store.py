@@ -567,7 +567,13 @@ class TestNoRegexTierIsReachable:
     """
 
     def test_no_module_emits_a_regex_match_operator(self) -> None:
-        """Every ``$regex``-family token in the package, from string literals only. There are none."""
+        """Every ``$regex``-family token in the package, from string literals only.
+
+        ``$regexFindAll`` is allowed and is not this tier. It is an aggregation *expression* over ``_id``
+        in ``MongoDBStorage``'s keyword search, tokenizing a stored key rather than matching a caller's
+        query, and it takes no caller input at all. The next test pins where it lives so the allowance
+        cannot quietly widen.
+        """
         found = {
             token
             for source in _package_sources().values()
@@ -575,7 +581,17 @@ class TestNoRegexTierIsReachable:
             for token in re.findall(r"\$regex[A-Za-z]*", literal)
         }
 
-        assert found == set(), found
+        assert found <= {"$regexFindAll"}, found
+
+    def test_the_one_allowed_regex_expression_stays_where_it_is(self) -> None:
+        """``$regexFindAll`` in ``storage.py`` and nowhere else, least of all on a memory query path."""
+        modules = {
+            name
+            for name, source in _package_sources().items()
+            if any("$regexFindAll" in literal for literal in _string_literals(source))
+        }
+
+        assert modules == {"storage.py"}
 
     def test_no_module_emits_a_text_search_operator(self) -> None:
         """``$text`` is the other half of the deferred no-mongot tier, so it is the other half of the wire.

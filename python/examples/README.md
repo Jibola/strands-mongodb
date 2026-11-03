@@ -103,7 +103,8 @@ with a document count and a byte total. The census is read back from MongoDB wit
 messages came back.
 
 One thing the key names invite you to get wrong: the `memory/` documents are **not** vector memory.
-`FileMemoryStore`'s recall is token overlap, with no notion of meaning. `MongoDBMemoryStore` is a different
+`Storage` moves opaque bytes under a string key, and `FileMemoryStore`'s recall is token overlap over the
+key space, so it matches file names rather than the text inside them. `MongoDBMemoryStore` is a different
 collection with typed fields and a vector index on it. That is what `memory_recall.py` shows.
 
 `--session-id` gives a run its own session.
