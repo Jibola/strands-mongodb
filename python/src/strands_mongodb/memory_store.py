@@ -591,7 +591,8 @@ class MongoDBMemoryStore:
             )
 
             self._rank_fusion = capabilities.rank_fusion
-            # Don't wait for builds under `auto`: this holds the shared lock during Agent construction.
+            # `auto` can answer from another tier and retries skipped ones later, so it skips
+            # indexes still building rather than block Agent construction under the connection lock.
             timeout = 0 if self._search_type == "auto" else self._index_ready_timeout
             self._tiers = (
                 await self._ensure_search_tiers(collection, rank_fusion=capabilities.rank_fusion, timeout=timeout)
