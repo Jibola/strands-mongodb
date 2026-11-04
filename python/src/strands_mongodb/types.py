@@ -8,7 +8,7 @@ client injected through the config dict, and an ``add`` result as a ``@dataclass
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 
 from typing_extensions import Required, TypedDict
 
@@ -36,6 +36,7 @@ __all__ = [
     "RESERVED_METADATA_KEYS",
     "ResolvedSearchType",
     "SearchType",
+    "TextEmbedder",
     "VectorSimilarity",
 ]
 
@@ -132,6 +133,17 @@ class MongoDBConfig(TypedDict, total=False):
     text_index_name: str
 
 
+class TextEmbedder(Protocol):
+    """What this package needs from an embedder. The SDK's ``strands.storage.search.Embedder`` satisfies it.
+
+    A protocol rather than that class so both extras keep working on SDK releases that predate it.
+    """
+
+    async def embed(self, text: str) -> list[float]:
+        """Return the embedding of ``text``."""
+        ...
+
+
 class MongoDBMemoryStoreConfig(MemoryStoreConfig, total=False):
     """Full configuration for a ``MongoDBMemoryStore``, passed as its constructor keyword arguments.
 
@@ -166,6 +178,7 @@ class MongoDBMemoryStoreConfig(MemoryStoreConfig, total=False):
             only, so re-adding a fact the store already holds does not extend its expiry. ``initialize()``
             creates the ``strands_expires_at_ttl`` index, so no separate ``ensure_indexes()`` call is
             needed, unlike ``MongoDBStorage``.
+        embedder: Manual-vector path only: embeds memories on ``add`` and string queries on ``search``.
     """
 
     config: Required[MongoDBConfig]
@@ -175,6 +188,7 @@ class MongoDBMemoryStoreConfig(MemoryStoreConfig, total=False):
     min_score: float
     max_score: float
     ttl_seconds: int
+    embedder: TextEmbedder
 
 
 class MongoDBSearchQuery(TypedDict, total=False):

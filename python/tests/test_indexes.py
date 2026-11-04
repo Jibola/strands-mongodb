@@ -2710,12 +2710,14 @@ class TestEveryCallSitePassesTheConfiguredBudget:
                     found.append((path.name, node.lineno, {kw.arg for kw in node.keywords if kw.arg}))
         return found
 
-    def test_the_call_sites_are_the_three_the_requirement_names(self) -> None:
+    def test_the_call_sites_are_the_four_the_package_has(self) -> None:
         """A guard on the guard. If this fails the package grew or lost a call site, and the test below
         is either checking something new or has quietly stopped checking anything."""
         by_module = [module for module, _, _ in self._ensure_calls()]
 
-        assert by_module == ["memory_store.py", "memory_store.py", "storage.py"], self._ensure_calls()
+        assert by_module == ["memory_store.py", "memory_store.py", "memory_store.py", "storage.py"], (
+            self._ensure_calls()
+        )
 
     def test_every_call_site_passes_a_timeout(self) -> None:
         missing = [(module, line) for module, line, keywords in self._ensure_calls() if "timeout" not in keywords]

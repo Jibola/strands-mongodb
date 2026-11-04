@@ -77,6 +77,7 @@ LogEvent = Literal[
     "reserved_key_collision",
     "no_search_setup",
     "tier_unavailable",
+    "tier_building",
     "below_vector",
     "bound_declined_fusion",
     "score_bound_applied",

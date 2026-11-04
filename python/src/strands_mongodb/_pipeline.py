@@ -22,7 +22,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Final
 
 from strands_mongodb._extras import missing_extra
-from strands_mongodb._indexes import CONTENT_FIELD, VECTOR_FIELD
+from strands_mongodb._indexes import CONTENT_FIELD, MAX_NUM_CANDIDATES, VECTOR_FIELD
 from strands_mongodb.types import DEFAULT_OVERSAMPLING_FACTOR
 
 try:
@@ -58,13 +58,6 @@ It sets the scale of every hybrid score. A fused score is the sum, over the tier
 of ``weight / (rank + 60)``. A document first in one tier scores about ``1/61`` (0.016) and one first in
 both about 0.033, while cosine similarity and BM25 land roughly between 0 and 1. A ``min_score`` chosen
 for those scales empties every hybrid result. The config docstring and the README quote this constant.
-"""
-
-MAX_NUM_CANDIDATES: Final[int] = 10000
-"""Upper bound the server enforces on ``numCandidates``.
-
-Outside ``[1..10000]`` the server returns code 8, *"numCandidates" must be within bounds [1..10000]*
-(measured on mongot 8.3.8). An integration test re-reads it from a real deployment.
 """
 
 VECTOR_SCORE_META: Final[str] = "vectorSearchScore"

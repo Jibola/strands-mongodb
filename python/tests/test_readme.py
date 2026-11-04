@@ -34,6 +34,7 @@ password gets published.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import inspect
 import json
@@ -41,11 +42,14 @@ import os
 import re
 import subprocess
 import sys
+import time
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, get_args
 
 import pytest
+from conftest import skip_if_search_is_unreachable
 from pymongo import AsyncMongoClient, monitoring
 from pymongo.auth import MECHANISMS
 from pymongo.errors import OperationFailure
@@ -1147,13 +1151,14 @@ class TestTheManualVectorPathIsDocumentedAtItsRealWidth:
             f"_indexes.VECTOR_FIELD makes the index cover"
         )
 
-    def test_the_readme_says_the_package_never_produces_a_vector(self) -> None:
+    def test_the_readme_says_what_writes_the_vector(self) -> None:
         """AT-128 -- the statement itself, read as separate clauses rather than one sentence."""
         section = _marked_section("manual-vectors").lower()
         for clause, phrases in (
             ("that this package indexes and queries the field", ("index", "quer")),
-            ("that this package never produces a vector", ("never",)),
-            ("that writing the field is the caller's", ("you", "caller")),
+            ("that an `embedder` produces the vectors", ("`embedder`",)),
+            ("that without one this package never produces a vector", ("never",)),
+            ("that writing the field is then the caller's", ("you", "caller")),
         ):
             assert any(phrase in section for phrase in phrases), f"the manual-vector passage does not state {clause}"
 
@@ -1537,3 +1542,88 @@ class TestTheObservabilitySectionMatchesTheCode:
         assert missing == [], f"the observability section does not name the log events {missing}"
         for field in ("strands_mongodb_event", "strands_mongodb_namespace", "strands_mongodb_tier"):
             assert f"`{field}`" in section, field
+
+
+_VOYAGE_WORDS = ("dark", "mode", "coffee", "tea")
+
+
+class _FakeVoyageClient:
+    """Stands in for ``voyageai.AsyncClient``: bag-of-words vectors at the README's 1024 dimensions."""
+
+    calls: list[tuple[list[str], str | None]] = []
+
+    async def embed(self, texts: list[str], model: str | None = None, **kwargs: Any) -> Any:
+        self.calls.append((texts, model))
+        vectors = []
+        for text in texts:
+            words = text.lower().split()
+            vectors.append([0.01 + words.count(word) for word in _VOYAGE_WORDS] + [0.01] * 1020)
+        return types.SimpleNamespace(embeddings=vectors)
+
+
+def _voyage_block() -> Block:
+    """Return the README block that defines ``VoyageEmbedder``."""
+    blocks = [block for block in _PACKAGE_BLOCKS if "class VoyageEmbedder" in block.body]
+    assert len(blocks) == 1, f"expected one block defining VoyageEmbedder in {_PACKAGE_README.name}"
+    return blocks[0]
+
+
+def _exec_voyage_block(monkeypatch: pytest.MonkeyPatch, connection: dict[str, Any]) -> dict[str, Any]:
+    """Execute the block with ``voyageai`` stubbed, returning its namespace."""
+    _FakeVoyageClient.calls = []
+    monkeypatch.setitem(sys.modules, "voyageai", types.SimpleNamespace(AsyncClient=_FakeVoyageClient))
+    namespace: dict[str, Any] = {"connection": connection, "MongoDBMemoryStore": MongoDBMemoryStore}
+    exec(_voyage_block().body, namespace)  # noqa: S102 - the README's own snippet
+    return namespace
+
+
+class TestTheVoyageEmbedderSnippet:
+    """The ``VoyageEmbedder`` the README defines is an embedder the store accepts."""
+
+    async def test_it_embeds_one_text_with_the_named_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        namespace = _exec_voyage_block(monkeypatch, {"connection_string": "mongodb://localhost:1", "database": "d"})
+        store = namespace["store"]
+
+        pending = store._embedder.embed("dark mode")
+        assert inspect.isawaitable(pending)
+        vector = await pending
+
+        assert len(vector) == store._mode.dimensions
+        assert all(isinstance(value, float) for value in vector)
+        assert _FakeVoyageClient.calls == [(["dark mode"], "voyage-4-lite")]
+
+    def test_it_calls_the_real_client_as_it_is_shaped(self) -> None:
+        voyageai = pytest.importorskip("voyageai")
+        embed = voyageai.AsyncClient.embed
+
+        assert inspect.iscoroutinefunction(embed)
+        assert list(inspect.signature(embed).parameters)[1:3] == ["texts", "model"]
+        assert "embeddings" in vars(voyageai.object.embeddings.EmbeddingsObject())
+
+    @pytest.mark.integration
+    async def test_its_store_finds_a_memory_by_meaning(
+        self, monkeypatch: pytest.MonkeyPatch, atlas_uri: str, test_database_name: str
+    ) -> None:
+        database = f"{test_database_name}_voyage"
+        namespace = _exec_voyage_block(monkeypatch, {"connection_string": atlas_uri, "database": database})
+        store: MongoDBMemoryStore = namespace["store"]
+        try:
+            await store.add("the user prefers dark mode")
+            await store.add("the user drinks coffee and tea")
+
+            found: list[Any] = []
+            deadline = time.monotonic() + 60
+            while len(found) < 2 and time.monotonic() < deadline:
+                try:
+                    found = list(await store.search("dark mode"))
+                except StorageError as error:
+                    skip_if_search_is_unreachable(error)
+                    raise
+                await asyncio.sleep(0.5)
+
+            assert [entry.content for entry in found][:1] == ["the user prefers dark mode"]
+        finally:
+            await store.close()
+            client: AsyncMongoClient[Any] = AsyncMongoClient(atlas_uri)
+            await client.drop_database(database)
+            await client.close()

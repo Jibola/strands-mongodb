@@ -90,7 +90,7 @@ class TestMemoryStoreConfigExtendsTheSdkConfig:
         assert set(MemoryStoreConfig.__annotations__) <= set(MongoDBMemoryStoreConfig.__annotations__)
 
     def test_it_adds_the_documented_mongodb_fields(self) -> None:
-        """The seven fields beyond the SDK's, named so a rename is deliberate.
+        """The eight fields beyond the SDK's, named so a rename is deliberate.
 
         Widening this set is the expected way for the config to grow, and the assertion is written as
         equality anyway, so a new field is a line in a diff rather than something a reviewer has to notice
@@ -98,7 +98,16 @@ class TestMemoryStoreConfigExtendsTheSdkConfig:
         """
         added = set(MongoDBMemoryStoreConfig.__annotations__) - set(MemoryStoreConfig.__annotations__)
 
-        assert added == {"config", "collection", "scope", "filter", "min_score", "max_score", "ttl_seconds"}
+        assert added == {
+            "config",
+            "collection",
+            "scope",
+            "filter",
+            "min_score",
+            "max_score",
+            "ttl_seconds",
+            "embedder",
+        }
 
     def test_mypy_requires_both_name_and_config(
         self, run_mypy: Callable[[str], subprocess.CompletedProcess[str]]
@@ -439,6 +448,7 @@ class TestTheModuleDeclaresItsSurface:
             "RESERVED_METADATA_KEYS",
             "ResolvedSearchType",
             "SearchType",
+            "TextEmbedder",
             "VectorSimilarity",
         ]
 

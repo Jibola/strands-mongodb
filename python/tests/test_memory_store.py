@@ -1279,6 +1279,7 @@ class _SetupRecorder:
             ``None`` for a call that passed none, which is the failure
             ``TestTheIndexReadyBudgetComesFromTheConfig`` exists to catch.
         failing: Index names to refuse.
+        building: Index names to report as still building, as ``ensure`` does when ``timeout`` runs out.
         available: What the capability probe answers.
         rank_fusion: What the ``$rankFusion`` probe answers.
         fusion_probes: The collection name for each ``$rankFusion`` probe. Separate from ``probes``
@@ -1305,6 +1306,7 @@ class _SetupRecorder:
     ) -> None:
         self.rank_fusion = rank_fusion
         self.refuse_collation = refuse_collation
+        self.building: set[str] = set()
         self.absent_until_provisioned = absent_until_provisioned
         self.collations: list[str] = []
         self.fusion_probes: list[str] = []
@@ -1406,6 +1408,8 @@ class _SetupRecorder:
         for spec in search:
             if spec.name in self.failing:
                 raise StorageError(f"strands_mongodb: creating {spec.name} failed: {_PRETEND_REASON}")
+            if spec.name in self.building:
+                raise _indexes.SearchIndexNotReady(f"strands_mongodb: {spec.name} is still building")
             self.search.append(spec.name)
 
 
@@ -1459,38 +1463,306 @@ def _patch_setup(
 class TestTheIndexReadyBudgetComesFromTheConfig:
     """AT-126 — the memory store's half of one config key, at both call sites.
 
-    ``initialize()`` calls ``_indexes.ensure`` once for the ordinary specs and once per search tier, and
-    only the search calls wait on anything. That asymmetry is the trap: a change that threads the key
-    through the call that obviously needs it leaves the other one on the module default, and nothing
-    observable differs until somebody raises the budget and finds half of it ignored. Both calls are
-    asserted here, and ``test_indexes.py`` asserts that the set of call sites is the set checked.
+    ``initialize()`` calls ``_indexes.ensure`` once for the ordinary specs and once per search tier. The
+    ordinary call always carries the configured budget. The search calls carry it only for a named
+    ``search_type``; under ``auto`` they carry ``0``, so constructing an ``Agent`` never waits on a build.
 
     The default case matters as much as the override. The module constant is the one default, and a
     store that read the key with a hard-coded fallback of its own would keep a second number alive in a
     second place.
     """
 
-    async def test_every_call_carries_the_configured_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("search_type", ["text", "vector"])
+    async def test_a_named_tier_carries_the_configured_budget_on_every_call(
+        self, monkeypatch: pytest.MonkeyPatch, search_type: str
+    ) -> None:
+        recorder = _patch_setup(monkeypatch)
+        store = _store(config=_connection_config(index_ready_timeout=7, search_type=search_type))
+
+        await store.initialize()
+
+        assert recorder.timeouts == [7, 7]
+
+    async def test_auto_waits_only_on_the_ordinary_indexes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AT-242. The search calls read build status and return, under the shared connection lock."""
         recorder = _patch_setup(monkeypatch)
         store = _store(config=_connection_config(index_ready_timeout=7))
 
         await store.initialize()
 
-        # One ordinary call plus one per search tier, all of them carrying the caller's number rather
-        # than the module's. `set` rather than a positional check: which tiers run is
-        # `TestWhatInitializeDecides`'s claim.
-        assert len(recorder.timeouts) == 1 + len(recorder.search)
-        assert set(recorder.timeouts) == {7}
+        assert recorder.timeouts[0] == 7
+        assert recorder.timeouts[1:] == [0] * len(recorder.search)
 
     async def test_absence_resolves_to_the_module_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Read through ``_indexes.READY_TIMEOUT_SECONDS`` rather than compared to a literal, so this
         keeps testing the wiring rather than restating ``AT-125``."""
         recorder = _patch_setup(monkeypatch)
-        store = _store()
+        store = _store(config=_connection_config(search_type="text"))
 
         await store.initialize()
 
         assert set(recorder.timeouts) == {_indexes.READY_TIMEOUT_SECONDS}
+
+
+class TestAutoDoesNotWaitForABuild:
+    """AT-242 — under ``auto``, ``initialize()`` returns while indexes build, and the first ``search`` waits
+    for the first of them."""
+
+    @staticmethod
+    def _finish_on_wait(monkeypatch: pytest.MonkeyPatch, recorder: _SetupRecorder) -> None:
+        """Make a call that passes a non-zero ``timeout`` see every build finish, as a real wait would."""
+
+        async def ensure(collection: Any, **kwargs: Any) -> None:
+            if kwargs.get("timeout"):
+                recorder.building = set()
+            await recorder.ensure(collection, **kwargs)
+
+        monkeypatch.setattr(_indexes, "ensure", ensure)
+
+    async def test_every_tier_still_building_initializes_with_no_tiers(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store()
+
+        await store.initialize()
+
+        assert store._tiers == ()
+
+    async def test_search_waits_for_the_build_with_the_configured_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store(config=_connection_config(index_ready_timeout=7))
+        await store.initialize()
+        self._finish_on_wait(monkeypatch, recorder)
+        collection = _RecordingCollection([{"_id": "abc", "content": "dark mode"}])
+        store._collection = lambda: collection  # type: ignore[assignment, return-value]
+
+        found = await store.search({"text": "dark"})
+
+        assert recorder.timeouts[-4:-2] == [7, 7]
+        assert store._tiers == ("vector", "text")
+        assert [(entry.metadata or {}).get("_search_type") for entry in found] == ["vector"]
+
+    async def test_a_retry_picks_up_the_finished_build(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store()
+        await store.initialize()
+
+        recorder.building = set()
+        store._tier_retry_at = 0
+        await store.initialize()
+
+        assert store._tiers == ("vector", "text")
+        assert store._tier_retry_at is None
+
+    async def test_a_refusal_alongside_a_build_waits_for_the_build(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An Atlas CLI local deployment refuses the AutoEmbeddings vector index while text builds."""
+        recorder = _patch_setup(monkeypatch, failing=frozenset({"vector_index"}))
+        recorder.building = {"text_index"}
+        store = _store()
+
+        await store.initialize()
+        assert store._tiers == ()
+        self._finish_on_wait(monkeypatch, recorder)
+        await store._wait_for_a_tier()
+
+        assert store._tiers == ("text",)
+
+    async def test_only_refusals_still_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A tier the server refused is a configuration to fix, so there is nothing to wait for."""
+        _patch_setup(monkeypatch, failing=frozenset({"vector_index", "text_index"}))
+
+        with pytest.raises(StorageError, match="no search tier could be prepared"):
+            await _store().initialize()
+
+    async def test_a_build_that_never_finishes_fails_the_search(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store()
+        await store.initialize()
+
+        with pytest.raises(StorageError, match="no search tier on .* was ready"):
+            await store.search({"text": "dark"})
+
+    async def test_a_ready_tier_is_not_held_behind_one_still_building(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store()
+        await store.initialize()
+        never = asyncio.Event()
+
+        async def ensure(collection: Any, *, search: Any = (), **kwargs: Any) -> None:
+            if kwargs.get("timeout") and search[0].name == "vector_index":
+                await never.wait()
+            if kwargs.get("timeout"):
+                recorder.building.discard(search[0].name)
+            await recorder.ensure(collection, search=search, **kwargs)
+
+        monkeypatch.setattr(_indexes, "ensure", ensure)
+        collection = _RecordingCollection([{"_id": "abc", "content": "dark mode"}])
+        store._collection = lambda: collection  # type: ignore[assignment, return-value]
+
+        found = await asyncio.wait_for(store.search({"text": "dark"}), timeout=5)
+
+        assert store._tiers == ("text",)
+        assert [(entry.metadata or {}).get("_search_type") for entry in found] == ["text"]
+
+    @staticmethod
+    def _skipped(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str, str]]:
+        """The ``(level, event, tier)`` of every skipped-tier record, in order."""
+        return [
+            (
+                record.levelname,
+                getattr(record, "strands_mongodb_event", ""),
+                getattr(record, "strands_mongodb_tier", ""),
+            )
+            for record in caplog.records
+            if getattr(record, "strands_mongodb_event", None) in ("tier_building", "tier_unavailable")
+        ]
+
+    async def test_a_fresh_store_logs_its_building_tiers_at_info(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        caplog.set_level(logging.DEBUG, logger="strands_mongodb")
+
+        await _store().initialize()
+
+        assert self._skipped(caplog) == [("INFO", "tier_building", "vector"), ("INFO", "tier_building", "text")]
+
+    async def test_a_refused_tier_still_warns(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        recorder = _patch_setup(monkeypatch, failing=frozenset({"vector_index"}))
+        recorder.building = {"text_index"}
+        caplog.set_level(logging.DEBUG, logger="strands_mongodb")
+
+        await _store().initialize()
+
+        assert self._skipped(caplog) == [("WARNING", "tier_unavailable", "vector"), ("INFO", "tier_building", "text")]
+
+    async def test_a_wait_that_runs_out_warns(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store()
+        await store.initialize()
+        caplog.clear()
+        caplog.set_level(logging.DEBUG, logger="strands_mongodb")
+
+        with pytest.raises(StorageError, match="was ready"):
+            await store.search({"text": "dark"})
+
+        assert self._skipped(caplog) == [
+            ("WARNING", "tier_unavailable", "vector"),
+            ("WARNING", "tier_unavailable", "text"),
+        ]
+
+    async def test_a_tier_still_building_after_another_came_up_stays_at_info(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store()
+        await store.initialize()
+
+        async def ensure(collection: Any, *, search: Any = (), **kwargs: Any) -> None:
+            if kwargs.get("timeout"):
+                recorder.building.discard("text_index")
+            await recorder.ensure(collection, search=search, **kwargs)
+
+        monkeypatch.setattr(_indexes, "ensure", ensure)
+        collection = _RecordingCollection([{"_id": "abc", "content": "dark mode"}])
+        store._collection = lambda: collection  # type: ignore[assignment, return-value]
+        caplog.clear()
+        caplog.set_level(logging.DEBUG, logger="strands_mongodb")
+
+        await store.search({"text": "dark"})
+
+        assert store._tiers == ("text",)
+        assert self._skipped(caplog) == [("INFO", "tier_building", "vector")]
+
+    @staticmethod
+    def _finish_when(monkeypatch: pytest.MonkeyPatch, recorder: _SetupRecorder, gate: asyncio.Event) -> None:
+        """Make a call that passes a non-zero ``timeout`` wait for ``gate``, then see every build finish."""
+
+        async def ensure(collection: Any, **kwargs: Any) -> None:
+            if kwargs.get("timeout"):
+                await gate.wait()
+                recorder.building = set()
+            await recorder.ensure(collection, **kwargs)
+
+        monkeypatch.setattr(_indexes, "ensure", ensure)
+
+    def test_a_search_on_another_event_loop_still_waits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The SDK runs ``initialize()`` on one event loop and each sync agent call on a new one."""
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store()
+        asyncio.run(store.initialize())
+        self._finish_on_wait(monkeypatch, recorder)
+        collection = _RecordingCollection([{"_id": "abc", "content": "dark mode"}])
+        store._collection = lambda: collection  # type: ignore[assignment, return-value]
+
+        found = asyncio.run(store.search({"text": "dark"}))
+
+        assert [(entry.metadata or {}).get("_search_type") for entry in found] == ["vector"]
+
+    async def test_searches_during_the_wait_share_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store(config=_connection_config(index_ready_timeout=7))
+        await store.initialize()
+        gate = asyncio.Event()
+        self._finish_when(monkeypatch, recorder, gate)
+        collection = _RecordingCollection([{"_id": "abc", "content": "dark mode"}])
+        store._collection = lambda: collection  # type: ignore[assignment, return-value]
+        calls = len(recorder.timeouts)
+
+        first = asyncio.ensure_future(store.search({"text": "dark"}))
+        second = asyncio.ensure_future(store.search({"text": "dark"}))
+        await asyncio.sleep(0)
+        gate.set()
+        found = await asyncio.gather(first, second)
+
+        assert [len(results) for results in found] == [1, 1]
+        assert recorder.timeouts[calls:].count(7) == 2
+
+    async def test_a_cancelled_search_leaves_the_wait_for_the_next(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store()
+        await store.initialize()
+        gate = asyncio.Event()
+        self._finish_when(monkeypatch, recorder, gate)
+        collection = _RecordingCollection([{"_id": "abc", "content": "dark mode"}])
+        store._collection = lambda: collection  # type: ignore[assignment, return-value]
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(store.search({"text": "dark"}), 0.01)
+        assert store._waited_for_a_tier is False
+        following = asyncio.ensure_future(store.search({"text": "dark"}))
+        await asyncio.sleep(0)
+        gate.set()
+
+        assert len(await following) == 1
+
+    async def test_only_the_first_search_waits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store(config=_connection_config(index_ready_timeout=7))
+        await store.initialize()
+        with pytest.raises(StorageError):
+            await store.search({"text": "dark"})
+        calls = len(recorder.timeouts)
+
+        with pytest.raises(StorageError, match="was ready"):
+            await store.search({"text": "dark"})
+
+        assert 7 not in recorder.timeouts[calls:]
 
 
 class TestWhatInitializeDecides:
@@ -1702,22 +1974,22 @@ class TestWhatInitializeDecides:
         assert len(recorder.ordinary) == 1
         assert recorder.search == ["vector_index", "text_index"]
 
-    async def test_a_query_with_no_prepared_tier_names_index_creation_not_a_missing_module(self) -> None:
-        """``_pick_tier``'s two messages for two remedies: no Atlas Search, or no prepared tier.
+    async def test_a_query_with_no_ready_tier_names_the_build_not_a_missing_module(self) -> None:
+        """``_pick_tier``'s two messages for two remedies: no Atlas Search, or no tier ready yet.
 
         This deployment can search, so the other message's advice about pointing ``connection_string`` at
-        Atlas would send a reader to replace something that is not broken. Reached by preparing nothing
-        rather than by refusing a tier, because ``initialize()`` refuses to leave a store in this state and
-        the guard covers the state anyway: ``_tiers`` is also empty on a store nobody initialized.
+        Atlas would send a reader to replace something that is not broken. Called directly, because
+        ``search`` first waits for a tier that is still building, and this is the state that wait ends in
+        when the build never finishes.
         """
         store = _store()
         _prepared(store, tiers=())
-        store._connection.capabilities = _client.Capabilities(search=True)
+        store._capabilities = _client.Capabilities(search=True)
 
         with pytest.raises(StorageError) as caught:
-            await store.search("dark mode")
+            store._pick_tier(query_text="dark mode", query_vector=None)
 
-        assert "no search tier could be prepared" in str(caught.value)
+        assert "was ready within 'index_ready_timeout'" in str(caught.value)
         # The other message's own words rather than a server code. That code is interpolated from the
         # probe, so `"31082" not in ...` would pass on a message built entirely from the wrong template
         # and prove nothing.
@@ -3226,6 +3498,16 @@ class TestTheFusionProbeAgreesWithTheServerItProbed:
             await store.close()
 
 
+async def _settled(store: MongoDBMemoryStore) -> None:
+    """Initialize ``store`` and wait for a tier, as its first ``search`` would.
+
+    Under ``auto``, ``initialize()`` does not wait for a build, so on a fresh collection it leaves no tier.
+    """
+    await store.initialize()
+    if not store._tiers and store._can_search():
+        await store._wait_for_a_tier()
+
+
 @pytest.mark.contract
 class TestTheTierSetIsTheOneTheDeploymentImplies:
     """``AT-185`` -- tier resolution, graded by a tier that runs on every change.
@@ -3312,7 +3594,7 @@ class TestTheTierSetIsTheOneTheDeploymentImplies:
         """
         store = _real_store(contract_uri, test_database_name, unique_collection_name, connection=dict(MANUAL_VECTOR))
         try:
-            await store.initialize()
+            await _settled(store)
             capabilities = store._connection.capabilities
             assert capabilities is not None
 
@@ -3346,7 +3628,7 @@ class TestTheTierSetIsTheOneTheDeploymentImplies:
         """
         store = _real_store(contract_uri, test_database_name, unique_collection_name)
         try:
-            await store.initialize()
+            await _settled(store)
             tiers = store._tiers
 
             assert "hybrid" not in tiers or tiers[0] == "hybrid", (
@@ -3373,7 +3655,7 @@ class TestTheTierSetIsTheOneTheDeploymentImplies:
         """
         store = _real_store(contract_uri, test_database_name, unique_collection_name)
         try:
-            await store.initialize()
+            await _settled(store)
             capabilities = store._connection.capabilities
             assert capabilities is not None
 
@@ -4109,6 +4391,43 @@ class TestTheFirstSearchSetsItselfUp:
 
 
 @pytest.mark.integration
+class TestConcurrentFirstSearchesShareOneWait:
+    """AT-242 against a real build: searches that arrive together on a fresh store wait for it once.
+
+    The shared wait only shows its behaviour against an index that is actually building, which no fake
+    reproduces: every search must answer, and each tier's index is waited on by one call, not one per
+    search.
+    """
+
+    async def test_they_all_answer_and_each_index_is_waited_on_once(
+        self, atlas_store: MongoDBMemoryStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        await atlas_store.add("the user prefers dark mode")
+        assert atlas_store._tiers == (), "a fresh store's indexes are still building after initialize()"
+        ensure = _indexes.ensure
+        waited: list[str] = []
+
+        async def counting(collection: Any, **kwargs: Any) -> None:
+            if kwargs.get("timeout") and kwargs.get("search"):
+                waited.append(kwargs["search"][0].name)
+            await ensure(collection, **kwargs)
+
+        monkeypatch.setattr(_indexes, "ensure", counting)
+
+        results = await asyncio.gather(*(atlas_store.search(QUERY_TEXT) for _ in range(5)))
+        assert sorted(waited) == sorted(spec.name for _, spec in atlas_store._specs)
+
+        # `READY` does not mean mongot has the document yet, so the batch repeats until it does.
+        deadline = time.monotonic() + _SEARCHABLE_BUDGET
+        while not all(results) and time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+            results = await asyncio.gather(*(atlas_store.search(QUERY_TEXT) for _ in range(5)))
+
+        assert [[entry.content for entry in found] for found in results] == [["the user prefers dark mode"]] * 5
+        assert len(waited) == len(atlas_store._specs), "searches after the first batch do not wait again"
+
+
+@pytest.mark.integration
 class TestNoSearchCrossesAScope:
     """AT-047a — no search crosses a scope, run once per search tier.
 
@@ -4641,6 +4960,29 @@ class TestASkippedTierIsTriedAgain:
         await store.initialize()
         assert store._tier_retry_delay == TIER_RETRY_MAX_SECONDS
 
+    async def test_a_store_with_no_tier_still_backs_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from strands_mongodb.memory_store import TIER_RETRY_SECONDS
+
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store()
+        await store.initialize()
+
+        assert store._tiers == ()
+        assert store._tier_retry_at is not None
+        assert store._tier_retry_at > time.monotonic() + TIER_RETRY_SECONDS / 2
+
+        store._tier_retry_at = 0.0
+        await store.initialize()
+        assert store._tier_retry_delay == 2 * TIER_RETRY_SECONDS
+
+    async def test_a_deployment_without_search_schedules_no_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_setup(monkeypatch, available=False)
+        store = _store()
+        await store.initialize()
+
+        assert store._tier_retry_at is None
+
     async def test_a_store_with_every_tier_schedules_no_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_setup(monkeypatch)
         store = _store()
@@ -4656,3 +4998,106 @@ class TestASkippedTierIsTriedAgain:
 
         assert store._tiers == ("text",)
         assert store._tier_retry_at is None
+
+
+class _WordEmbedder:
+    """A four-dimension embedder over ``dark``, ``mode``, ``coffee`` and ``tea``, recording what it embeds."""
+
+    def __init__(self, dimensions: int = 4) -> None:
+        self.dimensions = dimensions
+        self.calls: list[str] = []
+
+    async def embed(self, text: str) -> list[float]:
+        self.calls.append(text)
+        words = text.lower().split()
+        vector = [0.01 + words.count(word) for word in ("dark", "mode", "coffee", "tea")]
+        return (vector + [0.01] * self.dimensions)[: self.dimensions]
+
+
+class TestAnEmbedderCompletesTheManualPath:
+    """AT-243 — with ``embedder``, ``add`` writes the vector and a plain-string ``search`` embeds the query."""
+
+    def test_an_embedder_on_the_auto_embeddings_path_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="'embedder' is set"):
+            _store(embedder=_WordEmbedder())
+
+    async def test_add_stores_the_vector_in_the_insert(self) -> None:
+        embedder = _WordEmbedder()
+        store = _store(config=_connection_config(**MANUAL_VECTOR), writable=True, embedder=embedder)
+        collection = _prepared(store)
+        with contextlib.suppress(NotImplementedError):
+            await store.add("the user prefers dark mode")
+
+        assert embedder.calls == ["the user prefers dark mode"]
+        assert collection.upserts[-1][1]["$setOnInsert"][_indexes.VECTOR_FIELD] == [1.01, 1.01, 0.01, 0.01]
+
+    async def test_a_vector_of_the_wrong_length_writes_nothing(self) -> None:
+        store = _store(config=_connection_config(**MANUAL_VECTOR), writable=True, embedder=_WordEmbedder(3))
+        collection = _prepared(store)
+
+        with pytest.raises(ValueError, match="3-dimension vector"):
+            await store.add("dark")
+
+        assert collection.upserts == []
+
+    @pytest.mark.parametrize(
+        ("tiers", "tier"), [(("vector", "text"), "vector"), (("hybrid", "vector", "text"), "hybrid")]
+    )
+    async def test_a_plain_string_reaches_the_vector_tiers(self, tiers: tuple[str, ...], tier: str) -> None:
+        embedder = _WordEmbedder()
+        store = _store(config=_connection_config(**MANUAL_VECTOR), embedder=embedder)
+        collection = _prepared(store, tiers=tiers)
+
+        found = await store.search("dark")
+
+        assert embedder.calls == ["dark"]
+        assert _metadata(found[0])["_search_type"] == tier
+        assert "[1.01, 0.01, 0.01, 0.01]" in repr(collection.stages)
+
+    async def test_a_text_only_store_embeds_nothing(self) -> None:
+        embedder = _WordEmbedder()
+        store = _store(config=_connection_config(**MANUAL_VECTOR), embedder=embedder)
+        _prepared(store, tiers=("text",))
+
+        await store.search("dark")
+
+        assert embedder.calls == []
+
+    async def test_a_caller_vector_is_used_as_given(self) -> None:
+        embedder = _WordEmbedder()
+        store = _store(config=_connection_config(**MANUAL_VECTOR), embedder=embedder)
+        _prepared(store, tiers=("vector", "text"))
+
+        await store.search({"vector": QUERY_VECTOR})
+
+        assert embedder.calls == []
+
+
+@pytest.mark.integration
+class TestAnEmbedderAgainstADeployment:
+    """AT-243 — the manual path round trip ``MemoryManager`` makes: ``add`` a string, ``search`` a string."""
+
+    async def test_a_memory_added_as_text_is_found_by_a_text_query_on_the_vector_tier(
+        self, atlas_uri: str, test_database_name: str, unique_collection_name: str
+    ) -> None:
+        store = _real_store(
+            atlas_uri,
+            test_database_name,
+            unique_collection_name,
+            writable=True,
+            embedder=_WordEmbedder(),
+            connection={**MANUAL_VECTOR, "search_type": "vector"},
+        )
+        try:
+            await store.add("the user prefers dark mode")
+            await store.add("the user drinks coffee and tea")
+
+            found = await _answered(store, "dark mode", expected=2)
+
+            assert [entry.content for entry in found] == [
+                "the user prefers dark mode",
+                "the user drinks coffee and tea",
+            ]
+            assert {_metadata(entry)["_search_type"] for entry in found} == {"vector"}
+        finally:
+            await store.close()
