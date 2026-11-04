@@ -870,6 +870,7 @@ about one. The event names are stable:
 | `reserved_key_collision` | `WARNING` | A stored document's metadata uses a key the store sets on every result |
 | `no_search_setup` | `WARNING` | The deployment has no Atlas Search, so no search index is set up |
 | `tier_unavailable` | `WARNING` | Under `auto`, a search tier could not be prepared and was skipped |
+| `tier_building` | `INFO` | Under `auto`, a search index was still building, so its tier was skipped until a search needs it |
 | `below_vector` | `WARNING` | Under `auto`, vector search is unavailable and queries use the text tier |
 | `bound_declined_fusion` | `WARNING` | A score bound kept `auto` off the hybrid tier |
 | `score_bound_applied` | `DEBUG` | `min_score` or `max_score` dropped results |

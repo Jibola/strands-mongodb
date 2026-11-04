@@ -1609,6 +1609,83 @@ class TestAutoDoesNotWaitForABuild:
         assert [(entry.metadata or {}).get("_search_type") for entry in found] == ["text"]
 
     @staticmethod
+    def _skipped(caplog: pytest.LogCaptureFixture) -> list[tuple[str, str, str]]:
+        """The ``(level, event, tier)`` of every skipped-tier record, in order."""
+        return [
+            (
+                record.levelname,
+                getattr(record, "strands_mongodb_event", ""),
+                getattr(record, "strands_mongodb_tier", ""),
+            )
+            for record in caplog.records
+            if getattr(record, "strands_mongodb_event", None) in ("tier_building", "tier_unavailable")
+        ]
+
+    async def test_a_fresh_store_logs_its_building_tiers_at_info(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        caplog.set_level(logging.DEBUG, logger="strands_mongodb")
+
+        await _store().initialize()
+
+        assert self._skipped(caplog) == [("INFO", "tier_building", "vector"), ("INFO", "tier_building", "text")]
+
+    async def test_a_refused_tier_still_warns(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        recorder = _patch_setup(monkeypatch, failing=frozenset({"vector_index"}))
+        recorder.building = {"text_index"}
+        caplog.set_level(logging.DEBUG, logger="strands_mongodb")
+
+        await _store().initialize()
+
+        assert self._skipped(caplog) == [("WARNING", "tier_unavailable", "vector"), ("INFO", "tier_building", "text")]
+
+    async def test_a_wait_that_runs_out_warns(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store()
+        await store.initialize()
+        caplog.clear()
+        caplog.set_level(logging.DEBUG, logger="strands_mongodb")
+
+        with pytest.raises(StorageError, match="was ready"):
+            await store.search({"text": "dark"})
+
+        assert self._skipped(caplog) == [
+            ("WARNING", "tier_unavailable", "vector"),
+            ("WARNING", "tier_unavailable", "text"),
+        ]
+
+    async def test_a_tier_still_building_after_another_came_up_stays_at_info(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store()
+        await store.initialize()
+
+        async def ensure(collection: Any, *, search: Any = (), **kwargs: Any) -> None:
+            if kwargs.get("timeout"):
+                recorder.building.discard("text_index")
+            await recorder.ensure(collection, search=search, **kwargs)
+
+        monkeypatch.setattr(_indexes, "ensure", ensure)
+        collection = _RecordingCollection([{"_id": "abc", "content": "dark mode"}])
+        store._collection = lambda: collection  # type: ignore[assignment, return-value]
+        caplog.clear()
+        caplog.set_level(logging.DEBUG, logger="strands_mongodb")
+
+        await store.search({"text": "dark"})
+
+        assert store._tiers == ("text",)
+        assert self._skipped(caplog) == [("INFO", "tier_building", "vector")]
+
+    @staticmethod
     def _finish_when(monkeypatch: pytest.MonkeyPatch, recorder: _SetupRecorder, gate: asyncio.Event) -> None:
         """Make a call that passes a non-zero ``timeout`` wait for ``gate``, then see every build finish."""
 

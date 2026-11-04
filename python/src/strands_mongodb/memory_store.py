@@ -621,15 +621,18 @@ class MongoDBMemoryStore:
             _telemetry.annotate("strands_mongodb.search.tiers", ",".join(self._tiers))
             self._initialized = True
 
-    async def _retry_search_tiers(self) -> None:
+    async def _retry_search_tiers(self, *, waited: bool = False) -> None:
         """Try the tiers ``initialize()`` skipped again, reading build status without waiting.
 
         A retry that fails, or still finds a tier missing, keeps the tiers the store has and doubles the
         delay before the next one, up to :data:`TIER_RETRY_MAX_SECONDS`.
+
+        Args:
+            waited: Whether a wait for the builds just ran out, so a tier still building has timed out.
         """
         fusion = self._capabilities is not None and self._capabilities.rank_fusion
         try:
-            tiers = await self._ensure_search_tiers(self._collection(), rank_fusion=fusion, timeout=0)
+            tiers = await self._ensure_search_tiers(self._collection(), rank_fusion=fusion, timeout=0, waited=waited)
         except StorageError:
             tiers = None
         if tiers is not None:
@@ -667,16 +670,18 @@ class MongoDBMemoryStore:
             )
             for _, spec in self._specs
         ]
+        ready = False
         try:
             for wait in asyncio.as_completed(waits):
                 with contextlib.suppress(StorageError):
                     await wait
+                    ready = True
                     break
         finally:
             for wait in waits:
                 wait.cancel()
             await asyncio.gather(*waits, return_exceptions=True)
-        await self._retry_search_tiers()
+        await self._retry_search_tiers(waited=not ready)
         self._waited_for_a_tier = True
 
     def _missing_a_tier(self, tiers: tuple[ResolvedSearchType, ...]) -> bool:
@@ -684,7 +689,12 @@ class MongoDBMemoryStore:
         return self._search_type == "auto" and any(tier not in tiers for tier, _ in self._specs)
 
     async def _ensure_search_tiers(
-        self, collection: AsyncCollection[dict[str, Any]], *, rank_fusion: bool = False, timeout: float
+        self,
+        collection: AsyncCollection[dict[str, Any]],
+        *,
+        rank_fusion: bool = False,
+        timeout: float,
+        waited: bool = False,
     ) -> tuple[ResolvedSearchType, ...]:
         """Create each configured search index and return the tiers that came up.
 
@@ -692,14 +702,16 @@ class MongoDBMemoryStore:
         created. On a deployment with no registered embedding model (such as an Atlas CLI local one) the
         vector index fails with code 8, and the store can still answer lexically.
 
-        Under ``auto`` a tier that fails is logged with the server's reason and skipped. Under a named
-        ``search_type`` the failure is raised, because answering from another tier would change what
-        matches.
+        Under ``auto`` a tier that fails is logged with the server's reason and skipped: at ``INFO`` when
+        its index is only still building and nothing has waited for it, which is every fresh store, and
+        at ``WARNING`` otherwise. Under a named ``search_type`` the failure is raised, because answering
+        from another tier would change what matches.
 
         Args:
             collection: The collection to build indexes on.
             rank_fusion: Whether the deployment can run ``$rankFusion``.
             timeout: Seconds to wait for a build. ``0`` on a retry, which reads status and never waits.
+            waited: Whether a wait for the builds just ran out, so a tier still building has timed out.
 
         Returns:
             The tiers that can answer, in preference order. Hybrid first where it is on offer, then
@@ -724,13 +736,7 @@ class MongoDBMemoryStore:
             except StorageError as error:
                 if self._search_type != "auto":
                     raise
-                logger.warning(
-                    _TIER_UNAVAILABLE,
-                    tier,
-                    self._target,
-                    error,
-                    extra=_telemetry.event_extra("tier_unavailable", namespace=self._target, tier=tier),
-                )
+                self._log_skipped_tier(tier, error, building=timeout == 0 and not waited)
                 refused = error
                 building = building or isinstance(error, _indexes.SearchIndexNotReady)
                 continue
@@ -761,6 +767,25 @@ class MongoDBMemoryStore:
                 extra=_telemetry.event_extra("below_vector", namespace=self._target, tier=available[0]),
             )
         return tuple(available)
+
+    def _log_skipped_tier(self, tier: ResolvedSearchType, error: StorageError, *, building: bool) -> None:
+        """Log a tier ``auto`` skipped: ``INFO`` for an index nobody has waited for yet, else ``WARNING``."""
+        if building and isinstance(error, _indexes.SearchIndexNotReady):
+            logger.info(
+                _TIER_UNAVAILABLE,
+                tier,
+                self._target,
+                error,
+                extra=_telemetry.event_extra("tier_building", namespace=self._target, tier=tier),
+            )
+            return
+        logger.warning(
+            _TIER_UNAVAILABLE,
+            tier,
+            self._target,
+            error,
+            extra=_telemetry.event_extra("tier_unavailable", namespace=self._target, tier=tier),
+        )
 
     def _hybrid_is_available(self, available: list[ResolvedSearchType], *, rank_fusion: bool) -> bool:
         """Decide whether the hybrid tier is on offer, and log when a score bound declined it.
