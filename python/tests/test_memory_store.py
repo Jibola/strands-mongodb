@@ -3499,13 +3499,20 @@ class TestTheFusionProbeAgreesWithTheServerItProbed:
 
 
 async def _settled(store: MongoDBMemoryStore) -> None:
-    """Initialize ``store`` and wait for a tier, as its first ``search`` would.
+    """Initialize ``store`` and wait for every index it can build, so its tier set is final.
 
-    Under ``auto``, ``initialize()`` does not wait for a build, so on a fresh collection it leaves no tier.
+    Under ``auto``, ``initialize()`` does not wait for a build, and a first ``search`` waits only for the
+    first tier to be ready. Neither leaves the full set, so which tiers resolve would depend on which build
+    finished first.
     """
     await store.initialize()
-    if not store._tiers and store._can_search():
-        await store._wait_for_a_tier()
+    if not store._can_search():
+        return
+    for _, spec in store._specs:
+        # A refused index, such as an autoEmbed one on a deployment with no model, raises at once and stays out.
+        with contextlib.suppress(StorageError):
+            await _indexes.ensure(store._collection(), search=(spec,), create=store._ensure_indexes, timeout=180)
+    await store._retry_search_tiers()
 
 
 @pytest.mark.contract
