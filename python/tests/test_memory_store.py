@@ -4391,6 +4391,43 @@ class TestTheFirstSearchSetsItselfUp:
 
 
 @pytest.mark.integration
+class TestConcurrentFirstSearchesShareOneWait:
+    """AT-242 against a real build: searches that arrive together on a fresh store wait for it once.
+
+    The shared wait only shows its behaviour against an index that is actually building, which no fake
+    reproduces: every search must answer, and each tier's index is waited on by one call, not one per
+    search.
+    """
+
+    async def test_they_all_answer_and_each_index_is_waited_on_once(
+        self, atlas_store: MongoDBMemoryStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        await atlas_store.add("the user prefers dark mode")
+        assert atlas_store._tiers == (), "a fresh store's indexes are still building after initialize()"
+        ensure = _indexes.ensure
+        waited: list[str] = []
+
+        async def counting(collection: Any, **kwargs: Any) -> None:
+            if kwargs.get("timeout") and kwargs.get("search"):
+                waited.append(kwargs["search"][0].name)
+            await ensure(collection, **kwargs)
+
+        monkeypatch.setattr(_indexes, "ensure", counting)
+
+        results = await asyncio.gather(*(atlas_store.search(QUERY_TEXT) for _ in range(5)))
+        assert sorted(waited) == sorted(spec.name for _, spec in atlas_store._specs)
+
+        # `READY` does not mean mongot has the document yet, so the batch repeats until it does.
+        deadline = time.monotonic() + _SEARCHABLE_BUDGET
+        while not all(results) and time.monotonic() < deadline:
+            await asyncio.sleep(0.5)
+            results = await asyncio.gather(*(atlas_store.search(QUERY_TEXT) for _ in range(5)))
+
+        assert [[entry.content for entry in found] for found in results] == [["the user prefers dark mode"]] * 5
+        assert len(waited) == len(atlas_store._specs), "searches after the first batch do not wait again"
+
+
+@pytest.mark.integration
 class TestNoSearchCrossesAScope:
     """AT-047a — no search crosses a scope, run once per search tier.
 
