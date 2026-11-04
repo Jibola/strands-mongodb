@@ -1608,6 +1608,71 @@ class TestAutoDoesNotWaitForABuild:
         assert store._tiers == ("text",)
         assert [(entry.metadata or {}).get("_search_type") for entry in found] == ["text"]
 
+    @staticmethod
+    def _finish_when(monkeypatch: pytest.MonkeyPatch, recorder: _SetupRecorder, gate: asyncio.Event) -> None:
+        """Make a call that passes a non-zero ``timeout`` wait for ``gate``, then see every build finish."""
+
+        async def ensure(collection: Any, **kwargs: Any) -> None:
+            if kwargs.get("timeout"):
+                await gate.wait()
+                recorder.building = set()
+            await recorder.ensure(collection, **kwargs)
+
+        monkeypatch.setattr(_indexes, "ensure", ensure)
+
+    def test_a_search_on_another_event_loop_still_waits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The SDK runs ``initialize()`` on one event loop and each sync agent call on a new one."""
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store()
+        asyncio.run(store.initialize())
+        self._finish_on_wait(monkeypatch, recorder)
+        collection = _RecordingCollection([{"_id": "abc", "content": "dark mode"}])
+        store._collection = lambda: collection  # type: ignore[assignment, return-value]
+
+        found = asyncio.run(store.search({"text": "dark"}))
+
+        assert [(entry.metadata or {}).get("_search_type") for entry in found] == ["vector"]
+
+    async def test_searches_during_the_wait_share_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store(config=_connection_config(index_ready_timeout=7))
+        await store.initialize()
+        gate = asyncio.Event()
+        self._finish_when(monkeypatch, recorder, gate)
+        collection = _RecordingCollection([{"_id": "abc", "content": "dark mode"}])
+        store._collection = lambda: collection  # type: ignore[assignment, return-value]
+        calls = len(recorder.timeouts)
+
+        first = asyncio.ensure_future(store.search({"text": "dark"}))
+        second = asyncio.ensure_future(store.search({"text": "dark"}))
+        await asyncio.sleep(0)
+        gate.set()
+        found = await asyncio.gather(first, second)
+
+        assert [len(results) for results in found] == [1, 1]
+        assert recorder.timeouts[calls:].count(7) == 2
+
+    async def test_a_cancelled_search_leaves_the_wait_for_the_next(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store()
+        await store.initialize()
+        gate = asyncio.Event()
+        self._finish_when(monkeypatch, recorder, gate)
+        collection = _RecordingCollection([{"_id": "abc", "content": "dark mode"}])
+        store._collection = lambda: collection  # type: ignore[assignment, return-value]
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(store.search({"text": "dark"}), 0.01)
+        assert store._waited_for_a_tier is False
+        following = asyncio.ensure_future(store.search({"text": "dark"}))
+        await asyncio.sleep(0)
+        gate.set()
+
+        assert len(await following) == 1
+
     async def test_only_the_first_search_waits(self, monkeypatch: pytest.MonkeyPatch) -> None:
         recorder = _patch_setup(monkeypatch)
         recorder.building = {"vector_index", "text_index"}
@@ -1842,7 +1907,7 @@ class TestWhatInitializeDecides:
         """
         store = _store()
         _prepared(store, tiers=())
-        store._connection.capabilities = _client.Capabilities(search=True)
+        store._capabilities = _client.Capabilities(search=True)
 
         with pytest.raises(StorageError) as caught:
             store._pick_tier(query_text="dark mode", query_vector=None)

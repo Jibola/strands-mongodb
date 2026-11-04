@@ -502,11 +502,14 @@ class MongoDBMemoryStore:
         # When to retry a skipped tier, or `None` when none is skipped.
         self._tier_retry_at: float | None = None
         self._tier_retry_delay: float = TIER_RETRY_SECONDS
-        # Set by the first search that found no tier, so only that one waits for a build.
+        # Set once the first search's wait for a build finishes, so later searches don't wait.
         self._waited_for_a_tier = False
-        # From the first capability probe. Retries reuse it because they may run on another event loop's
-        # connection, where the probe has not run.
+        # That wait, shared by the searches that arrive during it on its event loop.
+        self._tier_wait: asyncio.Future[None] | None = None
+        # From the first capability probe. Retries and searches reuse it because they may run on another
+        # event loop's connection, where the probe has not run.
         self._rank_fusion = False
+        self._capabilities: _client.Capabilities | None = None
         # Called only to validate, so a config with neither `client` nor `connection_string` raises here.
         # Operations get their connection from `_connection`, per running event loop.
         _client.resolve(connection)
@@ -602,6 +605,7 @@ class MongoDBMemoryStore:
             )
 
             self._rank_fusion = capabilities.rank_fusion
+            self._capabilities = capabilities
             # `auto` can answer from another tier and retries skipped ones later, so it skips
             # indexes still building rather than block Agent construction under the connection lock.
             timeout = 0 if self._search_type == "auto" else self._index_ready_timeout
@@ -645,16 +649,22 @@ class MongoDBMemoryStore:
         _telemetry.annotate("strands_mongodb.search.tiers", ",".join(self._tiers))
 
     def _can_search(self) -> bool:
-        """Whether the deployment has Atlas Search, from the cached capability probe."""
-        capabilities = self._connection.capabilities
-        return capabilities is not None and capabilities.search
+        """Whether the deployment has Atlas Search, from the capability probe ``initialize()`` ran."""
+        return self._capabilities is not None and self._capabilities.search
 
     async def _wait_for_a_tier(self) -> None:
         """Wait, outside the connection's lock, until the first tier ``initialize()`` skipped is ready.
 
-        The tiers are waited on together, so a quick text build is not held behind a slow vector one.
+        Searches arriving during the wait on the same event loop share it, and one being cancelled does
+        not cancel it for the others.
         """
-        self._waited_for_a_tier = True
+        wait = self._tier_wait
+        if wait is None or wait.done() or wait.get_loop() is not asyncio.get_running_loop():
+            wait = self._tier_wait = asyncio.ensure_future(self._wait_for_the_first_ready_tier())
+        await asyncio.shield(wait)
+
+    async def _wait_for_the_first_ready_tier(self) -> None:
+        """Wait on every tier together, so a quick text build is not held behind a slow vector one."""
         collection = self._collection()
         waits = [
             asyncio.ensure_future(
@@ -674,6 +684,7 @@ class MongoDBMemoryStore:
                 wait.cancel()
             await asyncio.gather(*waits, return_exceptions=True)
         await self._retry_search_tiers()
+        self._waited_for_a_tier = True
 
     def _missing_a_tier(self, tiers: tuple[ResolvedSearchType, ...]) -> bool:
         """Whether ``auto`` skipped a configured tier, which is the only case a retry is for."""
@@ -1054,7 +1065,7 @@ class MongoDBMemoryStore:
             raise ValueError(_NO_FUSION_FOR_QUERY % (self._target, ", ".join(self._tiers) or "none"))
 
         if not self._tiers:
-            capabilities = self._connection.capabilities
+            capabilities = self._capabilities
             if capabilities is None or not capabilities.search:
                 # A phrase rather than a bare code, because with no cached probe there is no code to name.
                 code = capabilities.no_search_code if capabilities is not None else None
