@@ -1582,12 +1582,14 @@ class TestTheVoyageEmbedderSnippet:
 
     async def test_it_embeds_one_text_with_the_named_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         namespace = _exec_voyage_block(monkeypatch, {"connection_string": "mongodb://localhost:1", "database": "d"})
-        embedder = namespace["store"]._embedder
+        store = namespace["store"]
 
-        vector = await embedder.embed("dark mode")
+        pending = store._embedder.embed("dark mode")
+        assert inspect.isawaitable(pending)
+        vector = await pending
 
-        assert inspect.iscoroutinefunction(embedder.embed)
-        assert len(vector) == 1024
+        assert len(vector) == store._mode.dimensions
+        assert all(isinstance(value, float) for value in vector)
         assert _FakeVoyageClient.calls == [(["dark mode"], "voyage-4-lite")]
 
     def test_it_calls_the_real_client_as_it_is_shaped(self) -> None:

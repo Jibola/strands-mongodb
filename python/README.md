@@ -496,8 +496,8 @@ Setting `embedding_dimensions` and `similarity` selects the manual path, where t
 <!-- manual-vectors -->
 The package indexes and queries `embedding` but never fills it on its own. Pass an `embedder` and `add()`
 and string `search()` embed for you, so `MemoryManager` works unchanged.
-Any SDK `Embedder` works, such as `BedrockEmbedder`, or any object with an `async embed(text)` method,
-such as this one for Voyage AI:
+From strands-agents 1.64.0, any SDK `Embedder` works, including `BedrockEmbedder`. On every supported
+release, so does any object with an `async embed(text)` method, such as this one for Voyage AI:
 
 <!-- skip: it needs a Voyage AI API key -->
 ```python
