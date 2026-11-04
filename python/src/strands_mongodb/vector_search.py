@@ -70,7 +70,7 @@ class MongoDBVectorSearchStrategy:
         """Configure the strategy. Nothing connects until the first write or search.
 
         Args:
-            embedder: Any object with an async ``embed(text)``. Embeds stored values and queries.
+            embedder: Any SDK ``Embedder``. Embeds stored values and queries.
             dimensions: Length of the vectors ``embedder`` returns.
             similarity: ``"cosine"``, ``"dotProduct"`` or ``"euclidean"``.
             index_name: Name of the Atlas Vector Search index on the storage's collection.

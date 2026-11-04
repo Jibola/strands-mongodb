@@ -20,7 +20,7 @@ version heading when that version is tagged.
 ### Added
 
 - `MongoDBStorage(search_strategy=...)`, as on the SDK's `S3Storage`.
-- `MongoDBVectorSearchStrategy`: Atlas Vector Search for `MongoDBStorage`, using any embedder with an async `embed(text)`.
+- `MongoDBVectorSearchStrategy`: Atlas Vector Search for `MongoDBStorage`, using any SDK `Embedder`.
 - `embedder` on `MongoDBMemoryStore`'s manual-vector path, so `add` and string `search` embed.
 
 ### Changed

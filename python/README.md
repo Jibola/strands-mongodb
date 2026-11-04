@@ -496,7 +496,8 @@ Setting `embedding_dimensions` and `similarity` selects the manual path, where t
 <!-- manual-vectors -->
 The package indexes and queries `embedding` but never fills it on its own. Pass an `embedder` and `add()`
 and string `search()` embed for you, so `MemoryManager` works unchanged.
-Any object with an `async embed(text) -> list[float]` method works, such as this one for Voyage AI:
+Any SDK `Embedder` works, such as `BedrockEmbedder`, or any object with an `async embed(text)` method,
+such as this one for Voyage AI:
 
 <!-- skip: it needs a Voyage AI API key -->
 ```python
