@@ -162,15 +162,16 @@ async def main() -> None:
         await store.initialize()  # creates the indexes; every other operation calls it too
         await store.add("Prefers metric units and a 24-hour clock.")
 
-        # Atlas embeds a new document asynchronously, after the write is acknowledged, so a search that
-        # runs immediately finds nothing rather than failing.
-        for _ in range(30):
+        # Atlas embeds a new document asynchronously, after the write is acknowledged, and on a new
+        # collection the text index can finish before the vector one. Until the vector tier is ready a
+        # search answers lexically, so this query finds nothing for a few minutes rather than failing.
+        for _ in range(90):
             found = await store.search("how should times be displayed for this person?")
             if found:
                 break
-            await asyncio.sleep(2)
+            await asyncio.sleep(5)
         else:
-            raise SystemExit("Atlas has not embedded the memory yet. Run this again.")
+            raise SystemExit("The vector index or the embedding is not ready yet. Run this again.")
 
         for entry in found:
             print(entry.metadata["_relevance_score"], entry.content)
@@ -182,7 +183,9 @@ asyncio.run(main())
 ```
 
 The query shares no word with the stored fact. That is the point of the vector tier, and it is also why
-the first run of this snippet is slower: its first `search` waits for the new index to build.
+the first run of this snippet is slower. The first `search` waits for the first index to be ready, and
+when that is the text index, searches answer lexically until a retry finds the vector index ready: 120
+seconds later, then at doubling intervals. On an existing collection both indexes are ready at once.
 
 To give an agent both surfaces, pass one config to both and let the SDK wire them:
 
