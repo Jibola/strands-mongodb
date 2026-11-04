@@ -230,7 +230,8 @@ class FakeStorageCollection:
     async def update_one(self, filter: Mapping[str, Any], update: Mapping[str, Any]) -> Any:
         self._record("update_one", filter, update)
         for document in self.matching(filter):
-            document.update(update.get("$set", {}))
+            if all(document.get(field) == value for field, value in filter.items() if field != "_id"):
+                document.update(update.get("$set", {}))
         return None
 
     async def find_one(self, filter: Mapping[str, Any] | None = None) -> dict[str, Any] | None:

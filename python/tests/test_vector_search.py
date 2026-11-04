@@ -94,8 +94,29 @@ class TestIndex:
 
         assert collection.names_called == ["replace_one", "update_one"]
         _, (filter_, update), _ = collection.calls[-1]
-        assert filter_ == {"_id": "tenant-a/notes/dark.md"}
+        assert filter_ == {"_id": "tenant-a/notes/dark.md", "data": b"dark mode"}
         assert update == {"$set": {"embedding": [1.01, 1.01, 0.01, 0.01], "prefixes": ["tenant-a/", "tenant-a/notes/"]}}
+
+    async def test_a_slower_write_does_not_put_its_vector_on_a_newer_value(self) -> None:
+        release = asyncio.Event()
+
+        class SlowForDark(BagOfWordsEmbedder):
+            async def embed(self, text: str) -> list[float]:
+                if text == "dark":
+                    await release.wait()
+                return await super().embed(text)
+
+        collection = FakeStorageCollection()
+        storage = unit_storage(collection, search_strategy=strategy(SlowForDark()))
+
+        slow = asyncio.create_task(storage.write("k", b"dark"))
+        await asyncio.sleep(0)
+        await storage.write("k", b"tea")
+        release.set()
+        await slow
+
+        assert collection.documents["k"]["data"] == b"tea"
+        assert collection.documents["k"]["embedding"] == await BagOfWordsEmbedder().embed("tea")
 
     @pytest.mark.parametrize("data", [b"", b"\xff\xfe"])
     async def test_an_empty_or_binary_value_is_stored_but_not_embedded(self, data: bytes) -> None:

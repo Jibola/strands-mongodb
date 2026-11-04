@@ -134,6 +134,9 @@ class MongoDBVectorSearchStrategy:
     async def index(self, storage: MongoDBStorage, key: str, data: bytes, **kwargs: Any) -> None:
         """Embed ``data`` and store the vector on the document ``storage.write`` just replaced.
 
+        The update matches only while the document still holds ``data``, so a slower write's vector never
+        lands on a newer value.
+
         Args:
             storage: The storage the value was written to.
             key: The normalized key, relative to ``storage``.
@@ -149,7 +152,7 @@ class MongoDBVectorSearchStrategy:
         vector = await self._embed(text)
         document_id = f"{storage.prefix}{key}"
         await storage._collection().update_one(
-            {"_id": document_id},
+            {"_id": document_id, "data": data},
             {"$set": {_indexes.VECTOR_FIELD: vector, PREFIXES_FIELD: _ancestors(document_id)}},
         )
 
