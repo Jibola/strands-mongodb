@@ -143,12 +143,6 @@ _EMBEDDER_ON_AUTO_EMBED = (
 )
 """Raised at construction when an ``embedder`` would have nothing to embed for."""
 
-_EMBEDDER_DIMENSIONS = (
-    "strands_mongodb: the embedder returned a %d-dimension vector and 'embedding_dimensions' is %d. "
-    "Set 'embedding_dimensions' to the length the embedding model produces."
-)
-"""Raised when an ``embedder`` vector would be silently skipped by the index, or rejected by a query."""
-
 _BELOW_VECTOR = (
     "strands_mongodb: 'search_type' is 'auto' and the vector tier is not available on %s, so queries "
     "resolve to the %s tier. Answers are lexical rather than semantic, which is a difference in what "
@@ -508,7 +502,6 @@ class MongoDBMemoryStore:
         self._tier_wait: asyncio.Future[None] | None = None
         # From the first capability probe. Retries and searches reuse it because they may run on another
         # event loop's connection, where the probe has not run.
-        self._rank_fusion = False
         self._capabilities: _client.Capabilities | None = None
         # Called only to validate, so a config with neither `client` nor `connection_string` raises here.
         # Operations get their connection from `_connection`, per running event loop.
@@ -604,7 +597,6 @@ class MongoDBMemoryStore:
                 timeout=self._index_ready_timeout,
             )
 
-            self._rank_fusion = capabilities.rank_fusion
             self._capabilities = capabilities
             # `auto` can answer from another tier and retries skipped ones later, so it skips
             # indexes still building rather than block Agent construction under the connection lock.
@@ -635,8 +627,9 @@ class MongoDBMemoryStore:
         A retry that fails, or still finds a tier missing, keeps the tiers the store has and doubles the
         delay before the next one, up to :data:`TIER_RETRY_MAX_SECONDS`.
         """
+        fusion = self._capabilities is not None and self._capabilities.rank_fusion
         try:
-            tiers = await self._ensure_search_tiers(self._collection(), rank_fusion=self._rank_fusion, timeout=0)
+            tiers = await self._ensure_search_tiers(self._collection(), rank_fusion=fusion, timeout=0)
         except StorageError:
             tiers = None
         if tiers is not None:
@@ -1035,10 +1028,10 @@ class MongoDBMemoryStore:
     async def _embed(self, text: str) -> list[float]:
         """Embed ``text`` with the configured ``embedder`` and check the length against the index."""
         assert self._embedder is not None
-        vector = [float(value) for value in await self._embedder.embed(text)]
-        if len(vector) != self._mode.dimensions:
-            raise ValueError(_EMBEDDER_DIMENSIONS % (len(vector), self._mode.dimensions))
-        return vector
+        assert self._mode.dimensions is not None
+        return await _indexes.embed(
+            self._embedder, text, dimensions=self._mode.dimensions, setting="embedding_dimensions"
+        )
 
     def _pick_tier(self, *, query_text: str | None, query_vector: list[float] | None) -> ResolvedSearchType:
         """Choose the first prepared tier, in preference order, that fits the query's keys.

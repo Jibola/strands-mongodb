@@ -37,11 +37,6 @@ PREFIXES_FIELD: Final[str] = "prefixes"
 """
 
 
-# The server bound on `numCandidates`. `_pipeline.MAX_NUM_CANDIDATES` holds the same number, but that
-# module needs the `memory` extra.
-_MAX_NUM_CANDIDATES: Final[int] = 10000
-
-
 class MongoDBVectorSearchStrategy:
     """Vector search for :class:`~strands_mongodb.MongoDBStorage`, backed by Atlas Vector Search.
 
@@ -99,10 +94,10 @@ class MongoDBVectorSearchStrategy:
                 f"strands_mongodb: 'max_results' ({max_results}) and 'oversampling_factor' "
                 f"({oversampling_factor}) must both be at least 1."
             )
-        if max_results * oversampling_factor > _MAX_NUM_CANDIDATES:
+        if max_results * oversampling_factor > _indexes.MAX_NUM_CANDIDATES:
             raise ValueError(
                 f"strands_mongodb: numCandidates would be {max_results * oversampling_factor}, over the "
-                f"server's bound of {_MAX_NUM_CANDIDATES}. Lower 'max_results' or 'oversampling_factor'."
+                f"server's bound of {_indexes.MAX_NUM_CANDIDATES}. Lower 'max_results' or 'oversampling_factor'."
             )
         self._embedder = embedder
         self._dimensions = dimensions
@@ -199,17 +194,7 @@ class MongoDBVectorSearchStrategy:
         ]
 
     async def _embed(self, text: str) -> builtins.list[float]:
-        """Embed ``text`` and check the length against the index definition.
-
-        The server would reject a wrong length on search, but silently skip indexing it on write.
-        """
-        vector = [float(value) for value in await self._embedder.embed(text)]
-        if len(vector) != self._dimensions:
-            raise ValueError(
-                f"strands_mongodb: the embedder returned a {len(vector)}-dimension vector and the index "
-                f"{self._index_name!r} declares {self._dimensions}."
-            )
-        return vector
+        return await _indexes.embed(self._embedder, text, dimensions=self._dimensions, setting="dimensions")
 
 
 def _ancestors(document_id: str) -> builtins.list[str]:
