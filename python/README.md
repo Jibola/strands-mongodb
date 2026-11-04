@@ -392,17 +392,23 @@ their topic. For `FileMemoryStore`, pass a strategy that reads values: the SDK's
 stores each value's vector on the value's own document. Empty and non-UTF-8 values aren't indexed.
 `VoyageEmbedder` is defined in [Supplying your own vectors](#supplying-your-own-vectors).
 
+Every write through the storage is embedded, so give the strategy only to the storage you search, in
+its own collection. On `Agent(storage=...)` it would also embed session snapshots on every turn.
+
 <!-- skip: it needs an embedding model and Atlas Vector Search -->
 ```python
+from strands.vended_memory_stores.file_memory_store import FileMemoryStore
 from strands_mongodb import MongoDBStorage, MongoDBVectorSearchStrategy
 
-storage = MongoDBStorage(
+memory_storage = MongoDBStorage(
     connection,
+    collection="memory_files",
     search_strategy=MongoDBVectorSearchStrategy(
         embedder=VoyageEmbedder(), dimensions=1024, similarity="cosine"
     ),
 )
-await storage.ensure_indexes()  # also creates the vector index
+await memory_storage.ensure_indexes()  # also creates the vector index
+knowledge = FileMemoryStore(name="facts", storage=memory_storage)
 ```
 
 ### What the methods return
