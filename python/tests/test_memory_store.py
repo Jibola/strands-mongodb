@@ -1505,7 +1505,8 @@ class TestTheIndexReadyBudgetComesFromTheConfig:
 
 
 class TestAutoDoesNotWaitForABuild:
-    """AT-242 — under ``auto``, ``initialize()`` returns while indexes build, and ``search`` waits for one."""
+    """AT-242 — under ``auto``, ``initialize()`` returns while indexes build, and the first ``search`` waits
+    for the first of them."""
 
     @staticmethod
     def _finish_on_wait(monkeypatch: pytest.MonkeyPatch, recorder: _SetupRecorder) -> None:
@@ -1538,7 +1539,7 @@ class TestAutoDoesNotWaitForABuild:
 
         found = await store.search({"text": "dark"})
 
-        assert recorder.timeouts[-2:] == [7, 7]
+        assert recorder.timeouts[-4:-2] == [7, 7]
         assert store._tiers == ("vector", "text")
         assert [(entry.metadata or {}).get("_search_type") for entry in found] == ["vector"]
 
@@ -1581,8 +1582,45 @@ class TestAutoDoesNotWaitForABuild:
         store = _store()
         await store.initialize()
 
-        with pytest.raises(StorageError, match="no search tier could be prepared"):
+        with pytest.raises(StorageError, match="no search tier on .* was ready"):
             await store.search({"text": "dark"})
+
+    async def test_a_ready_tier_is_not_held_behind_one_still_building(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store()
+        await store.initialize()
+        never = asyncio.Event()
+
+        async def ensure(collection: Any, *, search: Any = (), **kwargs: Any) -> None:
+            if kwargs.get("timeout") and search[0].name == "vector_index":
+                await never.wait()
+            if kwargs.get("timeout"):
+                recorder.building.discard(search[0].name)
+            await recorder.ensure(collection, search=search, **kwargs)
+
+        monkeypatch.setattr(_indexes, "ensure", ensure)
+        collection = _RecordingCollection([{"_id": "abc", "content": "dark mode"}])
+        store._collection = lambda: collection  # type: ignore[assignment, return-value]
+
+        found = await asyncio.wait_for(store.search({"text": "dark"}), timeout=5)
+
+        assert store._tiers == ("text",)
+        assert [(entry.metadata or {}).get("_search_type") for entry in found] == ["text"]
+
+    async def test_only_the_first_search_waits(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store(config=_connection_config(index_ready_timeout=7))
+        await store.initialize()
+        with pytest.raises(StorageError):
+            await store.search({"text": "dark"})
+        calls = len(recorder.timeouts)
+
+        with pytest.raises(StorageError, match="was ready"):
+            await store.search({"text": "dark"})
+
+        assert 7 not in recorder.timeouts[calls:]
 
 
 class TestWhatInitializeDecides:
@@ -1794,8 +1832,8 @@ class TestWhatInitializeDecides:
         assert len(recorder.ordinary) == 1
         assert recorder.search == ["vector_index", "text_index"]
 
-    async def test_a_query_with_no_prepared_tier_names_index_creation_not_a_missing_module(self) -> None:
-        """``_pick_tier``'s two messages for two remedies: no Atlas Search, or no prepared tier.
+    async def test_a_query_with_no_ready_tier_names_the_build_not_a_missing_module(self) -> None:
+        """``_pick_tier``'s two messages for two remedies: no Atlas Search, or no tier ready yet.
 
         This deployment can search, so the other message's advice about pointing ``connection_string`` at
         Atlas would send a reader to replace something that is not broken. Called directly, because
@@ -1809,7 +1847,7 @@ class TestWhatInitializeDecides:
         with pytest.raises(StorageError) as caught:
             store._pick_tier(query_text="dark mode", query_vector=None)
 
-        assert "no search tier could be prepared" in str(caught.value)
+        assert "was ready within 'index_ready_timeout'" in str(caught.value)
         # The other message's own words rather than a server code. That code is interpolated from the
         # probe, so `"31082" not in ...` would pass on a message built entirely from the wrong template
         # and prove nothing.
@@ -4742,6 +4780,29 @@ class TestASkippedTierIsTriedAgain:
         store._tier_retry_at = 0.0
         await store.initialize()
         assert store._tier_retry_delay == TIER_RETRY_MAX_SECONDS
+
+    async def test_a_store_with_no_tier_still_backs_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from strands_mongodb.memory_store import TIER_RETRY_SECONDS
+
+        recorder = _patch_setup(monkeypatch)
+        recorder.building = {"vector_index", "text_index"}
+        store = _store()
+        await store.initialize()
+
+        assert store._tiers == ()
+        assert store._tier_retry_at is not None
+        assert store._tier_retry_at > time.monotonic() + TIER_RETRY_SECONDS / 2
+
+        store._tier_retry_at = 0.0
+        await store.initialize()
+        assert store._tier_retry_delay == 2 * TIER_RETRY_SECONDS
+
+    async def test_a_deployment_without_search_schedules_no_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_setup(monkeypatch, available=False)
+        store = _store()
+        await store.initialize()
+
+        assert store._tier_retry_at is None
 
     async def test_a_store_with_every_tier_schedules_no_retry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_setup(monkeypatch)

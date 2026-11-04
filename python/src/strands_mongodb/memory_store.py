@@ -10,6 +10,8 @@ only ``search``; the manager detects ``add`` and ``add_messages`` when they exis
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import datetime
 import functools
 import hashlib
@@ -126,6 +128,13 @@ _NO_TIER_PREPARED = (
     "each with the server's own reason."
 )
 """Raised under ``auto`` when no search tier could be prepared, after each failure was logged."""
+
+_NO_TIER_READY = (
+    "strands_mongodb: 'search_type' is 'auto' and no search tier on %s was ready within "
+    "'index_ready_timeout', so no query can be answered yet. Each tier's status is logged above. The "
+    "tiers are retried with backoff, and searches raise until one is ready."
+)
+"""Raised by ``search`` under ``auto`` when the first search's wait ended with every tier still missing."""
 
 _EMBEDDER_ON_AUTO_EMBED = (
     "strands_mongodb: 'embedder' is set, but this store is on the Atlas AutoEmbeddings path, where the "
@@ -493,6 +502,8 @@ class MongoDBMemoryStore:
         # When to retry a skipped tier, or `None` when none is skipped.
         self._tier_retry_at: float | None = None
         self._tier_retry_delay: float = TIER_RETRY_SECONDS
+        # Set by the first search that found no tier, so only that one waits for a build.
+        self._waited_for_a_tier = False
         # From the first capability probe. Retries reuse it because they may run on another event loop's
         # connection, where the probe has not run.
         self._rank_fusion = False
@@ -509,8 +520,8 @@ class MongoDBMemoryStore:
         retry.
 
         Under ``auto`` this never waits for an index build: building tiers are skipped, and the first
-        ``search`` waits if none is ready. Missing tiers are retried with backoff. A named ``search_type``
-        waits for its index, up to ``index_ready_timeout``.
+        ``search`` waits for the first of them if none is ready. Missing tiers are retried with backoff. A
+        named ``search_type`` waits for its index, up to ``index_ready_timeout``.
 
         On a deployment without Atlas Search this logs a warning, once per connection, and ``search``
         raises later. Writes still work there.
@@ -599,8 +610,9 @@ class MongoDBMemoryStore:
                 if capabilities.search
                 else ()
             )
-            if self._missing_a_tier(self._tiers):
-                self._schedule_tier_retry()
+            # Without Atlas Search no retry can succeed.
+            if capabilities.search and self._missing_a_tier(self._tiers):
+                self._tier_retry_at = time.monotonic() + self._tier_retry_delay
 
             # The collation check above cannot verify a collection that does not exist yet. Creating the
             # indexes created it, so check again now: this block never runs again for this store, and this
@@ -616,9 +628,8 @@ class MongoDBMemoryStore:
     async def _retry_search_tiers(self) -> None:
         """Try the tiers ``initialize()`` skipped again, reading build status without waiting.
 
-        A retry that fails, or still finds a tier missing, keeps the tiers the store has. While the store
-        has one, the delay before the next retry doubles, up to :data:`TIER_RETRY_MAX_SECONDS`; while it
-        has none, the next call retries.
+        A retry that fails, or still finds a tier missing, keeps the tiers the store has and doubles the
+        delay before the next one, up to :data:`TIER_RETRY_MAX_SECONDS`.
         """
         try:
             tiers = await self._ensure_search_tiers(self._collection(), rank_fusion=self._rank_fusion, timeout=0)
@@ -627,9 +638,8 @@ class MongoDBMemoryStore:
         if tiers is not None:
             self._tiers = tiers
         if tiers is None or self._missing_a_tier(tiers):
-            if self._tiers:
-                self._tier_retry_delay = min(self._tier_retry_delay * 2, TIER_RETRY_MAX_SECONDS)
-            self._schedule_tier_retry()
+            self._tier_retry_delay = min(self._tier_retry_delay * 2, TIER_RETRY_MAX_SECONDS)
+            self._tier_retry_at = time.monotonic() + self._tier_retry_delay
         else:
             self._tier_retry_at = None
         _telemetry.annotate("strands_mongodb.search.tiers", ",".join(self._tiers))
@@ -640,19 +650,30 @@ class MongoDBMemoryStore:
         return capabilities is not None and capabilities.search
 
     async def _wait_for_a_tier(self) -> None:
-        """Wait, outside the connection's lock, for the tiers ``initialize()`` found still building."""
-        self._tiers = await self._ensure_search_tiers(
-            self._collection(), rank_fusion=self._rank_fusion, timeout=self._index_ready_timeout
-        )
-        if self._missing_a_tier(self._tiers):
-            self._schedule_tier_retry()
-        else:
-            self._tier_retry_at = None
-        _telemetry.annotate("strands_mongodb.search.tiers", ",".join(self._tiers))
+        """Wait, outside the connection's lock, until the first tier ``initialize()`` skipped is ready.
 
-    def _schedule_tier_retry(self) -> None:
-        """Set when to retry a missing tier: on the next call while no tier can answer, else after the delay."""
-        self._tier_retry_at = time.monotonic() + (self._tier_retry_delay if self._tiers else 0)
+        The tiers are waited on together, so a quick text build is not held behind a slow vector one.
+        """
+        self._waited_for_a_tier = True
+        collection = self._collection()
+        waits = [
+            asyncio.ensure_future(
+                _indexes.ensure(
+                    collection, search=(spec,), create=self._ensure_indexes, timeout=self._index_ready_timeout
+                )
+            )
+            for _, spec in self._specs
+        ]
+        try:
+            for wait in asyncio.as_completed(waits):
+                with contextlib.suppress(StorageError):
+                    await wait
+                    break
+        finally:
+            for wait in waits:
+                wait.cancel()
+            await asyncio.gather(*waits, return_exceptions=True)
+        await self._retry_search_tiers()
 
     def _missing_a_tier(self, tiers: tuple[ResolvedSearchType, ...]) -> bool:
         """Whether ``auto`` skipped a configured tier, which is the only case a retry is for."""
@@ -920,7 +941,7 @@ class MongoDBMemoryStore:
         query_filter = _filter.compose(self.filter, caller_filter, scope=self.scope, store_name=self.name)
 
         await self.initialize()
-        if not self._tiers and self._can_search():
+        if not self._tiers and self._can_search() and not self._waited_for_a_tier:
             await self._wait_for_a_tier()
         if self._embeds_query(query_text, query_vector):
             assert query_text is not None
@@ -1023,7 +1044,7 @@ class MongoDBMemoryStore:
 
         Raises:
             StorageError: If no tier is prepared. The message differs between a deployment without Atlas
-                Search and one where index creation failed, because the remedies differ.
+                Search and one whose indexes are not ready, because the remedies differ.
             ValueError: If the query sets both ``text`` and ``vector`` and the hybrid tier is not
                 prepared, or if tiers exist but none fits this query's shape. The message names the key
                 to add.
@@ -1039,7 +1060,7 @@ class MongoDBMemoryStore:
                 code = capabilities.no_search_code if capabilities is not None else None
                 evidence = f"server error code {code}" if code is not None else "no probe result cached"
                 raise StorageError(_NO_SEARCH_QUERY % (self._target, evidence))
-            raise StorageError(_NO_TIER_PREPARED % self._target)
+            raise StorageError(_NO_TIER_READY % self._target)
 
         for tier in self._tiers:
             # Hybrid needs `text` for `$search` and the vector path's own key, which with AutoEmbeddings is

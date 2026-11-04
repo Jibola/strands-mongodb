@@ -680,8 +680,9 @@ there raises with the command for `strands_expires_at_ttl` and creates nothing.
 
 Waiting is bounded. Under a named `search_type`, `initialize()` waits up to 300 s per index, then raises
 `StorageError`. Under `"auto"` it doesn't wait (it runs during `Agent` construction): building tiers are
-skipped, and the first `search` waits up to 300 s if none is ready. Skipped tiers are retried with
-backoff from 60 s up to an hour.
+skipped, and the first `search` waits up to 300 s for the first of them to be ready. Later searches
+don't wait, and raise `StorageError` until a tier is ready. Skipped tiers are retried with backoff from
+60 s up to an hour.
 
 ### Privileges
 
