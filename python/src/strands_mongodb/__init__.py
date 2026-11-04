@@ -9,7 +9,7 @@ Two surfaces, each behind its own install extra:
 - :mod:`strands_mongodb.memory_store`: ``MongoDBMemoryStore``, implementing the SDK's
   ``strands.memory.MemoryStore`` protocol. Install with ``pip install 'strands-mongodb[memory]'``.
 
-Every class is importable from here and are loaded on first access, not at import time. That way a
+Every class is importable from here and is loaded on first access, not at import time. That way a
 ``[storage]``-only install can use ``MongoDBStorage`` without importing the memory module, which would
 fail on ``pymongo_search_utils``.
 """

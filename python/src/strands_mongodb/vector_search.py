@@ -42,7 +42,9 @@ class MongoDBVectorSearchStrategy:
 
     The vector lives on the key's own document, so ``write`` and ``delete`` keep the index in step. Call
     ``MongoDBStorage.ensure_indexes()`` once to create the index. Empty and non-UTF-8 values aren't indexed.
-    Every write is embedded, so use it on a storage of its own rather than the agent's.
+    Every write is embedded, so use it on a storage of its own rather than the agent's. Each value is
+    embedded whole and must fit the embedding model's input; a longer one makes ``write`` raise after the
+    value is stored.
 
     Example:
         ```python

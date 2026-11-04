@@ -390,7 +390,10 @@ their topic. For `FileMemoryStore`, pass a strategy that reads values: the SDK's
 
 `MongoDBVectorSearchStrategy` is the MongoDB counterpart of the SDK's `S3VectorSearchStrategy`. It
 stores each value's vector on the value's own document. Empty and non-UTF-8 values aren't indexed.
-`VoyageEmbedder` is defined in [Supplying your own vectors](#supplying-your-own-vectors).
+Each value is embedded whole, so it must fit the embedding model's input; a longer one makes `write()`
+raise `StorageError` after the value is stored. Values written before the strategy was configured have
+no vector, so vector search can't find them until they're rewritten. `VoyageEmbedder` is defined in
+[Supplying your own vectors](#supplying-your-own-vectors).
 
 Every write through the storage is embedded, so give the strategy only to the storage you search, in
 its own collection. On `Agent(storage=...)` it would also embed session snapshots on every turn.
