@@ -48,11 +48,12 @@ if TYPE_CHECKING:
     from opentelemetry.util.types import AttributeValue
     from pymongo.asynchronous.collection import AsyncCollection
 
-    from strands_mongodb.types import MongoDBConfig
+    from strands_mongodb.types import MongoDBConfig, TextEmbedder
 
 __all__ = [
     "DEFAULT_EMBEDDING_MODEL",
     "IndexSpec",
+    "MAX_NUM_CANDIDATES",
     "POLL_INTERVAL_SECONDS",
     "READY_TIMEOUT_SECONDS",
     "SEARCH_UNSUPPORTED_CODES",
@@ -62,6 +63,7 @@ __all__ = [
     "check_ttl",
     "declared_filter_fields",
     "drop_index_command",
+    "embed",
     "ensure",
     "memory_search_specs",
     "memory_specs",
@@ -121,6 +123,13 @@ SIMILARITIES: Final[tuple[str, ...]] = ("cosine", "dotProduct", "euclidean")
 
 MAX_DIMENSIONS: Final[int] = 8192
 """Upper bound Atlas enforces on ``numDimensions``. Measured: outside ``[1..8192]`` is code 8."""
+
+MAX_NUM_CANDIDATES: Final[int] = 10000
+"""Upper bound the server enforces on ``numCandidates``.
+
+Outside ``[1..10000]`` the server returns code 8, *"numCandidates" must be within bounds [1..10000]*
+(measured on mongot 8.3.8). An integration test re-reads it from a real deployment.
+"""
 
 READY_TIMEOUT_SECONDS: Final[float] = 300.0
 """Default seconds to wait for search-index builds to report ``READY``.
@@ -999,6 +1008,10 @@ def _missing_ordinary_message(collection_name: str, namespace: str, missing: Seq
     )
 
 
+class SearchIndexNotReady(StorageError):
+    """A search index exists but did not report ``READY`` within the timeout."""
+
+
 async def _ensure_search(
     collection: AsyncCollection[Any],
     specs: tuple[SearchIndexSpec, ...],
@@ -1055,7 +1068,7 @@ async def _ensure_search(
         stuck = await _wait_until_ready(collection, waiting, namespace, timeout=timeout, interval=interval)
         _telemetry.annotate("strands_mongodb.indexes.outcome", "ready" if stuck is None else "timed_out")
     if stuck is not None:
-        raise StorageError(
+        raise SearchIndexNotReady(
             f"strands_mongodb: waited {timeout}s for {len(stuck)} search index(es) on "
             f"{namespace} to report READY and they did not: {', '.join(stuck)}. BUILDING at this point means "
             f"a build slower than the timeout. A store with a named search_type can call initialize() "
@@ -1273,3 +1286,29 @@ async def _guard(awaitable: Any, *, what: str) -> Any:
         return await awaitable
     except PyMongoError as error:
         raise StorageError(f"strands_mongodb: {what} failed: {error}") from error
+
+
+async def embed(embedder: TextEmbedder, text: str, *, dimensions: int, setting: str) -> list[float]:
+    """Embed ``text`` and check the vector's length against the index definition.
+
+    The server rejects a wrong length on a query but silently leaves a written one out of the index.
+
+    Args:
+        embedder: What embeds the text.
+        text: The text to embed.
+        dimensions: The length the index declares.
+        setting: The name of the option that set ``dimensions``, for the error message.
+
+    Returns:
+        The vector, as floats.
+
+    Raises:
+        ValueError: If the vector's length is not ``dimensions``.
+    """
+    vector = [float(value) for value in await embedder.embed(text)]
+    if len(vector) != dimensions:
+        raise ValueError(
+            f"strands_mongodb: the embedder returned a {len(vector)}-dimension vector and {setting!r} is "
+            f"{dimensions}. Set {setting!r} to the length the embedding model produces."
+        )
+    return vector

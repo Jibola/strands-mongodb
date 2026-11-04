@@ -90,7 +90,7 @@ one `MongoDBStorage` ends up serving three writers at once:
 
 ```
 session/    conversation snapshots, from SnapshotSessionManager
-offloader/  an oversized tool result, moved out of context by ContextOffloader
+context/    the turn's messages, stashed by the context manager
 memory/     a knowledge file, from FileMemoryStore(storage=...)
 ```
 

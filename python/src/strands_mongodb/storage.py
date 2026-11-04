@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
 
     from pymongo.asynchronous.collection import AsyncCollection
+    from strands.storage.search import SearchStrategy
 
     from .types import MongoDBConfig
 
@@ -205,6 +206,7 @@ class MongoDBStorage:
         collection: str = "storage",
         prefix: str = "",
         ttl_seconds: int | None = None,
+        search_strategy: SearchStrategy[MongoDBStorage] | None = None,
     ) -> None:
         """Create a storage over one collection.
 
@@ -222,6 +224,8 @@ class MongoDBStorage:
                 :meth:`ensure_indexes` once at startup, or run the ``createIndexes`` command in the
                 README's "Indexes and privileges" section. Documents written before the index exists
                 expire once it does.
+            search_strategy: What :meth:`search` runs instead of the default key-only scan, such as the
+                SDK's ``KeywordSearchStrategy`` or a :class:`MongoDBVectorSearchStrategy`.
 
         Raises:
             KeyError: If ``config`` has no ``database``. Mypy rejects a literal that omits it; this
@@ -243,12 +247,18 @@ class MongoDBStorage:
         normalized = _normalize_prefix(prefix).rstrip("/")
         self._prefix = f"{normalized}/" if normalized else ""
         self._ttl_seconds = ttl_seconds
+        self._search_strategy = search_strategy
         self._config = config
         # Only passed on to `_indexes.ensure`; read so a value set for a memory store is honoured here too.
         self._index_ready_timeout: float = config.get("index_ready_timeout", _indexes.READY_TIMEOUT_SECONDS)
         # Called only to fail fast on a config with no client or connection string. The result is
         # dropped: the registry is keyed by event loop, so each operation resolves its own connection.
         _client.resolve(config)
+
+    @property
+    def prefix(self) -> str:
+        """The normalized key prefix (ending in ``/``), or ``""`` when none was configured."""
+        return self._prefix
 
     @_telemetry.traced("storage", "write")
     @_reporting("writing")
@@ -265,8 +275,9 @@ class MongoDBStorage:
         Raises:
             StorageError: If the key is empty, contains a backslash or a ``..`` segment, exceeds
                 :data:`MAX_KEY_BYTES` with the prefix included, or would build a document over
-                :data:`MAX_DOCUMENT_BYTES`. Also if the collection's default collation is not binary, or
-                if the write fails, with the driver's error chained.
+                :data:`MAX_DOCUMENT_BYTES`. Also if the collection's default collation is not binary, if
+                the write fails, with the driver's error chained, or if the search strategy fails to index
+                the value (which is stored in that case).
         """
         await self._require_binary_keys()
         document_id = self._id_for(key)
@@ -288,6 +299,18 @@ class MongoDBStorage:
             document[EXPIRES_FIELD] = now + datetime.timedelta(seconds=self._ttl_seconds)
 
         await self._collection().replace_one({"_id": document_id}, document, upsert=True)
+
+        # `SearchStrategy` gained `index` in strands-agents 1.56.0; a strategy from an older release has none.
+        index = getattr(self._search_strategy, "index", None)
+        if index is None:
+            return
+        try:
+            await index(self, document_id[len(self._prefix) :], data)
+        except Exception as error:
+            raise StorageError(
+                f"strands_mongodb: wrote {_abbreviate(document_id)!r} in {self._target} but indexing it for "
+                f"search failed: {error}"
+            ) from error
 
     @_telemetry.traced("storage", "read")
     @_reporting("reading")
@@ -365,12 +388,13 @@ class MongoDBStorage:
     @_telemetry.traced("storage", "search")
     @_reporting("searching")
     async def search(self, query: str) -> builtins.list[StorageSearchResult]:
-        """Rank stored keys by how many of the query's tokens they contain.
+        """Rank stored keys by how many of the query's tokens they contain, unless ``search_strategy`` is set.
 
         Scoring matches the SDK's ``KeywordSearchStrategy`` (token overlap), but **only keys are
         scored, not payloads**: a word that appears only inside stored data does not match. In
         exchange the search is one server-side aggregation that reads no documents, where the SDK's
-        default reads every payload.
+        default reads every payload. ``FileMemoryStore`` keeps facts in payloads, so give it a
+        ``search_strategy``.
 
         Args:
             query: A natural-language string. One that tokenizes to nothing returns ``[]`` without a
@@ -378,12 +402,23 @@ class MongoDBStorage:
 
         Returns:
             Matched keys with relevance scores, highest first, ties in ascending key order. ``data`` is
-            ``None``; the SDK's consumer reads back only the keys it keeps.
+            ``None``; the SDK's consumer reads back only the keys it keeps. A ``search_strategy``'s
+            results are returned as it gives them.
 
         Raises:
             StorageError: If the query has tokens and the collection's default collation is not binary,
-                or if the aggregation fails, including part way through draining the cursor.
+                if the aggregation fails, including part way through draining the cursor, or if the
+                search strategy raises, with its error chained.
         """
+        if self._search_strategy is not None:
+            try:
+                results = await self._search_strategy.search(self, query)
+            except (StorageError, PyMongoError):
+                raise
+            except Exception as error:
+                raise StorageError(f"strands_mongodb: searching in {self._target} failed: {error}") from error
+            _telemetry.annotate("strands_mongodb.result_count", len(results))
+            return results
         tokens = tokenize(query)
         if not tokens:
             # Same short circuit as `KeywordSearchStrategy`: scoring every key zero would cost a full scan.
@@ -487,7 +522,7 @@ class MongoDBStorage:
             prefix: Prefix to prepend to every key, appended to any prefix already in force.
 
         Returns:
-            A new instance sharing this one's connection pool, collection and TTL.
+            A new instance sharing this one's connection pool, collection, TTL and search strategy.
 
         Raises:
             StorageError: If ``prefix`` contains a backslash or a ``..`` segment.
@@ -500,6 +535,7 @@ class MongoDBStorage:
             # `__init__` normalizes, so a leading slash here does not produce an empty path segment.
             prefix=f"{self._prefix}{prefix}",
             ttl_seconds=self._ttl_seconds,
+            search_strategy=self._search_strategy,
         )
         # The SDK reads this sentinel to tell that a storage is already scoped. Without it, memory keys
         # would land one level deeper here than on `LocalFileStorage`.
@@ -511,7 +547,9 @@ class MongoDBStorage:
         """Create the TTL index that makes ``ttl_seconds`` take effect, or verify it exists.
 
         The index is ``strands_expires_at_ttl`` over ``expires_at`` with ``expireAfterSeconds: 0``.
-        Without it, documents get an ``expires_at`` stamp but are never deleted.
+        Without it, documents get an ``expires_at`` stamp but are never deleted. Also creates the search
+        index of a ``search_strategy`` that has an ``index_spec()``, such as
+        :class:`MongoDBVectorSearchStrategy`'s vector index.
 
         **Nothing in this package calls this method.** An ``Agent`` builds its storage in code the
         operator does not see, and index creation there could run without the rights for it. Call it once
@@ -527,16 +565,19 @@ class MongoDBStorage:
         Raises:
             StorageError: If the collection's default collation is not binary, if an index over the same
                 keys exists with different options, if the index is absent and ``ensure_indexes`` is
-                ``False``, or if a driver call fails. The server's own code and message arrive chained.
+                ``False``, if the strategy's index build fails or does not finish in time, or if a driver
+                call fails. The server's own code and message arrive chained.
         """
         # The collation does not affect a TTL index, but a collection that cannot hold this key space is
         # not worth provisioning: it would only fail at its first write.
         await self._require_binary_keys()
         # No `@_reporting`: there is no key argument for its message, and `_indexes.ensure` already turns
         # driver errors into `StorageError`.
+        index_spec = getattr(self._search_strategy, "index_spec", None)
         await _indexes.ensure(
             self._collection(),
             ordinary=_indexes.storage_specs(),
+            search=(index_spec(),) if index_spec is not None else (),
             create=self._config.get("ensure_indexes", True),
             timeout=self._index_ready_timeout,
         )

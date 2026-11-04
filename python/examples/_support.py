@@ -218,8 +218,8 @@ def emit_summary(payload: dict[str, Any], *, enabled: bool) -> None:
 async def prefix_census(collection: Any) -> list[dict[str, Any]]:
     """Count documents and bytes per top-level key prefix, as read from the collection.
 
-    The prefixes belong to the SDK (``session/`` from ``SnapshotSessionManager``, ``offloader/`` from
-    ``ContextOffloader``, ``memory/`` from ``FileMemoryStore``), so they are discovered, not hard-coded.
+    The prefixes belong to the SDK (``session/`` from ``SnapshotSessionManager``, ``context/`` from the
+    context manager's stash, ``memory/`` from ``FileMemoryStore``), so they are discovered, not hard-coded.
 
     Args:
         collection: An ``AsyncCollection`` holding storage documents.
@@ -247,8 +247,8 @@ async def prefix_census(collection: Any) -> list[dict[str, Any]]:
 class ScriptedModel(Model):
     """A ``Model`` that reads its replies from a list instead of calling a provider.
 
-    The examples need a model only to produce a turn, so the extraction trigger and the offloader's
-    after-tool hook have something to fire on. A scripted reply does that at no cost and needs no
+    The examples need a model only to produce a turn, so the extraction trigger and the context manager
+    have something to fire on. A scripted reply does that at no cost and needs no
     provider credentials. Pass ``--model bedrock`` to use a real model.
 
     The event sequence matches the SDK's mocked provider: ``messageStart``, then ``contentBlockStart``,

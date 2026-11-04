@@ -33,7 +33,8 @@ from typing import TYPE_CHECKING, Any, Final
 import bson
 import pytest
 from strands.storage import Storage
-from strands.storage.storage import _NAMESPACED, _resolve_namespace
+from strands.storage.search import KeywordSearchStrategy
+from strands.storage.storage import _NAMESPACED, StorageSearchResult, _resolve_namespace
 from strands.types.exceptions import StorageError
 
 from strands_mongodb import _client, _indexes
@@ -224,6 +225,13 @@ class FakeStorageCollection:
     async def replace_one(self, filter: Mapping[str, Any], replacement: Mapping[str, Any], upsert: bool = False) -> Any:
         self._record("replace_one", filter, replacement, upsert=upsert)
         self.documents[str(replacement["_id"])] = dict(replacement)
+        return None
+
+    async def update_one(self, filter: Mapping[str, Any], update: Mapping[str, Any]) -> Any:
+        self._record("update_one", filter, update)
+        for document in self.matching(filter):
+            if all(document.get(field) == value for field, value in filter.items() if field != "_id"):
+                document.update(update.get("$set", {}))
         return None
 
     async def find_one(self, filter: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
@@ -1094,6 +1102,27 @@ class TestNoStorageMethodRendersThePassword:
         assert_no_leak(str(caught.value), caught.value)
 
 
+class RecordingStrategy:
+    """A ``SearchStrategy`` that records what ``MongoDBStorage`` hands it and answers a fixed result."""
+
+    def __init__(self, *, results: Sequence[StorageSearchResult] = (), error: BaseException | None = None) -> None:
+        self.indexed: list[tuple[MongoDBStorage, str, bytes]] = []
+        self.searched: list[tuple[MongoDBStorage, str]] = []
+        self._results = list(results)
+        self._error = error
+
+    async def index(self, storage: MongoDBStorage, key: str, data: bytes, **kwargs: Any) -> None:
+        self.indexed.append((storage, key, data))
+        if self._error is not None:
+            raise self._error
+
+    async def search(self, storage: MongoDBStorage, query: str, **kwargs: Any) -> list[StorageSearchResult]:
+        self.searched.append((storage, query))
+        if self._error is not None:
+            raise self._error
+        return self._results
+
+
 class TestSearchIsOneAggregation:
     """AT-032a, AT-032c — the pipeline this package emits, and the round trips it does not make.
 
@@ -1272,6 +1301,90 @@ def _string_lists(value: Any) -> Iterator[list[str]]:
     elif isinstance(value, Mapping):
         for item in value.values():
             yield from _string_lists(item)
+
+
+class TestAConfiguredSearchStrategyIsCalledOnWriteAndSearch:
+    """AT-236 — ``search_strategy`` follows the SDK's ``S3Storage`` contract.
+
+    ``write`` indexes after its upsert with the normalized key relative to the instance, ``search``
+    delegates, and ``namespace()`` views share the strategy.
+    """
+
+    async def test_write_indexes_the_normalized_relative_key_after_the_upsert(self) -> None:
+        collection = FakeStorageCollection()
+        strategy = RecordingStrategy()
+        storage = unit_storage(collection, prefix="tenant-a", search_strategy=strategy)
+
+        await storage.write("/notes//one.md", b"text")
+
+        assert collection.names_called[-1] == "replace_one"
+        assert [(key, data) for _, key, data in strategy.indexed] == [("notes/one.md", b"text")]
+        assert strategy.indexed[0][0] is storage
+
+    async def test_an_indexing_failure_raises_and_the_value_stays_written(self) -> None:
+        collection = FakeStorageCollection()
+        storage = unit_storage(collection, search_strategy=RecordingStrategy(error=RuntimeError("embedder down")))
+
+        with pytest.raises(StorageError, match="but indexing it for search failed") as caught:
+            await storage.write("k", b"v")
+
+        assert isinstance(caught.value.__cause__, RuntimeError)
+        assert collection.documents["k"]["data"] == b"v"
+
+    async def test_a_strategy_without_index_is_only_searched(self) -> None:
+        """strands-agents releases before 1.56.0 define ``SearchStrategy`` with ``search`` alone."""
+
+        class SearchOnly:
+            async def search(self, storage: Any, query: str, **kwargs: Any) -> list[StorageSearchResult]:
+                return []
+
+        collection = FakeStorageCollection()
+        storage = unit_storage(collection, search_strategy=SearchOnly())  # type: ignore[arg-type]
+
+        await storage.write("k", b"v")
+
+        assert collection.names_called == ["replace_one"]
+
+    async def test_search_returns_what_the_strategy_returns(self) -> None:
+        answer = [StorageSearchResult(key="k", score=0.9, data=b"v")]
+        strategy = RecordingStrategy(results=answer)
+        collection = FakeStorageCollection()
+        storage = unit_storage(collection, search_strategy=strategy)
+
+        found = await storage.search("query")
+
+        assert found == answer
+        assert strategy.searched == [(storage, "query")]
+        assert collection.names_called == []
+
+    async def test_a_strategy_error_becomes_a_storage_error_with_the_cause_chained(self) -> None:
+        storage = unit_storage(search_strategy=RecordingStrategy(error=RuntimeError("embedder down")))
+
+        with pytest.raises(StorageError, match=r"searching in appdb\.storage failed") as caught:
+            await storage.search("query")
+
+        assert isinstance(caught.value.__cause__, RuntimeError)
+
+    async def test_the_sdk_keyword_strategy_matches_a_word_only_in_the_payload(self) -> None:
+        """The ``FileMemoryStore`` shape the default scan misses: the fact is in the body, the key is a
+        heading slug."""
+        collection = FakeStorageCollection(
+            documents=[{"_id": "memory/m/user-preferences.md", "data": b"# User preferences\nprefers dark mode"}]
+        )
+        storage = unit_storage(collection, search_strategy=KeywordSearchStrategy())
+
+        found = await storage.search("dark mode")
+
+        assert [result.key for result in found] == ["memory/m/user-preferences.md"]
+        assert await unit_storage(collection).search("dark mode") == []
+
+    def test_namespace_views_share_the_strategy(self) -> None:
+        strategy = RecordingStrategy()
+
+        scoped = unit_storage(search_strategy=strategy).namespace("memory")
+
+        assert scoped._search_strategy is strategy
+        assert scoped.prefix == "memory/"
 
 
 class TestEnsureIndexesIsExplicitAndIdempotent:

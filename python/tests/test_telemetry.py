@@ -802,6 +802,7 @@ PINNED_RECORDS: Final = {
     ("_telemetry.py", "debug", "'strands_mongodb: dropped span attribute %r, which is not on the allow-list'"),
     ("memory_store.py", "warning", "_RESERVED_KEY_COLLISION"),
     ("memory_store.py", "warning", "_NO_SEARCH_SETUP"),
+    ("memory_store.py", "info", "_TIER_UNAVAILABLE"),
     ("memory_store.py", "warning", "_TIER_UNAVAILABLE"),
     ("memory_store.py", "warning", "_BELOW_VECTOR"),
     ("memory_store.py", "warning", "_BOUND_DECLINED_FUSION"),

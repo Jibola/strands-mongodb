@@ -344,7 +344,7 @@ class TestTheStorageExampleAcrossTwoProcesses:
         keys = [
             str(document["_id"]) async for document in contract_database[unique_collection_name].find({}, {"_id": 1})
         ]
-        for prefix in ("session/", "offloader/", "memory/"):
+        for prefix in ("session/", "context/", "memory/"):
             assert any(key.startswith(prefix) for key in keys), f"nothing under {prefix!r}: {sorted(keys)}"
 
         second = _run("unified_storage.py", "resume", *arguments, env=environment)
