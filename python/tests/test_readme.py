@@ -53,7 +53,6 @@ from conftest import skip_if_search_is_unreachable
 from pymongo import AsyncMongoClient, monitoring
 from pymongo.auth import MECHANISMS
 from pymongo.errors import OperationFailure
-from strands.storage.search import Embedder
 from strands.types.exceptions import StorageError
 
 from strands_mongodb import _client, _indexes, _pipeline, _telemetry
@@ -1579,7 +1578,7 @@ def _exec_voyage_block(monkeypatch: pytest.MonkeyPatch, connection: dict[str, An
 
 
 class TestTheVoyageEmbedderSnippet:
-    """The ``VoyageEmbedder`` the README defines is an SDK ``Embedder`` the store accepts."""
+    """The ``VoyageEmbedder`` the README defines is an embedder the store accepts."""
 
     async def test_it_embeds_one_text_with_the_named_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
         namespace = _exec_voyage_block(monkeypatch, {"connection_string": "mongodb://localhost:1", "database": "d"})
@@ -1587,7 +1586,7 @@ class TestTheVoyageEmbedderSnippet:
 
         vector = await embedder.embed("dark mode")
 
-        assert isinstance(embedder, Embedder)
+        assert inspect.iscoroutinefunction(embedder.embed)
         assert len(vector) == 1024
         assert _FakeVoyageClient.calls == [(["dark mode"], "voyage-4-lite")]
 

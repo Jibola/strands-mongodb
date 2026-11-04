@@ -9,7 +9,7 @@ Agent(storage=...) takes one backend and hands it to every subsystem that does n
 MongoDBStorage serves three writers, each under its own key prefix:
 
     session/    conversation snapshots, from SnapshotSessionManager
-    context/    an oversized tool result, stashed by the context manager
+    context/    the turn's messages, stashed by the context manager
     memory/     a knowledge file, from FileMemoryStore(storage=...)
 
 The run step runs a turn that writes all three, then prints a census of the collection read back from
@@ -276,7 +276,7 @@ def describe(step: str) -> list[str]:
             "build one MongoDBStorage and pass it as Agent(storage=...)",
             'add a SnapshotSessionManager and context_manager="auto", neither carrying storage of its own',
             f"run one turn in which the model calls {reservation_book.tool_name!r}, whose result is far "
-            "over the offload threshold, so the context manager stashes it under context/",
+            "over the offload threshold; the context manager stashes the turn under context/",
             f"write one knowledge file through FileMemoryStore({MEMORY_STORE!r}, storage=...)",
             "save an immutable snapshot, then read the prefix census back with a plain driver",
         ]

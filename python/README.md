@@ -496,15 +496,14 @@ Setting `embedding_dimensions` and `similarity` selects the manual path, where t
 <!-- manual-vectors -->
 The package indexes and queries `embedding` but never fills it on its own. Pass an `embedder` and `add()`
 and string `search()` embed for you, so `MemoryManager` works unchanged.
-Any SDK `Embedder` works. The SDK ships `BedrockEmbedder`; for Voyage AI, subclass `Embedder`:
+Any object with an `async embed(text) -> list[float]` method works, such as this one for Voyage AI:
 
 <!-- skip: it needs a Voyage AI API key -->
 ```python
 import voyageai
-from strands.storage.search import Embedder
 
 
-class VoyageEmbedder(Embedder):
+class VoyageEmbedder:
     def __init__(self, model: str = "voyage-4-lite") -> None:
         self._client = voyageai.AsyncClient()  # reads VOYAGE_API_KEY
         self._model = model
@@ -557,10 +556,6 @@ caller cannot set it through `filter` or `metadata`; an absent scope resolves to
 rather than to no predicate; a caller `filter` composes as a narrowing conjunction and cannot widen the
 read; and `delete()` reaches exactly as far as `search()` does. The tests for these run two stores in
 one collection and check isolation in both directions.
-
-On storage, `prefix` and `namespace()` differ in one way that matters to an agent. A `namespace()` view
-tells the SDK it is already namespaced, so as a context manager `stash` it becomes the stash root, and
-`retrieve_context` can read any key under it. Give the stash a view of its own.
 
 ![What every memory write and read goes through: a write is stamped with scope and store name and deduplicated by content hash; a read passes the filter guard and is limited to the store's scope](https://raw.githubusercontent.com/mongodb/strands-mongodb/main/docs/images/memory-guards.png)
 
