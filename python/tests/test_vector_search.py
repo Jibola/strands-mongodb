@@ -187,6 +187,27 @@ class TestEnsureIndexes:
 
         assert seen == [(configured.index_spec(),), ()]
 
+    async def test_any_strategy_with_an_index_spec_gets_its_index(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: list[Sequence[_indexes.SearchIndexSpec]] = []
+
+        async def ensure(collection: Any, **kwargs: Any) -> None:
+            seen.append(kwargs["search"])
+
+        spec = _indexes.SearchIndexSpec(name="text", definition={"mappings": {"dynamic": True}}, type="search")
+
+        class TextStrategy:
+            def index_spec(self) -> _indexes.SearchIndexSpec:
+                return spec
+
+            async def search(self, storage: Any, query: str, **kwargs: Any) -> list[Any]:
+                return []
+
+        monkeypatch.setattr(_indexes, "ensure", ensure)
+
+        await unit_storage(search_strategy=TextStrategy()).ensure_indexes()  # type: ignore[arg-type]
+
+        assert seen == [(spec,)]
+
 
 @pytest.fixture
 async def vector_storage(

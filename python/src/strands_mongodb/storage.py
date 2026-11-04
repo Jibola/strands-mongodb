@@ -35,7 +35,6 @@ from strands.types.exceptions import StorageError
 
 from . import _client, _indexes, _telemetry
 from ._indexes import EXPIRES_FIELD
-from .vector_search import MongoDBVectorSearchStrategy
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine
@@ -548,7 +547,8 @@ class MongoDBStorage:
         """Create the TTL index that makes ``ttl_seconds`` take effect, or verify it exists.
 
         The index is ``strands_expires_at_ttl`` over ``expires_at`` with ``expireAfterSeconds: 0``.
-        Without it, documents get an ``expires_at`` stamp but are never deleted. Also creates a
+        Without it, documents get an ``expires_at`` stamp but are never deleted. Also creates the search
+        index of a ``search_strategy`` that has an ``index_spec()``, such as
         :class:`MongoDBVectorSearchStrategy`'s vector index.
 
         **Nothing in this package calls this method.** An ``Agent`` builds its storage in code the
@@ -565,7 +565,7 @@ class MongoDBStorage:
         Raises:
             StorageError: If the collection's default collation is not binary, if an index over the same
                 keys exists with different options, if the index is absent and ``ensure_indexes`` is
-                ``False``, if the vector index build fails or does not finish in time, or if a driver
+                ``False``, if the strategy's index build fails or does not finish in time, or if a driver
                 call fails. The server's own code and message arrive chained.
         """
         # The collation does not affect a TTL index, but a collection that cannot hold this key space is
@@ -573,11 +573,11 @@ class MongoDBStorage:
         await self._require_binary_keys()
         # No `@_reporting`: there is no key argument for its message, and `_indexes.ensure` already turns
         # driver errors into `StorageError`.
-        strategy = self._search_strategy
+        index_spec = getattr(self._search_strategy, "index_spec", None)
         await _indexes.ensure(
             self._collection(),
             ordinary=_indexes.storage_specs(),
-            search=(strategy.index_spec(),) if isinstance(strategy, MongoDBVectorSearchStrategy) else (),
+            search=(index_spec(),) if index_spec is not None else (),
             create=self._config.get("ensure_indexes", True),
             timeout=self._index_ready_timeout,
         )
