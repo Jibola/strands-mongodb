@@ -196,6 +196,30 @@ The workflow cannot be run end to end without a tag, and a tag publishes. So:
   name contains a space, to confirm the word-splitting fix.
 - First real exercise is a release candidate tag, after the blockers clear.
 
+### There is no dry run, and none should be added
+
+`test_a_tag_push_is_the_only_trigger` forbids `workflow_dispatch`, deliberately:
+a manually triggerable publish is a publish anybody with write access can fire.
+Do not add one to get a test run, and do not add one temporarily.
+
+So the first execution of this pipeline is a real release. Mitigate it in this
+order, not by weakening the trigger:
+
+1. **Smoke-test in a scratch repo first.** A throwaway repo under the same org
+   can carry a copy of the workflow, a trivial package and TestPyPI as the
+   publish target. That exercises the OIDC trust policy, the Garasign
+   container and the action wiring without touching strands-mongodb's name on
+   PyPI.
+2. **Then tag `python-v0.1.0rc1` on strands-mongodb.** A pre-release is the
+   closest thing to a dry run that the trigger permits: `pip install` will not
+   resolve to it without `--pre`, so a broken artifact does not reach anyone
+   who did not ask for it.
+
+A tag is permanent for this purpose. PyPI does not allow re-uploading a
+filename, and deleting a release does not free the version, so `rc1` is spent
+once. Expect to burn `rc2`, `rc3` and so on; budget for that rather than
+planning to reuse one.
+
 ## Blockers needing an administrator
 
 1. **AWS OIDC trust policy** covers `repo:mongodb-developer/*`;
