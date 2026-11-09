@@ -339,11 +339,12 @@ jobs:
           gh release upload "$TAG" release/* --clobber
 
   sbom:
-    name: Augment and attach the SBOM
+    name: Generate and attach the SBOM
     needs: github-release
-    # Inert until the Kondukto secret is provisioned. A gate rather than an absence, so that turning
-    # it on is a repository variable and not a second code review.
-    if: vars.KONDUKTO_SECRET_ID != ''
+    # Not gated. Generating a CycloneDX SBOM needs no credential and no vendor, so a release ships
+    # one from the first tag. Only the SilkBomb/Kondukto augmentation is gated, step by step below:
+    # that is the part that needs the ECR image and a Kondukto token. An unaugmented SBOM is a real
+    # SBOM -- it lists the dependencies -- it simply carries no vulnerability or licence annotation.
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -375,7 +376,11 @@ jobs:
           cyclonedx-py environment --output-format json --outfile sbom.json
           test -s sbom.json
 
+      # The three steps below are the augmentation. Each is gated on the same variable, so turning
+      # Kondukto on is setting a repository variable rather than a second code review -- and turning
+      # it off again, if the tool is replaced, does not cost a release.
       - name: Set up the release environment
+        if: vars.KONDUKTO_SECRET_ID != ''
         uses: caseyclements/abx-release-tools/actions/setup@e89529bd0c362149a3faf6b154ecba3a911c2f7e
         with:
           aws_role_arn: ${{ vars.AWS_SIGNING_ROLE_ARN }}
@@ -383,9 +388,25 @@ jobs:
           aws_secret_id: ${{ vars.KONDUKTO_SECRET_ID }}
 
       - name: Augment the SBOM
+        if: vars.KONDUKTO_SECRET_ID != ''
         uses: caseyclements/abx-release-tools/actions/sbom@e89529bd0c362149a3faf6b154ecba3a911c2f7e
         with:
           sbom_in_path: python/sbom.json
+
+      # One asset name either way, so a consumer looks in one place and does not have to know
+      # whether Kondukto was configured on the day of the release. Whether the SBOM was augmented
+      # shows in its contents.
+      - name: Collect the SBOM that will be attached
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          if [ -n "${RELEASE_ASSETS:-}" ] && [ -s "$RELEASE_ASSETS/cyclonedx.sbom.json" ]; then
+            cp -- "$RELEASE_ASSETS/cyclonedx.sbom.json" release/cyclonedx.sbom.json
+          else
+            cp -- python/sbom.json release/cyclonedx.sbom.json
+          fi
+          test -s release/cyclonedx.sbom.json
 
       - name: Attach the SBOM to the release
         working-directory: ${{ github.workspace }}
@@ -394,7 +415,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          gh release upload "$TAG" "$RELEASE_ASSETS/cyclonedx.sbom.json" --clobber
+          gh release upload "$TAG" release/cyclonedx.sbom.json --clobber
 
   trace:
     name: Record the authorized publication

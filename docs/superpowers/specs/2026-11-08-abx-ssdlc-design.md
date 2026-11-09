@@ -105,9 +105,16 @@ contract ─┘                  └──────────────�
   says to attach signatures to the GitHub Release as pymongo does; the repo
   creates no Release today, so this job introduces one. A signature nobody can
   download does not meet the intent of the guide.
-- **`sbom`** — `needs: github-release`, gated on `vars.KONDUKTO_SECRET_ID != ''`.
-  Generates a CycloneDX SBOM from the project, runs SilkBomb `update` then
-  `augment`, and attaches the result to the Release.
+- **`sbom`** — `needs: github-release`, **not gated**. Generates a CycloneDX
+  SBOM from the project and attaches it to the Release as
+  `cyclonedx.sbom.json`. The SilkBomb `update`/`augment` pass is gated *at step
+  level* on `vars.KONDUKTO_SECRET_ID != ''`, because that is the only part
+  needing the ECR image and a Kondukto token. Gating the whole job fused the
+  two and shipped no SBOM at all while the variable was unset — which is the
+  state the repo is in, and, with Kondukto possibly being deprecated, may not
+  be a short-lived one. The dependency list is what a reviewer, a consumer and
+  a vulnerability scan actually want and it costs nothing, so it ships from the
+  first tag; the annotation arrives when the vendor does.
 - **`trace`** — `needs: publish`, gated on `vars.AWS_RELEASE_BUCKET != ''`.
   Writes `authorized-publication.txt` with `authorized-pub` and uploads it with
   `upload-s3-assets`. Papertrail itself is reachable only from Evergreen and

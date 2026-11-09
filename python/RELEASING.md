@@ -58,7 +58,7 @@ same history, and its tags must not reach this workflow.
 | `sign` | Sign the artifact | Checksums the wheel and the sdist, signs all three with Garasign, uploads `python-signatures` |
 | `publish` | Publish to PyPI | Downloads `python-dist` and uploads it |
 | `github-release` | Attach the signatures to the GitHub Release | Creates the Release for the tag if it does not exist, attaches the artifacts, the `.sig` files and `SHA256SUMS` |
-| `sbom` | Augment and attach the SBOM | Generates a CycloneDX SBOM, augments it through SilkBomb, attaches it to the Release. **Skipped** unless `KONDUKTO_SECRET_ID` is set |
+| `sbom` | Generate and attach the SBOM | Generates a CycloneDX SBOM and attaches it to the Release as `cyclonedx.sbom.json`. Always runs. Augments it through SilkBomb/Kondukto first **only** if `KONDUKTO_SECRET_ID` is set |
 | `trace` | Record the authorized publication | Writes the authorized-publication report and uploads it to S3. **Skipped** unless `AWS_RELEASE_BUCKET` is set |
 
 `gate` and `contract` run in parallel; `build` needs both; `sign` needs `build`; `publish` needs
@@ -67,9 +67,15 @@ same history, and its tags must not reach this workflow.
 `publish` needs `sign` rather than `build` on purpose: an artifact that was not signed cannot reach
 PyPI, because the job that uploads it does not start until the job that signs it has succeeded.
 
-`sbom` and `trace` are gated on repository variables and are skipped, not failed, while those
-variables are empty. A skipped job is green. They become live the moment the variables are set, with
-no change to this file or to the workflow.
+`trace` is gated on a repository variable and is skipped, not failed, while that variable is empty.
+A skipped job is green. It becomes live the moment the variable is set, with no change to this file
+or to the workflow.
+
+`sbom` is **not** gated. Generating a CycloneDX SBOM needs no credential and no vendor, so every
+release ships one. Only the SilkBomb/Kondukto augmentation waits on `KONDUKTO_SECRET_ID`, step by
+step inside the job. The asset is called `cyclonedx.sbom.json` either way, so there is one place to
+look; whether it was augmented shows in its contents, not in its name. An unaugmented SBOM still
+lists every dependency -- what it lacks is the vulnerability and licence annotation Kondukto adds.
 
 The check inside `build` compares versions: the built wheel's version must equal the
 tag, compared as PEP 440 objects rather than as strings, so `python-v0.1.0-rc1` and `python-v0.1.0rc1`

@@ -930,3 +930,62 @@ class TestTheActionThatUploadsIsPinnedToContentRatherThanToAPlace:
         assert not _DIGEST.match("release/v1")
         assert not _DIGEST.match("v7")
         assert not _DIGEST.match("v7.0.0")
+
+
+class TestAnSbomShipsWhetherOrNotAVendorIsConfigured:
+    """``AT-171`` -- the SBOM is generated on every release; only its augmentation is optional.
+
+    Two different things live in the SBOM job. Generating a CycloneDX SBOM is ``cyclonedx-py`` reading
+    the installed environment: no credential, no network service, no vendor. Augmenting it is SilkBomb
+    talking to Kondukto, which needs an image from MongoDB's ECR and a Kondukto token, and which is
+    therefore the part that waits on provisioning.
+
+    Gating the whole job on the Kondukto variable fuses the two, and a release then ships no SBOM at
+    all while the variable is unset -- which is the state the repository is in and expects to stay in
+    for a while. Product Security owns Kondukto now and has indicated it may be deprecated, so "the
+    variable is unset" is not reliably a short-lived condition and may outlive the tool.
+
+    The dependency list is the part an SSDLC reviewer, a downstream consumer and a vulnerability scan
+    all actually want, and it costs nothing. So it ships unconditionally, and the annotation arrives
+    when the vendor does.
+    """
+
+    def test_generating_the_sbom_is_not_gated_on_the_vendor(self, workflow: dict[str, Any]) -> None:
+        """AT-171 -- neither the job nor the generation step waits on ``KONDUKTO_SECRET_ID``."""
+        jobs = _jobs(workflow)
+        producers = {
+            name: job for name, job in jobs.items() if any("cyclonedx-py" in str(step.get("run", "")) for step in _steps(job))
+        }
+        assert producers, "no job generates an SBOM, so no release can ship one"
+
+        for name, job in producers.items():
+            condition = str(job.get("if", ""))
+            assert "KONDUKTO" not in condition, (
+                f"job `{name}` generates the SBOM but is gated on {condition!r}: while that variable is "
+                "unset the release ships no SBOM at all, and generating one needs no Kondukto"
+            )
+            for step in _steps(job):
+                if "cyclonedx-py" in str(step.get("run", "")):
+                    assert "KONDUKTO" not in str(step.get("if", "")), (
+                        f"the generation step in `{name}` is gated on Kondukto; only the augmentation is"
+                    )
+
+    def test_the_augmentation_is_gated_so_an_unprovisioned_vendor_does_not_fail_the_release(
+        self, workflow: dict[str, Any]
+    ) -> None:
+        """AT-171 -- every step that talks to SilkBomb or Kondukto tests the variable first.
+
+        Ungating the job is only safe because of this. A SilkBomb step that ran with no token would
+        fail the job, and a failing SBOM job after a successful publish is a red release for a reason
+        nobody can act on.
+        """
+        jobs = _jobs(workflow)
+        for name, job in jobs.items():
+            for step in _steps(job):
+                uses = str(step.get("uses", ""))
+                if "abx-release-tools/actions/sbom" not in uses and "KONDUKTO_SECRET_ID" not in str(step.get("with", "")):
+                    continue
+                assert "KONDUKTO_SECRET_ID" in str(step.get("if", "")), (
+                    f"step {step.get('name', uses)!r} in `{name}` needs Kondukto but does not test "
+                    "`vars.KONDUKTO_SECRET_ID`, so an unprovisioned vendor fails a successful release"
+                )
