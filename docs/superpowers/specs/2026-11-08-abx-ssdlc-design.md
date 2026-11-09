@@ -224,11 +224,30 @@ planning to reuse one.
 
 1. **AWS OIDC trust policy** covers `repo:mongodb-developer/*`;
    `mongodb/strands-mongodb` is in the `mongodb` org and is probably not
-   covered. *Unverified inference — confirm before acting.*
-   (#ask-devprod-release-tools, Zakhar Kleyman.)
+   covered. *Unverified inference.* Zakhar Kleyman (ProdSec, 2026-11-09) cannot
+   read it out of the policy either and asked for an **empirical** answer: run a
+   workflow in a `mongodb`-org repository that tries to assume the same role,
+   and report what STS says. The scratch-repo smoke test under
+   "There is no dry run" answers this as a side effect, which is the cheapest
+   way to get it; the alternative is waiting on his CloudTrail pull.
+   Note the scratch repo must be in the **`mongodb`** org to answer the
+   question — one in `mongodb-developer` is already covered and proves nothing
+   about `mongodb`.
 2. **Kondukto** RNDSEC onboarding ticket for the repo, plus a CI API token.
-   (#ask-product-security.)
-3. **Release S3 bucket** agreed with DevProd Release Infrastructure.
+   (#ask-product-security.) Zakhar reports Kondukto is **owned by Product
+   Security now and may be being deprecated** — "Silk" in SilkBomb is the
+   vendor before Kondukto, and the tooling turns over often. Ask what the
+   successor is before filing an onboarding ticket for a tool on its way out.
+   This does not change the workflow: the `sbom` job is gated on
+   `vars.KONDUKTO_SECRET_ID` and stays skipped until somebody sets it. What
+   changes is only which ticket to file and against which tool.
+3. **S3 bucket** agreed with DevProd Release Infrastructure. Not a *release*
+   bucket — Zakhar: release buckets are CDN-connected, and this is an
+   **Evergreen** bucket, which is the right kind for the Papertrail
+   authorized-publication report. He recalls a self-service route through
+   Backstage and is unsure whether it is still supported. The workflow reads
+   `vars.AWS_RELEASE_BUCKET`, whose name is now inaccurate; rename it when the
+   bucket is actually provisioned, so the variable and the thing match.
 4. **Papertrail credentials** — the guide does not confirm delivery
    (DEVPROD-44346).
 5. **`pypi` environment with required reviewers**, and the PyPI pending

@@ -188,7 +188,9 @@ jobs:
 
   publish:
     name: Publish to PyPI
-    needs: build
+    # `sign`, not `build`: an artifact that was not signed can never reach PyPI, because the job that
+    # uploads it does not run until the job that signs it has succeeded.
+    needs: sign
     runs-on: ubuntu-latest
     # This does not cut the approval short: the budget starts when the job starts, after a reviewer
     # approves. GitHub cancels an unapproved run after thirty days on its own clock.
@@ -221,3 +223,225 @@ jobs:
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # release/v1
         with:
           packages-dir: dist/
+
+  # ---------------------------------------------------------------------------------------------
+  # ABX SSDLC steps. `sign` is required; `sbom` and `trace` are gated on repository variables and
+  # skip cleanly until the credentials behind them are provisioned. The actions come from
+  # abx-release-tools, hash-pinned: the owner is a personal fork today and moves to a MongoDB org,
+  # at which point the owner and the pins change together.
+  # ---------------------------------------------------------------------------------------------
+
+  sign:
+    name: Sign the artifact
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15  # A container pull, three signatures, and the AWS round trip.
+
+    # A credential scope, not an approval gate, so this environment carries no required reviewers.
+    # `pypi` is where a human approves; two prompts for one release would train people to click through.
+    environment:
+      name: release-signing
+
+    permissions:
+      # Exchanged for the AWS role that reads the Garasign credentials out of Secrets Manager.
+      id-token: write
+
+    steps:
+      # Every action in this job is pinned to a digest because the job holds `id-token: write`.
+      - name: Download the artifact the build job verified
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: python-dist
+          path: dist/
+
+      # Over the two files that will be published, computed here rather than in `build`: anything
+      # left in the build job's `dist/` is uploaded as part of `python-dist`, and the publish action
+      # offers PyPI everything it finds in the directory it is handed.
+      - name: Checksum the wheel and the sdist
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -- *.whl *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      # The role ARN, the region and the *name* of a secret. None of the three is a credential: the
+      # credential is the OIDC token minted for this job, which is why this job is environment-bound.
+      - name: Set up the release environment
+        uses: caseyclements/abx-release-tools/actions/setup@e89529bd0c362149a3faf6b154ecba3a911c2f7e
+        with:
+          aws_role_arn: ${{ vars.AWS_SIGNING_ROLE_ARN }}
+          aws_region_name: ${{ vars.AWS_SIGNING_REGION }}
+          aws_secret_id: ${{ vars.AWS_SIGNING_SECRET_ID }}
+
+      # Newline-separated: the space-separated form cannot express a filename containing a space,
+      # and a pattern that matches nothing is an error rather than a quietly unsigned artifact.
+      - name: Sign the artifacts
+        uses: caseyclements/abx-release-tools/actions/gpg-sign@e89529bd0c362149a3faf6b154ecba3a911c2f7e
+        with:
+          filenames: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+      # The signatures are moved to RELEASE_ASSETS by the action; SHA256SUMS itself is not, and the
+      # GitHub Release needs both.
+      - name: Collect the signatures and the checksums
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          cp -- dist/SHA256SUMS "$RELEASE_ASSETS/"
+          ls -l "$RELEASE_ASSETS"
+
+      - name: Upload the signatures
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
+        with:
+          name: python-signatures
+          path: ${{ env.RELEASE_ASSETS }}
+          if-no-files-found: error
+
+  github-release:
+    name: Attach the signatures to the GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      # Creating the Release and uploading assets to it. No OIDC here: this job mints no credential.
+      contents: write
+
+    steps:
+      - name: Download the artifact that was published
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: python-dist
+          path: release/
+
+      - name: Download the signatures
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: python-signatures
+          path: release/
+
+      # `gh release create` is idempotent only in the sense that it fails if the release exists, so
+      # the existence check comes first. A signature nobody can download does not meet the intent of
+      # the signing guide, which is why this job exists at all.
+      - name: Create the release if it does not exist, then attach everything
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes "Release $TAG"
+          fi
+          gh release upload "$TAG" release/* --clobber
+
+  sbom:
+    name: Augment and attach the SBOM
+    needs: github-release
+    # Inert until the Kondukto secret is provisioned. A gate rather than an absence, so that turning
+    # it on is a repository variable and not a second code review.
+    if: vars.KONDUKTO_SECRET_ID != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    environment:
+      name: release-signing
+
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          # The SBOM is generated from an installed copy of the project, so hatch-vcs resolves the
+          # version here too. A shallow clone has no tag and the SBOM would name a `.dev` version.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@f677139bbc7f481bc1ad0dde94de0f5d1dfb6f87  # v7.1.0
+        with:
+          python-version: '3.13'
+
+      - name: Generate the CycloneDX SBOM
+        run: |
+          set -euo pipefail
+          pip install --quiet cyclonedx-bom
+          pip install --quiet .
+          cyclonedx-py environment --output-format json --outfile sbom.json
+          test -s sbom.json
+
+      - name: Set up the release environment
+        uses: caseyclements/abx-release-tools/actions/setup@e89529bd0c362149a3faf6b154ecba3a911c2f7e
+        with:
+          aws_role_arn: ${{ vars.AWS_SIGNING_ROLE_ARN }}
+          aws_region_name: ${{ vars.AWS_SIGNING_REGION }}
+          aws_secret_id: ${{ vars.KONDUKTO_SECRET_ID }}
+
+      - name: Augment the SBOM
+        uses: caseyclements/abx-release-tools/actions/sbom@e89529bd0c362149a3faf6b154ecba3a911c2f7e
+        with:
+          sbom_in_path: python/sbom.json
+
+      - name: Attach the SBOM to the release
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" "$RELEASE_ASSETS/cyclonedx.sbom.json" --clobber
+
+  trace:
+    name: Record the authorized publication
+    needs: publish
+    # Inert until the release bucket exists. Papertrail itself is reachable only from Evergreen and
+    # Drone hosts inside AWS, never from a GitHub Actions runner, so the sanctioned path from here is
+    # the S3 report that mongo-python-driver writes.
+    if: vars.AWS_RELEASE_BUCKET != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    environment:
+      name: release-signing
+
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download the artifact that was published
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: python-dist
+          path: dist/
+
+      - name: The version this run published
+        id: version
+        run: echo "value=${GITHUB_REF_NAME#python-v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up the release environment
+        uses: caseyclements/abx-release-tools/actions/setup@e89529bd0c362149a3faf6b154ecba3a911c2f7e
+        with:
+          aws_role_arn: ${{ vars.AWS_SIGNING_ROLE_ARN }}
+          aws_region_name: ${{ vars.AWS_SIGNING_REGION }}
+          aws_secret_id: ${{ vars.AWS_SIGNING_SECRET_ID }}
+
+      - name: Write the authorized publication report
+        uses: caseyclements/abx-release-tools/actions/authorized-pub@e89529bd0c362149a3faf6b154ecba3a911c2f7e
+        with:
+          product_name: strands-mongodb
+          release_version: ${{ steps.version.outputs.value }}
+          token: ${{ github.token }}
+          filenames: |
+            dist/*.whl
+            dist/*.tar.gz
+
+      - name: Upload the report to S3
+        uses: caseyclements/abx-release-tools/actions/upload-s3-assets@e89529bd0c362149a3faf6b154ecba3a911c2f7e
+        with:
+          version: ${{ steps.version.outputs.value }}
+          product_name: strands-mongodb

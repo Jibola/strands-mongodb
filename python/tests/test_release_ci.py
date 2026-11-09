@@ -222,15 +222,33 @@ class TestNothingHereIsALongLivedCredential:
             f"and no long-lived credential should exist to reference"
         )
 
-    def test_the_oidc_permission_is_raised_on_exactly_one_job(self, workflow: dict[str, Any]) -> None:
-        """``id-token: write`` is what exchanges for the upload credential, so its blast radius is
-        every job that holds it. One job needs it.
-        """
-        holders = [
-            name for name, job in _jobs(workflow).items() if (job.get("permissions") or {}).get("id-token") == "write"
-        ]
+    def test_every_job_holding_oidc_is_bound_to_an_environment(self, workflow: dict[str, Any]) -> None:
+        """``id-token: write`` is what exchanges for a cloud credential, so every job holding it must
+        name an environment.
 
-        assert len(holders) == 1, f"`id-token: write` is held by {holders}, and exactly one job should hold it"
+        An environment is what keeps a job from minting a credential unsupervised: it is the binding
+        PyPI verifies, the place required reviewers live, and the scope an org admin can revoke in one
+        action. This asserts that at least one job raises the permission -- a workflow where nothing
+        can authenticate publishes nothing -- and that each one that does names an environment.
+
+        This replaces ``test_the_oidc_permission_is_raised_on_exactly_one_job`` because four jobs now
+        assume a role over OIDC -- signing, publishing, the SBOM and the authorized-publication report
+        -- so a count of holders no longer distinguishes a correct workflow from a careless one. The
+        count stood in for supervision; naming the environment states it directly, and states it of
+        every holder rather than leaving the one holder's binding unchecked.
+        """
+        holders = {
+            name: job for name, job in _jobs(workflow).items() if (job.get("permissions") or {}).get("id-token") == "write"
+        }
+
+        assert holders, "no job raises `id-token: write`, so nothing here can authenticate to PyPI or AWS"
+        for name, job in holders.items():
+            environment = job.get("environment")
+            bound = environment if isinstance(environment, str) else (environment or {}).get("name")
+            assert bound, (
+                f"job {name!r} raises `id-token: write` without naming an environment, so the token it "
+                f"mints is scoped by nothing a repository administrator can see or revoke"
+            )
 
     def test_the_workflow_default_grants_no_write(self, workflow: dict[str, Any]) -> None:
         """The top-level default is read-only, so a job that raises nothing inherits nothing."""
@@ -328,8 +346,12 @@ class TestThePublishedArtifactIsTheVerifiedArtifact:
         release over PEP 440 spelling, and a maintainer who has just been failed over spelling is
         the person most likely to replace the check with something weaker.
         """
+        # Located by what the step does, not merely by the variable it reads. `GITHUB_REF_NAME` alone
+        # matched every step that derives a version from the tag -- the authorized-publication report
+        # does that too, and has no artifact to parse -- which made this fail for a step it was never
+        # about.
         runs = [str(step.get("run", "")) for job in _jobs(workflow).values() for step in _steps(job)]
-        checks = [block for block in runs if "GITHUB_REF_NAME" in block]
+        checks = [block for block in runs if "GITHUB_REF_NAME" in block and "parse_wheel_filename" in block]
 
         assert checks, "no step compares the built artifact against the tag"
         for block in checks:
@@ -406,6 +428,23 @@ class TestTheReleaseGateIsNoWeakerThanCI:
 MANIFEST_CHECK = "validate-pyproject"
 ARTIFACT_CHECK = "twine check"
 
+
+def _published_artifact(workflow: dict[str, Any]) -> str:
+    """The artifact name the publishing job downloads: the one whose contents reach PyPI.
+
+    Several artifacts move between jobs now. Rules about what PyPI receives apply to this one, and
+    naming it here keeps them from being asserted of the signatures by accident.
+    """
+    for job in workflow.get("jobs", {}).values():
+        if not _step_uses(job, PUBLISH_ACTION):
+            continue
+        for step in _steps(job):
+            if str(step.get("uses", "")).startswith(DOWNLOAD_ACTION):
+                name = (step.get("with") or {}).get("name")
+                if name:
+                    return str(name)
+    raise AssertionError("no publishing job downloads a named artifact, so nothing reaches PyPI")
+
 #: The action that hands the built files to the publisher, and the one that wrote them.
 DOWNLOAD_ACTION = "actions/download-artifact"
 UPLOAD_ACTION = "actions/upload-artifact"
@@ -464,9 +503,18 @@ class TestTheArtifactIsCheckedAndNotOnlyTheCodeInIt:
         job whose next action is irreversible. Asserted by step index, because ``needs:`` says nothing
         about the order of steps inside one job.
         """
+        # Only the job that uploads what PyPI will receive. `sign` uploads detached signatures and a
+        # checksum file, which `twine check` cannot read and which are never offered to PyPI; requiring
+        # it there would be requiring a check of the wrong thing.
+        published = _published_artifact(workflow)
         for name, job in _jobs(workflow).items():
             steps = _steps(job)
-            uploads = [i for i, step in enumerate(steps) if str(step.get("uses", "")).startswith(UPLOAD_ACTION)]
+            uploads = [
+                i
+                for i, step in enumerate(steps)
+                if str(step.get("uses", "")).startswith(UPLOAD_ACTION)
+                and (step.get("with") or {}).get("name") == published
+            ]
             if not uploads:
                 continue
             checks = [i for i, step in enumerate(steps) if ARTIFACT_CHECK in str(step.get("run", ""))]
@@ -502,33 +550,57 @@ class TestTheArtifactTheUploadWroteIsTheOneThePublisherReads:
     jobs run in what order and it is correct; this is about whether the payload arrives.
     """
 
-    def _pair(self, workflow: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        """The one upload step and the one download step, as ``with:`` mappings."""
-        steps = [step for job in _jobs(workflow).values() for step in _steps(job)]
-        uploads = [step for step in steps if str(step.get("uses", "")).startswith(UPLOAD_ACTION)]
-        downloads = [step for step in steps if str(step.get("uses", "")).startswith(DOWNLOAD_ACTION)]
+    def _uploads(self, workflow: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Every upload step's ``with:`` mapping, keyed by the artifact name it writes.
 
-        assert len(uploads) == 1, f"expected exactly one upload step, found {len(uploads)}"
-        assert len(downloads) == 1, f"expected exactly one download step, found {len(downloads)}"
-        return uploads[0].get("with") or {}, downloads[0].get("with") or {}
-
-    def test_exactly_one_job_uploads_and_exactly_one_downloads(self, workflow: dict[str, Any]) -> None:
-        """The vacuity guard for the two tests below, which compare a pair.
-
-        Two uploads under different names is the shape where the equality assertions below start passing
-        on whichever pair the walk happens to reach first.
+        One name may be written only once. Two uploads under one name is the shape where a download
+        resolves to whichever the walk reaches first, which is the ambiguity the old pair-counting
+        guarded against and the only part of it that still needs guarding.
         """
-        self._pair(workflow)
+        uploads: dict[str, dict[str, Any]] = {}
+        for name, job in _jobs(workflow).items():
+            for step in _steps(job):
+                if not str(step.get("uses", "")).startswith(UPLOAD_ACTION):
+                    continue
+                supplied = step.get("with") or {}
+                artifact = supplied.get("name")
+                assert artifact, f"job {name!r} uploads without naming an artifact, so nothing can ask for it"
+                assert artifact not in uploads, (
+                    f"artifact {artifact!r} is uploaded by more than one job; a download of that name "
+                    f"resolves to whichever ran last, which is not a thing the file states"
+                )
+                uploads[artifact] = supplied
+        return uploads
 
-    def test_the_download_names_the_artifact_the_upload_wrote(self, workflow: dict[str, Any]) -> None:
-        """One name, spelled once in each direction, and nothing else in the file agrees them."""
-        upload, download = self._pair(workflow)
+    def _downloads(self, workflow: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+        """Every download step, as ``(job name, with-mapping)``."""
+        return [
+            (name, step.get("with") or {})
+            for name, job in _jobs(workflow).items()
+            for step in _steps(job)
+            if str(step.get("uses", "")).startswith(DOWNLOAD_ACTION)
+        ]
 
-        assert upload.get("name"), "the upload declares no artifact name, so the download cannot ask for one"
-        assert download.get("name") == upload.get("name"), (
-            f"the upload writes {upload.get('name')!r} and the download asks for {download.get('name')!r}; "
-            f"the publish job would receive nothing and the failure would arrive after the approval"
-        )
+    def test_every_download_names_an_artifact_some_upload_wrote(self, workflow: dict[str, Any]) -> None:
+        """The replacement for counting one upload and one download.
+
+        The counts held while the only artifact was the distribution. Signing adds a second artifact
+        and two more downloads, so the counts are wrong without anything being wrong. What they were
+        protecting is the string agreement: a download that names an artifact nothing wrote receives
+        an empty directory, and in the publish job that happens after somebody has approved the
+        deployment. That is asserted here directly, for every download rather than for one.
+        """
+        uploads = self._uploads(workflow)
+        downloads = self._downloads(workflow)
+
+        assert uploads, "nothing uploads an artifact"
+        assert downloads, "nothing downloads an artifact"
+        for job, download in downloads:
+            artifact = download.get("name")
+            assert artifact in uploads, (
+                f"job {job!r} downloads {artifact!r}, which no job uploads (uploaded: {sorted(uploads)}); "
+                f"it would receive an empty directory and the failure would arrive after the approval"
+            )
 
     def test_the_directory_handed_to_the_publisher_is_the_one_the_download_wrote_into(
         self, workflow: dict[str, Any]
@@ -538,11 +610,26 @@ class TestTheArtifactTheUploadWroteIsTheOneThePublisherReads:
         ``dist/`` and ``dist`` are the same directory and a string comparison calls them different, which
         is the kind of failure that gets a real assertion replaced with a weaker one.
         """
-        _, download = self._pair(workflow)
-        publishers = [step for job in _jobs(workflow).values() for step in _step_uses(job, PUBLISH_ACTION)]
-        assert publishers, f"no step uses {PUBLISH_ACTION}"
+        publishing = {
+            name: job for name, job in _jobs(workflow).items() if _step_uses(job, PUBLISH_ACTION)
+        }
+        assert publishing, f"no step uses {PUBLISH_ACTION}"
 
-        for step in publishers:
+        for name, job in publishing.items():
+            # The download in the publishing job, not any download in the file: other jobs download the
+            # same artifact to other paths, and only this one feeds the uploader.
+            local = [
+                step.get("with") or {}
+                for step in _steps(job)
+                if str(step.get("uses", "")).startswith(DOWNLOAD_ACTION)
+            ]
+            assert len(local) == 1, (
+                f"job {name!r} runs {PUBLISH_ACTION} and {len(local)} downloads; which directory reaches "
+                f"the uploader has to be unambiguous"
+            )
+            download = local[0]
+
+        for step in [step for job in publishing.values() for step in _step_uses(job, PUBLISH_ACTION)]:
             packages = (step.get("with") or {}).get("packages-dir")
             assert packages, f"{PUBLISH_ACTION} is handed no packages-dir, so it reads wherever it defaults to"
             assert PurePosixPath(str(packages)) == PurePosixPath(str(download.get("path"))), (
@@ -557,12 +644,13 @@ class TestTheArtifactTheUploadWroteIsTheOneThePublisherReads:
         a renamed output directory or a hatch configuration change, and the default turns that into a
         release that uploads nothing to PyPI rather than into a red job.
         """
-        upload, _ = self._pair(workflow)
+        uploads = self._uploads(workflow)
 
-        assert upload.get("if-no-files-found") == "error", (
-            f"the upload sets if-no-files-found to {upload.get('if-no-files-found')!r}; anything but "
-            f"`error` lets an empty artifact through to the publish job"
-        )
+        for artifact, upload in uploads.items():
+            assert upload.get("if-no-files-found") == "error", (
+                f"the upload of {artifact!r} sets if-no-files-found to {upload.get('if-no-files-found')!r}; "
+                f"anything but `error` lets an empty artifact through to the job that consumes it"
+            )
 
 
 #: The release document, beside the package README rather than at the repository root: it is about
@@ -804,14 +892,23 @@ class TestTheActionThatUploadsIsPinnedToContentRatherThanToAPlace:
     current, and the pin is worth less without them.
     """
 
-    def test_exactly_one_job_holds_the_publishing_credential(self, workflow: dict[str, Any]) -> None:
-        """AT-170 -- the vacuity guard, and the premise the scope of this gate rests on."""
-        holders = [
+    def test_the_publishing_credential_is_held_by_the_job_that_publishes(self, workflow: dict[str, Any]) -> None:
+        """AT-170 -- the vacuity guard, and the premise the scope of this gate rests on.
+
+        This required exactly one holder of ``id-token: write``. Several jobs hold it now, because
+        signing and the SBOM authenticate to AWS the same way, so the premise has to be stated as what
+        it always meant: the job that runs the publish action is a holder, and the pinning rule below
+        applies to every holder rather than to one job that happened to be alone.
+        """
+        holders = {
             name for name, job in workflow["jobs"].items() if (job.get("permissions") or {}).get("id-token") == "write"
-        ]
-        assert len(holders) == 1, (
-            f"{len(holders)} jobs raise id-token: write ({holders}). This gate is scoped to the job that "
-            f"holds the upload credential, so which job that is has to be unambiguous"
+        }
+        publishers = {name for name, job in workflow["jobs"].items() if _step_uses(job, PUBLISH_ACTION)}
+
+        assert publishers, f"no job uses {PUBLISH_ACTION}, so this gate is guarding nothing"
+        assert publishers <= holders, (
+            f"{sorted(publishers - holders)} runs {PUBLISH_ACTION} without `id-token: write`, so it is "
+            f"uploading with something other than a trusted-publishing token"
         )
 
     def test_every_action_it_runs_is_pinned_to_a_digest(self, workflow: dict[str, Any]) -> None:
