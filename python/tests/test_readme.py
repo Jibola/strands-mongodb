@@ -571,6 +571,7 @@ _TRACEABLE_IDS = frozenset(
         "MongoDBMemoryStore.close()",
         "MongoDBMemoryStore.add()",
         "MongoDBMemoryStore.search()",
+        "MongoDBStorage.search()",
         "Storage.list()",
         "MongoDBStorage.ensure_indexes()",
     }
