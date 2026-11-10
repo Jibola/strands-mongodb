@@ -238,7 +238,9 @@ class TestNothingHereIsALongLivedCredential:
         every holder rather than leaving the one holder's binding unchecked.
         """
         holders = {
-            name: job for name, job in _jobs(workflow).items() if (job.get("permissions") or {}).get("id-token") == "write"
+            name: job
+            for name, job in _jobs(workflow).items()
+            if (job.get("permissions") or {}).get("id-token") == "write"
         }
 
         assert holders, "no job raises `id-token: write`, so nothing here can authenticate to PyPI or AWS"
@@ -445,6 +447,7 @@ def _published_artifact(workflow: dict[str, Any]) -> str:
                     return str(name)
     raise AssertionError("no publishing job downloads a named artifact, so nothing reaches PyPI")
 
+
 #: The action that hands the built files to the publisher, and the one that wrote them.
 DOWNLOAD_ACTION = "actions/download-artifact"
 UPLOAD_ACTION = "actions/upload-artifact"
@@ -610,18 +613,14 @@ class TestTheArtifactTheUploadWroteIsTheOneThePublisherReads:
         ``dist/`` and ``dist`` are the same directory and a string comparison calls them different, which
         is the kind of failure that gets a real assertion replaced with a weaker one.
         """
-        publishing = {
-            name: job for name, job in _jobs(workflow).items() if _step_uses(job, PUBLISH_ACTION)
-        }
+        publishing = {name: job for name, job in _jobs(workflow).items() if _step_uses(job, PUBLISH_ACTION)}
         assert publishing, f"no step uses {PUBLISH_ACTION}"
 
         for name, job in publishing.items():
             # The download in the publishing job, not any download in the file: other jobs download the
             # same artifact to other paths, and only this one feeds the uploader.
             local = [
-                step.get("with") or {}
-                for step in _steps(job)
-                if str(step.get("uses", "")).startswith(DOWNLOAD_ACTION)
+                step.get("with") or {} for step in _steps(job) if str(step.get("uses", "")).startswith(DOWNLOAD_ACTION)
             ]
             assert len(local) == 1, (
                 f"job {name!r} runs {PUBLISH_ACTION} and {len(local)} downloads; which directory reaches "
@@ -954,7 +953,9 @@ class TestAnSbomShipsWhetherOrNotAVendorIsConfigured:
         """AT-171 -- neither the job nor the generation step waits on ``KONDUKTO_SECRET_ID``."""
         jobs = _jobs(workflow)
         producers = {
-            name: job for name, job in jobs.items() if any("cyclonedx-py" in str(step.get("run", "")) for step in _steps(job))
+            name: job
+            for name, job in jobs.items()
+            if any("cyclonedx-py" in str(step.get("run", "")) for step in _steps(job))
         }
         assert producers, "no job generates an SBOM, so no release can ship one"
 
@@ -983,7 +984,9 @@ class TestAnSbomShipsWhetherOrNotAVendorIsConfigured:
         for name, job in jobs.items():
             for step in _steps(job):
                 uses = str(step.get("uses", ""))
-                if "abx-release-tools/actions/sbom" not in uses and "KONDUKTO_SECRET_ID" not in str(step.get("with", "")):
+                if "abx-release-tools/actions/sbom" not in uses and "KONDUKTO_SECRET_ID" not in str(
+                    step.get("with", "")
+                ):
                     continue
                 assert "KONDUKTO_SECRET_ID" in str(step.get("if", "")), (
                     f"step {step.get('name', uses)!r} in `{name}` needs Kondukto but does not test "
