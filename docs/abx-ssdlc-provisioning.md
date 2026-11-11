@@ -166,3 +166,25 @@ there is deliberately no dry run: `release-python.yml` triggers on tag push only
 The failure mode is safe — `publish` depends on `sign`, so a rejected
 `AssumeRoleWithWebIdentity` fails `sign`, `publish` never starts, nothing reaches
 PyPI, and the release candidate version stays unspent.
+
+## Still open
+
+**Whether SilkBomb and Kondukto are still the supported path.** The release ships an SBOM from its
+first tag — that part is settled and runs unconditionally. What is not settled is the vendor half.
+The upload to Kondukto is gated on `vars.KONDUKTO_SECRET_ID != ''` and is therefore off until a token
+exists, which was a deliberate choice: the SBOM is worth generating whether or not anything ingests
+it, so the two were separated rather than shipped as one switch.
+
+Before asking for that token, confirm with DevProd that SilkBomb and Kondukto are what ABX should be
+targeting at all. Both predate the current tooling and neither appeared in the ABX material we worked
+from; the reference repo does not upload to Kondukto either. If there is a successor, the gated step
+should point at it rather than being switched on as written. Until that is answered, treat the
+Kondukto path as unproven rather than merely unconfigured.
+
+**The `drivers/` versus `drivers-release/` exposure**, described above. Needs its own ticket.
+
+**The bucket name, if step 3 is ever switched on.** `pymongo-release-assets` is the precedent for a
+single-package bucket, and the SSDLC wiki lists `*-driver-release-assets` for the drivers. Neither
+pattern obviously covers an ABX integration package, and the name is not worth guessing at — ask
+before creating a bucket, since the variable's whole purpose is that the job stays off until one
+exists.
