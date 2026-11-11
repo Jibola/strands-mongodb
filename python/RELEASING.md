@@ -40,13 +40,24 @@ whole decision: tag the commit you mean, because the artifact is built from it a
 ## Tagging
 
 ```bash
-git tag python-v0.1.0
+git tag -s python-v0.1.0 -m 'strands-mongodb 0.1.0'
 git push origin python-v0.1.0
 ```
 
 The `python-v` prefix is what starts a release. A plain `v0.1.0` tag does nothing. The prefix
 exists because this repository is a monorepo: a future `typescript/` versions independently off the
 same history, and its tags must not reach this workflow.
+
+`-s`, not a lightweight tag. The tag is what authorises everything downstream — it is the only input
+to a release, there is no `workflow_dispatch` to fall back on, and the OIDC claim PyPI trusts is
+minted because *this* tag was pushed. An annotated, signed tag records who asked for that and can be
+verified afterwards with `git tag -v`; a lightweight tag records nothing but a commit id. It needs a
+GPG or SSH signing key configured locally (`git config --get user.signingkey`); without one, `-s`
+fails rather than quietly producing an unsigned tag.
+
+A prerelease is tagged the same way: `python-v1.0.0.dev1` yields version `1.0.0.dev1`, which `pip
+install strands-mongodb` will not resolve to unless asked with `--pre`. The GitHub Release for such
+a tag is marked as a prerelease, so it does not displace the last stable one.
 
 ## What runs, in order
 
@@ -89,9 +100,10 @@ reviewers**: it is a credential scope rather than an approval gate, naming the A
 may assume over OIDC. `pypi` is where a person approves, and two prompts for one release would teach
 everybody to click through both.
 
-Signing is required rather than gated, because the Garasign credentials are the one piece of this
-that has actually been provisioned. If the AWS trust policy does not yet permit this repository to
-assume the signing role, a tag fails at `sign` — loudly, and before anything reaches PyPI.
+Signing is required rather than gated, because the Garasign credentials behind it are provisioned:
+the `drivers-test-secrets-role` trust policy names this repository and the
+`drivers/strands-mongodb/release-signing` vault exists. If that ever stops being true, a tag fails at
+`sign` — loudly, and before anything reaches PyPI.
 
 ## The approval
 
@@ -101,9 +113,10 @@ Actions UI. That pause is the last stop before the irreversible step, and it is 
 process you cannot discover by reading the repository: the environment and its reviewer list live in
 repository settings, not in a file.
 
-**The environments do not exist yet.** The repository has none at all, and GitHub creates a missing
-one on first reference *with no reviewers* — so a tag pushed today would reach the upload unapproved.
-Create `pypi` with its reviewer list, and `release-signing` without one, before the first tag.
+**Both environments exist, and `pypi` has required reviewers.** That mattered to get right up
+front, because GitHub creates a missing environment on first reference *with no reviewers* — a tag
+pushed before `pypi` existed would have reached the upload unapproved rather than failing. Both are
+scoped to `tag python-v*`, so a branch cannot deploy to either.
 
 The PyPI trusted publisher **is** registered: project `strands-mongodb`, owner `mongodb`, repository
 `strands-mongodb`, workflow `release-python.yml`, environment `pypi`. The owner is what makes the tag
@@ -131,5 +144,7 @@ is updated to match. That coupling is intended: it is what ties the upload to th
 | `wheel is X, tag says Y` | `hatch-vcs` saw a dirty tree or no tag | Tag an exact commit on a clean checkout |
 | Stuck at `publish` | Waiting for a required reviewer | Approve the deployment, or find somebody who can |
 | `sign` red, AWS "not authorized to perform sts:AssumeRoleWithWebIdentity" | The trust policy does not cover this repository | Ask DevProd Release Infrastructure to add it; nothing has reached PyPI |
-| `sbom` or `trace` skipped | Their repository variable is empty | Expected while the credentials behind them are unprovisioned |
+| `trace` skipped, or the Kondukto steps inside `sbom` skipped | Their repository variable is empty | Expected while the credentials behind them are unprovisioned. `sbom` itself always runs and always attaches one |
+| `sbom` red on `gh release upload` with a 403 | The job lacks `contents: write` | A permissions block sets every scope it does not name to `none`; the SBOM is the only asset missing, the release stands |
+| A `.dev` or `rc` release shows as *Latest* on the releases page | It was created without `--prerelease` | Edit the release and tick *Set as a pre-release*; nothing on PyPI is affected |
 | Wrong artifact uploaded | It is on PyPI permanently | Yank that version on PyPI and release a new patch. There is no replace |

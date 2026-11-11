@@ -8,6 +8,14 @@ The workflow was already written and merged (PR #56). Everything below is the
 signed release can run. It took far longer than the workflow did, almost entirely
 because the facts below were not written down anywhere.
 
+**This file is the status document for the ABX SSDLC work in this repository.**
+It is the one that is version-controlled and reviewable, and it is the source for
+the DEVPROD-44346 write-up and the ABX release how-to guide. The reasoning behind
+the design is in `docs/superpowers/specs/2026-11-08-abx-ssdlc-design.md`; the
+operator's view is `python/RELEASING.md`. Working notes under `.claude/` are
+laptop-local and gitignored — they are scratch, not a second source of truth, and
+anything in them that matters belongs here instead.
+
 ## The one role
 
 ABX repos do not get their own IAM role. They share
@@ -169,11 +177,31 @@ PyPI, and the release candidate version stays unspent.
 
 ## Still open
 
+**The pinned `abx-release-tools` commit cannot run in `sign` or `trace`.** Both jobs download an
+artifact and check nothing out, and `setup.sh` at `e89529bd` configures the release bot's git
+identity with a repository-local `git config`, which fails with `fatal: not in a git directory`.
+The script runs under `set -e`, so the whole setup dies there — before `$RELEASE_ASSETS` is even
+created, which makes the error surface as a missing directory in a later step. `publish` needs
+`sign`, so this fails the tag with nothing uploaded and the version unspent, but it does fail it.
+The fix is `git config --global`, proposed upstream as mongodb-labs/abx-release-tools#2; **the pin
+in `release-python.yml` has to move to a commit that carries it before the first tag.**
+
 **Whether SilkBomb and Kondukto are still the supported path.** The release ships an SBOM from its
 first tag — that part is settled and runs unconditionally. What is not settled is the vendor half.
 The upload to Kondukto is gated on `vars.KONDUKTO_SECRET_ID != ''` and is therefore off until a token
 exists, which was a deliberate choice: the SBOM is worth generating whether or not anything ingests
 it, so the two were separated rather than shipped as one switch.
+
+**TODO: follow `mongo-python-driver`'s lead and write the report to S3.** This is the next step
+here, and it does not wait on the Kondukto question above. PyMongo's release calls
+`drivers-github-tools/python/post-publish`, which runs `full-report` and then `upload-s3-assets`:
+`full-report` assembles the authorized-publication report, the SBOM, the SARIF export and the
+compliance report, and the S3 upload is what actually delivers them, because Papertrail is reachable
+only from Evergreen and Drone hosts inside AWS and never from a GitHub Actions runner
+(DEVPROD-36740). The `trace` job already has that shape — `authorized-pub` followed by
+`upload-s3-assets` — and is inert solely because `vars.AWS_RELEASE_BUCKET` is unset. So the work is
+not code: it is agreeing a bucket name (see below), creating it, and setting the variable. Widening
+`authorized-pub` toward the rest of `full-report` can follow once the destination exists.
 
 Before asking for that token, confirm with DevProd that SilkBomb and Kondukto are what ABX should be
 targeting at all. Both predate the current tooling and neither appeared in the ABX material we worked
