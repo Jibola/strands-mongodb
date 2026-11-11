@@ -1,0 +1,56 @@
+name: Workflow security analysis
+
+# Static analysis of the workflows themselves. The other suites check what the workflows *do*;
+# this one checks the workflows as code — template injection into a `run:` block, a token with more
+# permission than the job needs, credentials left behind in a checkout, a mutable action reference.
+#
+# Findings are argued with or fixed, never silenced in passing: `.github/zizmor.yml` holds the
+# exceptions, and each one states what the rule is right about and why this use is not that.
+#
+# tests/test_ci.py asserts this file exists, scans every workflow, and is pinned to digests, so the
+# scan cannot be quietly removed or narrowed.
+
+on:
+  pull_request:
+    # No `branches:` filter, for the same reason as the CI workflow: a pull request stacked on another
+    # topic branch would otherwise run no scan at all.
+    paths:
+      - '.github/workflows/**'
+      - '.github/zizmor.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/**'
+      - '.github/zizmor.yml'
+
+# Read-only by default. The scan job raises `security-events` to file its results, and nothing else
+# here needs more.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # To read the workflows.
+      contents: read
+      # To file findings as code scanning alerts, which is what makes a finding visible in the
+      # Security tab rather than only in a log nobody opens.
+      security-events: write
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The scan reads the tree and pushes nothing. A credential left in `.git/config` is the
+          # thing zizmor's own `artipacked` rule is about, so this workflow had better not trip it.
+          persist-credentials: false
+
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1

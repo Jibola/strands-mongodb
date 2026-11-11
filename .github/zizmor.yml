@@ -1,0 +1,18 @@
+# zizmor configuration. See .github/workflows/zizmor.yml for how it runs.
+#
+# An entry here is an argued exception, not a way to quiet a finding. Each one says what the rule is
+# right about in general and why this particular use is not the thing it is looking for.
+rules:
+  unpinned-images:
+    ignore:
+      # The MongoDB server images for the integration matrix, as `services:` containers.
+      #
+      # The rule is right that a mutable tag can change under you. These are disposable test
+      # fixtures, though: they hold no credentials, receive no secrets, and produce nothing that
+      # reaches a release. Pinning them to digests would mean a Dependabot PR per server image for a
+      # matrix whose whole purpose is to track what MongoDB currently ships, and would quietly stop
+      # testing against the server a user would actually install.
+      #
+      # The release workflow is the opposite case, and is digest-pinned throughout. A test asserts
+      # that every action in a job holding `id-token: write` is pinned to a 40-character digest.
+      - ci-python.yml

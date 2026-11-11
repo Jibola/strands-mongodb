@@ -176,6 +176,8 @@ _READ_AT_LEAST = (
     ".github/workflows/ci-python.yml",
     ".github/workflows/release-python.yml",
     ".github/dependabot.yml",
+    ".github/workflows/zizmor.yml",
+    ".github/zizmor.yml",
     "AGENTS.md",
     "CONTRIBUTING.md",
     ".gitignore",
@@ -1615,6 +1617,17 @@ RELEASE_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release-python.ym
 #: ``TestTheTriggerWatchesEverythingTheSuiteReads`` requires both change triggers to watch it.
 DEPENDABOT_PATH = REPO_ROOT / ".github" / "dependabot.yml"
 
+#: The static analysis of the workflows themselves, and the file holding its argued exceptions. Also
+#: outside ``python/``, so both change triggers have to watch them too.
+ZIZMOR_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "zizmor.yml"
+ZIZMOR_CONFIG_PATH = REPO_ROOT / ".github" / "zizmor.yml"
+
+#: A commit digest, as an action reference. Forty hexadecimal characters and nothing else: a tag or a
+#: branch name names a place that can be moved, and a digest names the content that was reviewed.
+#: ``test_release_ci.py`` holds its own copy, deliberately -- the two files are read separately, and a
+#: shared constant would let one suite's edit weaken the other's gate.
+_DIGEST = re.compile(r"\A[0-9a-f]{40}\Z")
+
 
 def _checkout_steps(parsed: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     """Every ``actions/checkout`` step in a parsed workflow, paired with the job that runs it.
@@ -2347,3 +2360,90 @@ class TestEveryMongoDBContainerRunsOnAKernelItAccepts:
             for name, job in yaml.safe_load(path.read_text())["jobs"].items():
                 if job.get("services"):
                     assert job.get("runs-on") == "ubuntu-22.04", f"{path.name}:{name} runs on {job.get('runs-on')}"
+
+
+@pytest.fixture(scope="module")
+def zizmor_workflow() -> dict[str, Any]:
+    """The parsed security-analysis workflow.
+
+    Fails rather than skips when absent, like the other workflow fixtures: a scan that is not there is
+    indistinguishable, from a passing pull request, from a scan that found nothing.
+    """
+    assert ZIZMOR_WORKFLOW_PATH.is_file(), f"no workflow security analysis at {ZIZMOR_WORKFLOW_PATH}"
+    parsed = yaml.safe_load(ZIZMOR_WORKFLOW_PATH.read_text())
+    assert isinstance(parsed, dict), "the security-analysis workflow did not parse as a mapping"
+    return parsed
+
+
+class TestTheWorkflowsAreThemselvesScanned:
+    """``AT-244`` -- the rest of this file reads the workflows for what they say; zizmor reads them as code.
+
+    The two do not overlap. This suite knows what it thought to assert, and the gaps are the interesting
+    part: template injection into a ``run:`` block, a token broader than its job, a mutable action
+    reference, a credential persisted into ``.git/config``. Those are classes of defect nobody writes a
+    bespoke assertion for, which is the argument for a scanner rather than another test class here.
+
+    What is asserted is that the scan runs, that it runs on the workflows' own changes, and that it does
+    not quietly become weaker than the thing it is checking. An analysis job pulling an action from a
+    mutable tag would be exactly the finding it exists to report.
+    """
+
+    def test_the_scan_runs_on_a_change_to_a_workflow(self, zizmor_workflow: dict[str, Any]) -> None:
+        """AT-244 -- a scan nothing triggers is a file, not a gate."""
+        triggers = _triggers(zizmor_workflow)
+        assert set(triggers) >= {"pull_request", "push"}, (
+            f"the security analysis triggers on {sorted(triggers)}. A change to a workflow arrives as a "
+            f"pull request, so a scan that does not run on one reports nothing until after the merge"
+        )
+        for event in ("pull_request", "push"):
+            paths = (triggers.get(event) or {}).get("paths") or []
+            assert any(entry.startswith(".github/workflows/") for entry in paths), (
+                f"the {event!r} trigger watches {paths}, none of which covers .github/workflows/. The scan "
+                f"would not run on a change to the very files it reads"
+            )
+
+    def test_the_scan_is_pinned_to_a_digest(self, zizmor_workflow: dict[str, Any]) -> None:
+        """AT-244 -- the analysis job holds the strictest version of the rule it enforces."""
+        for job_name, job in (zizmor_workflow.get("jobs") or {}).items():
+            for step in job.get("steps") or []:
+                uses = step.get("uses")
+                if not uses:
+                    continue
+                reference = uses.rpartition("@")[2]
+                assert _DIGEST.fullmatch(reference), (
+                    f"zizmor.yml:{job_name} runs {uses}, whose reference {reference!r} is not a "
+                    f"40-character digest. A tag moves, including onto a compromised release, and this is "
+                    f"the job that would otherwise have reported that"
+                )
+
+    def test_the_scan_takes_only_the_permission_it_files_results_with(self, zizmor_workflow: dict[str, Any]) -> None:
+        """AT-244 -- least privilege, asserted on the job that checks other jobs for it."""
+        assert zizmor_workflow.get("permissions") == {"contents": "read"}, (
+            f"the security-analysis workflow declares top-level permissions "
+            f"{zizmor_workflow.get('permissions')!r} rather than {{'contents': 'read'}}"
+        )
+        for job_name, job in (zizmor_workflow.get("jobs") or {}).items():
+            granted = job.get("permissions") or {}
+            assert set(granted) <= {"contents", "security-events"}, (
+                f"zizmor.yml:{job_name} grants {sorted(granted)}. Filing code scanning alerts needs "
+                f"security-events, and reading the tree needs contents; anything further is unexplained"
+            )
+            assert granted.get("security-events") == "write", (
+                f"zizmor.yml:{job_name} does not hold security-events: write, so its findings reach a log "
+                f"nobody opens rather than the Security tab"
+            )
+
+    def test_every_suppression_is_argued(self) -> None:
+        """AT-244 -- an exception file is only worth having if nothing lands in it silently."""
+        assert ZIZMOR_CONFIG_PATH.is_file(), f"no zizmor configuration at {ZIZMOR_CONFIG_PATH}"
+        parsed = yaml.safe_load(ZIZMOR_CONFIG_PATH.read_text()) or {}
+        commentary = [line for line in ZIZMOR_CONFIG_PATH.read_text().splitlines() if line.lstrip().startswith("#")]
+        for rule, body in (parsed.get("rules") or {}).items():
+            ignored = (body or {}).get("ignore") or []
+            assert ignored, f"the configuration names rule {rule!r} but ignores nothing under it"
+            assert len(commentary) >= 3 * len(ignored), (
+                f"the configuration suppresses {len(ignored)} finding(s) under {rule!r} with "
+                f"{len(commentary)} comment lines in the whole file. A suppression is an argument about "
+                f"why the rule is right in general and wrong here, and an unargued one is just a silenced "
+                f"finding"
+            )

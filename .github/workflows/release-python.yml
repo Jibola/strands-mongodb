@@ -47,7 +47,11 @@ jobs:
         uses: actions/setup-python@v7.1.0
         with:
           python-version: '3.13'
-          cache: 'pip'
+          # No `cache: 'pip'` here, unlike the CI workflow. zizmor flags a cached release job as a
+          # cache-poisoning path: the thing that signs and publishes should not restore state that
+          # another workflow wrote. The confidence is low, because GitHub scopes a pull request's
+          # cache away from a tag's, but a release runs rarely and installs little, so the cache was
+          # buying almost nothing. Removing it is cheaper than reasoning about scope rules.
 
       - name: Install hatch
         run: pip install hatch
@@ -106,7 +110,11 @@ jobs:
         uses: actions/setup-python@v7.1.0
         with:
           python-version: '3.13'
-          cache: 'pip'
+          # No `cache: 'pip'` here, unlike the CI workflow. zizmor flags a cached release job as a
+          # cache-poisoning path: the thing that signs and publishes should not restore state that
+          # another workflow wrote. The confidence is low, because GitHub scopes a pull request's
+          # cache away from a tag's, but a release runs rarely and installs little, so the cache was
+          # buying almost nothing. Removing it is cheaper than reasoning about scope rules.
 
       - name: Install hatch
         run: pip install hatch
@@ -144,7 +152,11 @@ jobs:
         uses: actions/setup-python@v7.1.0
         with:
           python-version: '3.13'
-          cache: 'pip'
+          # No `cache: 'pip'` here, unlike the CI workflow. zizmor flags a cached release job as a
+          # cache-poisoning path: the thing that signs and publishes should not restore state that
+          # another workflow wrote. The confidence is low, because GitHub scopes a pull request's
+          # cache away from a tag's, but a release runs rarely and installs little, so the cache was
+          # buying almost nothing. Removing it is cheaper than reasoning about scope rules.
 
       - name: Install hatch
         run: pip install hatch
