@@ -2417,7 +2417,13 @@ class TestTheWorkflowsAreThemselvesScanned:
                 )
 
     def test_the_scan_takes_only_the_permission_it_files_results_with(self, zizmor_workflow: dict[str, Any]) -> None:
-        """AT-244 -- least privilege, asserted on the job that checks other jobs for it."""
+        """AT-244 -- least privilege, asserted on the job that checks other jobs for it.
+
+        ``security-events: write`` is the permission a SARIF upload needs. This repository has Code
+        Security disabled, so there is no upload and the permission would be unused -- which is itself
+        a zizmor finding. What is asserted is that the two agree: the token the job holds and the way
+        it reports findings are one decision, and enabling either without the other is the bug.
+        """
         assert zizmor_workflow.get("permissions") == {"contents": "read"}, (
             f"the security-analysis workflow declares top-level permissions "
             f"{zizmor_workflow.get('permissions')!r} rather than {{'contents': 'read'}}"
@@ -2428,10 +2434,38 @@ class TestTheWorkflowsAreThemselvesScanned:
                 f"zizmor.yml:{job_name} grants {sorted(granted)}. Filing code scanning alerts needs "
                 f"security-events, and reading the tree needs contents; anything further is unexplained"
             )
-            assert granted.get("security-events") == "write", (
-                f"zizmor.yml:{job_name} does not hold security-events: write, so its findings reach a log "
-                f"nobody opens rather than the Security tab"
-            )
+            for step in job.get("steps") or []:
+                if "zizmor-action" not in (step.get("uses") or ""):
+                    continue
+                uploads = str((step.get("with") or {}).get("advanced-security", "true")).lower() == "true"
+                assert uploads == (granted.get("security-events") == "write"), (
+                    f"zizmor.yml:{job_name} sets advanced-security={uploads} but "
+                    f"security-events={granted.get('security-events')!r}. Uploading SARIF without the "
+                    f"permission fails the job on the upload rather than on the findings; holding the "
+                    f"permission without uploading is a token the job cannot use"
+                )
+                if not uploads:
+                    assert str((step.get("with") or {}).get("annotations", "")).lower() == "true", (
+                        f"zizmor.yml:{job_name} neither uploads to code scanning nor emits annotations, "
+                        f"so a finding would appear only in the job log"
+                    )
+
+    def test_the_scanner_itself_is_pinned_to_a_version(self, zizmor_workflow: dict[str, Any]) -> None:
+        """AT-244 -- a gate whose version floats is a gate that changes without review.
+
+        The action resolves ``latest`` at run time by default. zizmor 1.32.0 promoted ``unpinned-uses``
+        to a default audit; on a floating version that arrives as an unexplained red build on an
+        unrelated pull request. Raising the pin is a change someone reads.
+        """
+        for job_name, job in (zizmor_workflow.get("jobs") or {}).items():
+            for step in job.get("steps") or []:
+                if "zizmor-action" not in (step.get("uses") or ""):
+                    continue
+                version = str((step.get("with") or {}).get("version", "latest"))
+                assert re.fullmatch(r"\d+\.\d+\.\d+", version), (
+                    f"zizmor.yml:{job_name} runs zizmor {version!r} rather than an exact release. A new "
+                    f"zizmor version then changes what this gate enforces with no change to this file"
+                )
 
     def test_every_suppression_is_argued(self) -> None:
         """AT-244 -- an exception file is only worth having if nothing lands in it silently."""
