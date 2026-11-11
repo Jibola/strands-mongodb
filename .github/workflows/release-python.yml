@@ -280,7 +280,7 @@ jobs:
       # The role ARN, the region and the *name* of a secret. None of the three is a credential: the
       # credential is the OIDC token minted for this job, which is why this job is environment-bound.
       - name: Set up the release environment
-        uses: caseyclements/abx-release-tools/actions/setup@e89529bd0c362149a3faf6b154ecba3a911c2f7e
+        uses: mongodb-labs/abx-release-tools/actions/setup@e89529bd0c362149a3faf6b154ecba3a911c2f7e
         with:
           aws_role_arn: ${{ vars.AWS_SIGNING_ROLE_ARN }}
           aws_region_name: ${{ vars.AWS_SIGNING_REGION }}
@@ -289,7 +289,7 @@ jobs:
       # Newline-separated: the space-separated form cannot express a filename containing a space,
       # and a pattern that matches nothing is an error rather than a quietly unsigned artifact.
       - name: Sign the artifacts
-        uses: caseyclements/abx-release-tools/actions/gpg-sign@e89529bd0c362149a3faf6b154ecba3a911c2f7e
+        uses: mongodb-labs/abx-release-tools/actions/gpg-sign@e89529bd0c362149a3faf6b154ecba3a911c2f7e
         with:
           filenames: |
             dist/*.whl
@@ -393,7 +393,7 @@ jobs:
       # it off again, if the tool is replaced, does not cost a release.
       - name: Set up the release environment
         if: vars.KONDUKTO_SECRET_ID != ''
-        uses: caseyclements/abx-release-tools/actions/setup@e89529bd0c362149a3faf6b154ecba3a911c2f7e
+        uses: mongodb-labs/abx-release-tools/actions/setup@e89529bd0c362149a3faf6b154ecba3a911c2f7e
         with:
           aws_role_arn: ${{ vars.AWS_SIGNING_ROLE_ARN }}
           aws_region_name: ${{ vars.AWS_SIGNING_REGION }}
@@ -401,7 +401,7 @@ jobs:
 
       - name: Augment the SBOM
         if: vars.KONDUKTO_SECRET_ID != ''
-        uses: caseyclements/abx-release-tools/actions/sbom@e89529bd0c362149a3faf6b154ecba3a911c2f7e
+        uses: mongodb-labs/abx-release-tools/actions/sbom@e89529bd0c362149a3faf6b154ecba3a911c2f7e
         with:
           sbom_in_path: python/sbom.json
 
@@ -457,14 +457,14 @@ jobs:
         run: echo "value=${GITHUB_REF_NAME#python-v}" >> "$GITHUB_OUTPUT"
 
       - name: Set up the release environment
-        uses: caseyclements/abx-release-tools/actions/setup@e89529bd0c362149a3faf6b154ecba3a911c2f7e
+        uses: mongodb-labs/abx-release-tools/actions/setup@e89529bd0c362149a3faf6b154ecba3a911c2f7e
         with:
           aws_role_arn: ${{ vars.AWS_SIGNING_ROLE_ARN }}
           aws_region_name: ${{ vars.AWS_SIGNING_REGION }}
           aws_secret_id: ${{ vars.AWS_SIGNING_SECRET_ID }}
 
       - name: Write the authorized publication report
-        uses: caseyclements/abx-release-tools/actions/authorized-pub@e89529bd0c362149a3faf6b154ecba3a911c2f7e
+        uses: mongodb-labs/abx-release-tools/actions/authorized-pub@e89529bd0c362149a3faf6b154ecba3a911c2f7e
         with:
           product_name: strands-mongodb
           release_version: ${{ steps.version.outputs.value }}
@@ -474,7 +474,7 @@ jobs:
             dist/*.tar.gz
 
       - name: Upload the report to S3
-        uses: caseyclements/abx-release-tools/actions/upload-s3-assets@e89529bd0c362149a3faf6b154ecba3a911c2f7e
+        uses: mongodb-labs/abx-release-tools/actions/upload-s3-assets@e89529bd0c362149a3faf6b154ecba3a911c2f7e
         with:
           version: ${{ steps.version.outputs.value }}
           product_name: strands-mongodb
