@@ -188,3 +188,14 @@ single-package bucket, and the SSDLC wiki lists `*-driver-release-assets` for th
 pattern obviously covers an ABX integration package, and the name is not worth guessing at — ask
 before creating a bucket, since the variable's whole purpose is that the job stays off until one
 exists.
+
+**Code Security is disabled on the repository.** `GET /repos/mongodb/strands-mongodb` reports
+`code_security: disabled`, and the code scanning API answers 403. Any workflow that files SARIF —
+zizmor here, and CodeQL or semgrep if either is ever wired up properly — fails on the upload rather
+than on its findings, with `Resource not accessible by integration` well after the scanner has
+exited 0. The zizmor job reports through pull request annotations instead, which works but keeps
+findings out of the Security tab and leaves nothing to query across repositories.
+
+Enabling it is a per-repository setting under an org licence, so it is a question for whoever holds
+that budget rather than something to flip while onboarding one package. Worth asking as part of the
+ABX cohort rather than once per repo.
