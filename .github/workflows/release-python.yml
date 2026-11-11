@@ -237,10 +237,11 @@ jobs:
           packages-dir: dist/
 
   # ---------------------------------------------------------------------------------------------
-  # ABX SSDLC steps. `sign` is required; `sbom` and `trace` are gated on repository variables and
-  # skip cleanly until the credentials behind them are provisioned. The actions come from
-  # abx-release-tools, hash-pinned: the owner is a personal fork today and moves to a MongoDB org,
-  # at which point the owner and the pins change together.
+  # ABX SSDLC steps. `sign` is required; the Kondukto augmentation inside `sbom`, and `trace`
+  # entirely, are gated on repository variables and skip cleanly until the credentials behind them
+  # are provisioned. The actions come from `mongodb-labs/abx-release-tools`, hash-pinned: a tag or a
+  # branch there could be moved by anyone with write access to that repository, and these jobs hold
+  # `id-token: write`.
   # ---------------------------------------------------------------------------------------------
 
   sign:
@@ -342,11 +343,25 @@ jobs:
         working-directory: ${{ github.workspace }}
         env:
           GH_TOKEN: ${{ github.token }}
+          # `gh` infers the repository from a git remote, and this job checks nothing out -- it only
+          # downloads artifacts. Without GH_REPO every `gh` call below fails with
+          # `none of the git remotes configured for this repository point to a known GitHub host`.
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --verify-tag --title "$TAG" --notes "Release $TAG"
+            # A PEP 440 prerelease is only a prerelease to PyPI: GitHub reads nothing from the
+            # version and would list `python-v1.0.0.dev1` as the latest release, ahead of the last
+            # stable one. Anything beyond digits and dots -- `.dev1`, `rc1`, `a2`, `+local` -- is
+            # not a final release, so it is marked as one here too.
+            version="${TAG#python-v}"
+            prerelease=()
+            case "$version" in
+              *[!0-9.]*) prerelease=(--prerelease) ;;
+            esac
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes "Release $TAG" \
+              ${prerelease[@]+"${prerelease[@]}"}
           fi
           gh release upload "$TAG" release/* --clobber
 
@@ -365,6 +380,9 @@ jobs:
 
     permissions:
       id-token: write
+      # Attaching the SBOM to the Release `github-release` created. Declaring `id-token` alone sets
+      # every other scope to `none`, so the upload at the end of this job would 403 without it.
+      contents: write
 
     steps:
       - name: Checkout code
@@ -384,7 +402,13 @@ jobs:
         run: |
           set -euo pipefail
           pip install --quiet cyclonedx-bom
-          pip install --quiet .
+          # `.[all]`, not `.`: `dependencies` in pyproject.toml is deliberately empty -- every runtime
+          # dependency belongs to the extra that needs it -- so a bare `pip install .` installs
+          # metadata and nothing else, and `cyclonedx-py environment` would report an SBOM listing
+          # only the project itself. `[all]` is `[memory,storage]`, which is every runtime
+          # dependency a consumer can install. The self-reference resolves to this checkout, not to
+          # the copy on PyPI.
+          pip install --quiet '.[all]'
           cyclonedx-py environment --output-format json --outfile sbom.json
           test -s sbom.json
 
@@ -424,6 +448,10 @@ jobs:
         working-directory: ${{ github.workspace }}
         env:
           GH_TOKEN: ${{ github.token }}
+          # Set for the same reason as in `github-release`. This job does check out, so `gh` could
+          # infer the repository -- but it is inferred from the remote, and the checkout above sets
+          # `persist-credentials: false`, so naming it is both explicit and independent of that.
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -452,8 +480,12 @@ jobs:
           name: python-dist
           path: dist/
 
+      # `working-directory`, like every other `run:` step in a job that checks nothing out: the
+      # workflow default is `python`, which exists only in a checkout. Without the override the step
+      # fails before it runs, with `Unable to locate executable file` naming the directory.
       - name: The version this run published
         id: version
+        working-directory: ${{ github.workspace }}
         run: echo "value=${GITHUB_REF_NAME#python-v}" >> "$GITHUB_OUTPUT"
 
       - name: Set up the release environment

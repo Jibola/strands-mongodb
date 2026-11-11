@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
+import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -992,3 +993,228 @@ class TestAnSbomShipsWhetherOrNotAVendorIsConfigured:
                     f"step {step.get('name', uses)!r} in `{name}` needs Kondukto but does not test "
                     "`vars.KONDUKTO_SECRET_ID`, so an unprovisioned vendor fails a successful release"
                 )
+
+
+def _checks_out(job: dict[str, Any]) -> bool:
+    """Whether ``job`` puts a working tree on the runner."""
+    return bool(_step_uses(job, "actions/checkout"))
+
+
+def _step_env(workflow: dict[str, Any], job: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
+    """The environment a step sees, with the nearer scope winning, as Actions resolves it."""
+    merged: dict[str, Any] = {}
+    for scope in (workflow.get("env"), job.get("env"), step.get("env")):
+        if isinstance(scope, dict):
+            merged.update(scope)
+    return merged
+
+
+class TestAJobThatChecksNothingOutStillRuns:
+    """``AT-172`` -- the three things a checkout-less job silently depends on.
+
+    Four jobs here never check out: they download an artifact, act on it, and upload the result.
+    That is deliberate -- a job that signs a wheel has no use for a working tree, and a checkout it
+    does not need is a credential and a cache surface it does not need either. But three pieces of
+    this workflow's configuration quietly assume a checkout exists, and each of them fails at run
+    time on a tag, which is the one trigger that cannot be rehearsed: there is no `workflow_dispatch`
+    here, deliberately, so the first run of any of this is a real release of a real version.
+
+    Every assertion below was written against a defect that was in the file, not against a
+    hypothetical. None of them is about style.
+    """
+
+    def test_every_run_step_in_such_a_job_overrides_the_working_directory(self, workflow: dict[str, Any]) -> None:
+        """AT-172 -- the workflow default is a directory that exists only in a checkout.
+
+        ``defaults.run.working-directory: python`` is right for the jobs that build and test, and it
+        is inherited by every ``run:`` step in the file, including those in jobs where ``python/``
+        was never created. The runner fails such a step before the shell starts, so nothing in the
+        script -- including a ``set -e`` trap or an ``if`` guard -- can recover from it.
+        """
+        default = ((workflow.get("defaults") or {}).get("run") or {}).get("working-directory")
+        if not default:
+            pytest.skip("no workflow-level working directory to inherit")
+
+        for name, job in _jobs(workflow).items():
+            if _checks_out(job):
+                continue
+            for step in _steps(job):
+                if "run" not in step:
+                    continue
+                assert step.get("working-directory"), (
+                    f"step {step.get('name', step['run'][:40])!r} in `{name}` runs a script in the inherited "
+                    f"`{default}/`, but `{name}` checks nothing out, so that directory does not exist. "
+                    f"Override it with `working-directory: ${{{{ github.workspace }}}}`"
+                )
+
+    def test_every_step_calling_gh_is_told_which_repository_it_is_in(self, workflow: dict[str, Any]) -> None:
+        """AT-172 -- ``GH_TOKEN`` authenticates; it does not identify a repository.
+
+        ``gh`` resolves the repository from a git remote. A token alone leaves it with nowhere to
+        send the request, and it exits with `none of the git remotes configured for this repository
+        point to a known GitHub host` -- after the release has already been published, because these
+        jobs run downstream of ``publish``.
+
+        Checked for every job rather than only the checkout-less ones: a checkout with
+        ``persist-credentials: false`` still leaves a usable remote, so the inference would work, but
+        it then depends on a flag set for an unrelated reason three steps earlier.
+        """
+        for name, job in _jobs(workflow).items():
+            for step in _steps(job):
+                script = str(step.get("run", ""))
+                if not re.search(r"\bgh\s+\w", script):
+                    continue
+                env = _step_env(workflow, job, step)
+                assert "GH_TOKEN" in env, f"step {step.get('name')!r} in `{name}` calls `gh` with no GH_TOKEN"
+                assert "GH_REPO" in env, (
+                    f"step {step.get('name')!r} in `{name}` calls `gh` but names no repository. Set "
+                    "`GH_REPO: ${{ github.repository }}`; GH_TOKEN authenticates but does not point anywhere"
+                )
+
+    def test_every_job_that_writes_to_a_release_holds_the_permission_to(self, workflow: dict[str, Any]) -> None:
+        """AT-172 -- declaring one scope sets every other to ``none``.
+
+        A job that declares ``permissions: {id-token: write}`` for AWS has, by that act, given up the
+        ``contents: write`` the ambient token would otherwise have carried. ``gh release upload``
+        then fails with a 403 that reads like a token problem rather than a permissions block.
+        """
+        for name, job in _jobs(workflow).items():
+            writes = [
+                step
+                for step in _steps(job)
+                if re.search(r"\bgh\s+release\s+(create|upload|edit|delete)", str(step.get("run", "")))
+            ]
+            if not writes:
+                continue
+            granted = job.get("permissions")
+            assert isinstance(granted, dict) and granted.get("contents") == "write", (
+                f"`{name}` writes to a GitHub Release but its permissions are {granted!r}. Declaring any "
+                "scope sets the rest to `none`, so `contents: write` has to be named explicitly"
+            )
+
+
+class TestTheSbomListsSomethingWorthReading:
+    """``AT-173`` -- an SBOM of a package whose dependencies all live in extras.
+
+    ``pyproject.toml`` declares ``dependencies = []`` on purpose: every runtime dependency belongs to
+    the extra that needs it, so ``pip install strands-mongodb`` is metadata only. That choice has a
+    consequence nobody looking at the SBOM job would guess: ``cyclonedx-py environment`` reports what
+    is installed, so an SBOM built after a bare ``pip install .`` lists this package and nothing else.
+
+    It is a valid CycloneDX document, it attaches to the release, every structural test passes, and it
+    answers none of the questions an SBOM exists to answer. That is the worst failure available here,
+    because it is the one that looks like success.
+    """
+
+    def test_the_premise_still_holds(self) -> None:
+        """AT-173 -- the base install really is empty, which is the whole reason for the test below.
+
+        If the dependencies ever move back out of the extras this assertion fails, and the next test
+        becomes a style preference rather than a correctness one.
+        """
+        manifest = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())
+        assert manifest["project"]["dependencies"] == [], (
+            "the base install now carries dependencies, so a bare `pip install .` would produce a "
+            "populated SBOM; re-read the test below before changing it"
+        )
+
+    def test_the_project_is_installed_with_its_dependencies(self, workflow: dict[str, Any]) -> None:
+        """AT-173 -- the generating job installs an extra, not the bare project."""
+        for name, job in _jobs(workflow).items():
+            for step in _steps(job):
+                script = str(step.get("run", ""))
+                if "cyclonedx-py" not in script:
+                    continue
+                installs = re.findall(
+                    r"pip install[^\n]*?((?:'|\")?\.\[[a-z,]+\](?:'|\")?|(?<![\w.\[])\.$)", script, re.M
+                )
+                assert any("[" in found for found in installs), (
+                    f"the SBOM step in `{name}` does not install the project with an extra. With "
+                    "`dependencies = []` the resulting SBOM lists only strands-mongodb itself"
+                )
+
+
+class TestAPrereleaseIsNotTheLatestRelease:
+    """``AT-174`` -- PEP 440 means nothing to GitHub.
+
+    ``python-v1.0.0.dev1`` is a prerelease to PyPI, which hides it from a plain ``pip install``. The
+    GitHub Release created from the same tag carries no such notion: unless it is marked, GitHub
+    lists it as the repository's latest release, above the last stable one, and that is what the
+    README badge, the releases page and anything reading the API will report.
+    """
+
+    @staticmethod
+    def _creating_step(workflow: dict[str, Any]) -> tuple[str, str]:
+        """The one step that creates the Release, and the job it lives in."""
+        found = [
+            (name, str(step.get("run", "")))
+            for name, job in _jobs(workflow).items()
+            for step in _steps(job)
+            if "gh release create" in str(step.get("run", ""))
+        ]
+        assert found, "nothing creates a GitHub Release, so the signatures have nowhere to attach"
+        assert len(found) == 1, f"{len(found)} steps create a Release; this test assumes one"
+        return found[0]
+
+    @pytest.mark.parametrize(
+        ("tag", "marked"),
+        [
+            ("python-v1.0.0.dev1", True),
+            ("python-v1.0.0rc1", True),
+            ("python-v1.0.0a2", True),
+            ("python-v1.0.0.post1", True),
+            ("python-v1.0.0", False),
+            ("python-v0.1.0", False),
+            ("python-v10.20.30", False),
+        ],
+    )
+    def test_it_marks_exactly_the_versions_that_are_not_final(
+        self, workflow: dict[str, Any], tmp_path: Path, tag: str, marked: bool
+    ) -> None:
+        """AT-174 -- the script is run, not read, because the decision is a shell glob.
+
+        Asserting that the text contains ``--prerelease`` proves nothing: the flag can be computed
+        into a variable that is never passed on, which is a single missing line and exactly the shape
+        of mistake a substring check cannot see. So the step's own script runs here against a
+        recording stand-in for ``gh``, under the same ``set -euo pipefail`` the runner uses, and the
+        assertion is about the arguments ``gh release create`` was actually handed.
+        """
+        _, script = self._creating_step(workflow)
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        # `view` exits non-zero so the script takes the create branch; everything else records and
+        # succeeds. Written to a file rather than echoed, so an argument containing a space survives.
+        (bin_dir / "gh").write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1 $2" = "release view" ]; then exit 1; fi\n'
+            'printf "%s\\n" "$@" >> "$RECORD"\n'
+            'printf "%s\\n" "=== end of call" >> "$RECORD"\n'
+        )
+        (bin_dir / "gh").chmod(0o755)
+
+        record = tmp_path / "calls"
+        (tmp_path / "release").mkdir()
+        result = subprocess.run(  # noqa: S603 - a fixed interpreter on a script this repository owns
+            ["bash", "-c", script],
+            cwd=tmp_path,
+            env={
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "RECORD": str(record),
+                "TAG": tag,
+                "GH_TOKEN": "not-a-token",
+                "GH_REPO": "mongodb/strands-mongodb",
+            },
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"the step failed for {tag}:\n{result.stderr}"
+
+        calls = [call.splitlines() for call in record.read_text().split("=== end of call\n") if call.strip()]
+        creates = [call for call in calls if call[:2] == ["release", "create"]]
+        assert len(creates) == 1, f"expected one `gh release create` for {tag}, recorded {calls}"
+
+        assert ("--prerelease" in creates[0]) is marked, (
+            f"`gh release create` for {tag} was handed {creates[0]}. A version that is not a final "
+            f"release must be marked, or GitHub lists it as this repository's latest release"
+        )
