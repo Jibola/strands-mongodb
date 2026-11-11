@@ -26,3 +26,7 @@ htmlcov/
 # Local credentials: never commit a connection string
 .env
 *.pem
+
+# Local agent settings. Personal, per-machine, and sometimes holds paths from a
+# working directory; nothing here describes the project.
+.claude/

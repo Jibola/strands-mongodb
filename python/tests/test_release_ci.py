@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
+import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -222,15 +223,35 @@ class TestNothingHereIsALongLivedCredential:
             f"and no long-lived credential should exist to reference"
         )
 
-    def test_the_oidc_permission_is_raised_on_exactly_one_job(self, workflow: dict[str, Any]) -> None:
-        """``id-token: write`` is what exchanges for the upload credential, so its blast radius is
-        every job that holds it. One job needs it.
-        """
-        holders = [
-            name for name, job in _jobs(workflow).items() if (job.get("permissions") or {}).get("id-token") == "write"
-        ]
+    def test_every_job_holding_oidc_is_bound_to_an_environment(self, workflow: dict[str, Any]) -> None:
+        """``id-token: write`` is what exchanges for a cloud credential, so every job holding it must
+        name an environment.
 
-        assert len(holders) == 1, f"`id-token: write` is held by {holders}, and exactly one job should hold it"
+        An environment is what keeps a job from minting a credential unsupervised: it is the binding
+        PyPI verifies, the place required reviewers live, and the scope an org admin can revoke in one
+        action. This asserts that at least one job raises the permission -- a workflow where nothing
+        can authenticate publishes nothing -- and that each one that does names an environment.
+
+        This replaces ``test_the_oidc_permission_is_raised_on_exactly_one_job`` because four jobs now
+        assume a role over OIDC -- signing, publishing, the SBOM and the authorized-publication report
+        -- so a count of holders no longer distinguishes a correct workflow from a careless one. The
+        count stood in for supervision; naming the environment states it directly, and states it of
+        every holder rather than leaving the one holder's binding unchecked.
+        """
+        holders = {
+            name: job
+            for name, job in _jobs(workflow).items()
+            if (job.get("permissions") or {}).get("id-token") == "write"
+        }
+
+        assert holders, "no job raises `id-token: write`, so nothing here can authenticate to PyPI or AWS"
+        for name, job in holders.items():
+            environment = job.get("environment")
+            bound = environment if isinstance(environment, str) else (environment or {}).get("name")
+            assert bound, (
+                f"job {name!r} raises `id-token: write` without naming an environment, so the token it "
+                f"mints is scoped by nothing a repository administrator can see or revoke"
+            )
 
     def test_the_workflow_default_grants_no_write(self, workflow: dict[str, Any]) -> None:
         """The top-level default is read-only, so a job that raises nothing inherits nothing."""
@@ -328,8 +349,12 @@ class TestThePublishedArtifactIsTheVerifiedArtifact:
         release over PEP 440 spelling, and a maintainer who has just been failed over spelling is
         the person most likely to replace the check with something weaker.
         """
+        # Located by what the step does, not merely by the variable it reads. `GITHUB_REF_NAME` alone
+        # matched every step that derives a version from the tag -- the authorized-publication report
+        # does that too, and has no artifact to parse -- which made this fail for a step it was never
+        # about.
         runs = [str(step.get("run", "")) for job in _jobs(workflow).values() for step in _steps(job)]
-        checks = [block for block in runs if "GITHUB_REF_NAME" in block]
+        checks = [block for block in runs if "GITHUB_REF_NAME" in block and "parse_wheel_filename" in block]
 
         assert checks, "no step compares the built artifact against the tag"
         for block in checks:
@@ -406,6 +431,24 @@ class TestTheReleaseGateIsNoWeakerThanCI:
 MANIFEST_CHECK = "validate-pyproject"
 ARTIFACT_CHECK = "twine check"
 
+
+def _published_artifact(workflow: dict[str, Any]) -> str:
+    """The artifact name the publishing job downloads: the one whose contents reach PyPI.
+
+    Several artifacts move between jobs now. Rules about what PyPI receives apply to this one, and
+    naming it here keeps them from being asserted of the signatures by accident.
+    """
+    for job in workflow.get("jobs", {}).values():
+        if not _step_uses(job, PUBLISH_ACTION):
+            continue
+        for step in _steps(job):
+            if str(step.get("uses", "")).startswith(DOWNLOAD_ACTION):
+                name = (step.get("with") or {}).get("name")
+                if name:
+                    return str(name)
+    raise AssertionError("no publishing job downloads a named artifact, so nothing reaches PyPI")
+
+
 #: The action that hands the built files to the publisher, and the one that wrote them.
 DOWNLOAD_ACTION = "actions/download-artifact"
 UPLOAD_ACTION = "actions/upload-artifact"
@@ -464,9 +507,18 @@ class TestTheArtifactIsCheckedAndNotOnlyTheCodeInIt:
         job whose next action is irreversible. Asserted by step index, because ``needs:`` says nothing
         about the order of steps inside one job.
         """
+        # Only the job that uploads what PyPI will receive. `sign` uploads detached signatures and a
+        # checksum file, which `twine check` cannot read and which are never offered to PyPI; requiring
+        # it there would be requiring a check of the wrong thing.
+        published = _published_artifact(workflow)
         for name, job in _jobs(workflow).items():
             steps = _steps(job)
-            uploads = [i for i, step in enumerate(steps) if str(step.get("uses", "")).startswith(UPLOAD_ACTION)]
+            uploads = [
+                i
+                for i, step in enumerate(steps)
+                if str(step.get("uses", "")).startswith(UPLOAD_ACTION)
+                and (step.get("with") or {}).get("name") == published
+            ]
             if not uploads:
                 continue
             checks = [i for i, step in enumerate(steps) if ARTIFACT_CHECK in str(step.get("run", ""))]
@@ -502,33 +554,57 @@ class TestTheArtifactTheUploadWroteIsTheOneThePublisherReads:
     jobs run in what order and it is correct; this is about whether the payload arrives.
     """
 
-    def _pair(self, workflow: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        """The one upload step and the one download step, as ``with:`` mappings."""
-        steps = [step for job in _jobs(workflow).values() for step in _steps(job)]
-        uploads = [step for step in steps if str(step.get("uses", "")).startswith(UPLOAD_ACTION)]
-        downloads = [step for step in steps if str(step.get("uses", "")).startswith(DOWNLOAD_ACTION)]
+    def _uploads(self, workflow: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Every upload step's ``with:`` mapping, keyed by the artifact name it writes.
 
-        assert len(uploads) == 1, f"expected exactly one upload step, found {len(uploads)}"
-        assert len(downloads) == 1, f"expected exactly one download step, found {len(downloads)}"
-        return uploads[0].get("with") or {}, downloads[0].get("with") or {}
-
-    def test_exactly_one_job_uploads_and_exactly_one_downloads(self, workflow: dict[str, Any]) -> None:
-        """The vacuity guard for the two tests below, which compare a pair.
-
-        Two uploads under different names is the shape where the equality assertions below start passing
-        on whichever pair the walk happens to reach first.
+        One name may be written only once. Two uploads under one name is the shape where a download
+        resolves to whichever the walk reaches first, which is the ambiguity the old pair-counting
+        guarded against and the only part of it that still needs guarding.
         """
-        self._pair(workflow)
+        uploads: dict[str, dict[str, Any]] = {}
+        for name, job in _jobs(workflow).items():
+            for step in _steps(job):
+                if not str(step.get("uses", "")).startswith(UPLOAD_ACTION):
+                    continue
+                supplied = step.get("with") or {}
+                artifact = supplied.get("name")
+                assert artifact, f"job {name!r} uploads without naming an artifact, so nothing can ask for it"
+                assert artifact not in uploads, (
+                    f"artifact {artifact!r} is uploaded by more than one job; a download of that name "
+                    f"resolves to whichever ran last, which is not a thing the file states"
+                )
+                uploads[artifact] = supplied
+        return uploads
 
-    def test_the_download_names_the_artifact_the_upload_wrote(self, workflow: dict[str, Any]) -> None:
-        """One name, spelled once in each direction, and nothing else in the file agrees them."""
-        upload, download = self._pair(workflow)
+    def _downloads(self, workflow: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+        """Every download step, as ``(job name, with-mapping)``."""
+        return [
+            (name, step.get("with") or {})
+            for name, job in _jobs(workflow).items()
+            for step in _steps(job)
+            if str(step.get("uses", "")).startswith(DOWNLOAD_ACTION)
+        ]
 
-        assert upload.get("name"), "the upload declares no artifact name, so the download cannot ask for one"
-        assert download.get("name") == upload.get("name"), (
-            f"the upload writes {upload.get('name')!r} and the download asks for {download.get('name')!r}; "
-            f"the publish job would receive nothing and the failure would arrive after the approval"
-        )
+    def test_every_download_names_an_artifact_some_upload_wrote(self, workflow: dict[str, Any]) -> None:
+        """The replacement for counting one upload and one download.
+
+        The counts held while the only artifact was the distribution. Signing adds a second artifact
+        and two more downloads, so the counts are wrong without anything being wrong. What they were
+        protecting is the string agreement: a download that names an artifact nothing wrote receives
+        an empty directory, and in the publish job that happens after somebody has approved the
+        deployment. That is asserted here directly, for every download rather than for one.
+        """
+        uploads = self._uploads(workflow)
+        downloads = self._downloads(workflow)
+
+        assert uploads, "nothing uploads an artifact"
+        assert downloads, "nothing downloads an artifact"
+        for job, download in downloads:
+            artifact = download.get("name")
+            assert artifact in uploads, (
+                f"job {job!r} downloads {artifact!r}, which no job uploads (uploaded: {sorted(uploads)}); "
+                f"it would receive an empty directory and the failure would arrive after the approval"
+            )
 
     def test_the_directory_handed_to_the_publisher_is_the_one_the_download_wrote_into(
         self, workflow: dict[str, Any]
@@ -538,11 +614,22 @@ class TestTheArtifactTheUploadWroteIsTheOneThePublisherReads:
         ``dist/`` and ``dist`` are the same directory and a string comparison calls them different, which
         is the kind of failure that gets a real assertion replaced with a weaker one.
         """
-        _, download = self._pair(workflow)
-        publishers = [step for job in _jobs(workflow).values() for step in _step_uses(job, PUBLISH_ACTION)]
-        assert publishers, f"no step uses {PUBLISH_ACTION}"
+        publishing = {name: job for name, job in _jobs(workflow).items() if _step_uses(job, PUBLISH_ACTION)}
+        assert publishing, f"no step uses {PUBLISH_ACTION}"
 
-        for step in publishers:
+        for name, job in publishing.items():
+            # The download in the publishing job, not any download in the file: other jobs download the
+            # same artifact to other paths, and only this one feeds the uploader.
+            local = [
+                step.get("with") or {} for step in _steps(job) if str(step.get("uses", "")).startswith(DOWNLOAD_ACTION)
+            ]
+            assert len(local) == 1, (
+                f"job {name!r} runs {PUBLISH_ACTION} and {len(local)} downloads; which directory reaches "
+                f"the uploader has to be unambiguous"
+            )
+            download = local[0]
+
+        for step in [step for job in publishing.values() for step in _step_uses(job, PUBLISH_ACTION)]:
             packages = (step.get("with") or {}).get("packages-dir")
             assert packages, f"{PUBLISH_ACTION} is handed no packages-dir, so it reads wherever it defaults to"
             assert PurePosixPath(str(packages)) == PurePosixPath(str(download.get("path"))), (
@@ -557,12 +644,13 @@ class TestTheArtifactTheUploadWroteIsTheOneThePublisherReads:
         a renamed output directory or a hatch configuration change, and the default turns that into a
         release that uploads nothing to PyPI rather than into a red job.
         """
-        upload, _ = self._pair(workflow)
+        uploads = self._uploads(workflow)
 
-        assert upload.get("if-no-files-found") == "error", (
-            f"the upload sets if-no-files-found to {upload.get('if-no-files-found')!r}; anything but "
-            f"`error` lets an empty artifact through to the publish job"
-        )
+        for artifact, upload in uploads.items():
+            assert upload.get("if-no-files-found") == "error", (
+                f"the upload of {artifact!r} sets if-no-files-found to {upload.get('if-no-files-found')!r}; "
+                f"anything but `error` lets an empty artifact through to the job that consumes it"
+            )
 
 
 #: The release document, beside the package README rather than at the repository root: it is about
@@ -804,14 +892,23 @@ class TestTheActionThatUploadsIsPinnedToContentRatherThanToAPlace:
     current, and the pin is worth less without them.
     """
 
-    def test_exactly_one_job_holds_the_publishing_credential(self, workflow: dict[str, Any]) -> None:
-        """AT-170 -- the vacuity guard, and the premise the scope of this gate rests on."""
-        holders = [
+    def test_the_publishing_credential_is_held_by_the_job_that_publishes(self, workflow: dict[str, Any]) -> None:
+        """AT-170 -- the vacuity guard, and the premise the scope of this gate rests on.
+
+        This required exactly one holder of ``id-token: write``. Several jobs hold it now, because
+        signing and the SBOM authenticate to AWS the same way, so the premise has to be stated as what
+        it always meant: the job that runs the publish action is a holder, and the pinning rule below
+        applies to every holder rather than to one job that happened to be alone.
+        """
+        holders = {
             name for name, job in workflow["jobs"].items() if (job.get("permissions") or {}).get("id-token") == "write"
-        ]
-        assert len(holders) == 1, (
-            f"{len(holders)} jobs raise id-token: write ({holders}). This gate is scoped to the job that "
-            f"holds the upload credential, so which job that is has to be unambiguous"
+        }
+        publishers = {name for name, job in workflow["jobs"].items() if _step_uses(job, PUBLISH_ACTION)}
+
+        assert publishers, f"no job uses {PUBLISH_ACTION}, so this gate is guarding nothing"
+        assert publishers <= holders, (
+            f"{sorted(publishers - holders)} runs {PUBLISH_ACTION} without `id-token: write`, so it is "
+            f"uploading with something other than a trusted-publishing token"
         )
 
     def test_every_action_it_runs_is_pinned_to_a_digest(self, workflow: dict[str, Any]) -> None:
@@ -833,3 +930,291 @@ class TestTheActionThatUploadsIsPinnedToContentRatherThanToAPlace:
         assert not _DIGEST.match("release/v1")
         assert not _DIGEST.match("v7")
         assert not _DIGEST.match("v7.0.0")
+
+
+class TestAnSbomShipsWhetherOrNotAVendorIsConfigured:
+    """``AT-171`` -- the SBOM is generated on every release; only its augmentation is optional.
+
+    Two different things live in the SBOM job. Generating a CycloneDX SBOM is ``cyclonedx-py`` reading
+    the installed environment: no credential, no network service, no vendor. Augmenting it is SilkBomb
+    talking to Kondukto, which needs an image from MongoDB's ECR and a Kondukto token, and which is
+    therefore the part that waits on provisioning.
+
+    Gating the whole job on the Kondukto variable fuses the two, and a release then ships no SBOM at
+    all while the variable is unset -- which is the state the repository is in and expects to stay in
+    for a while. Product Security owns Kondukto now and has indicated it may be deprecated, so "the
+    variable is unset" is not reliably a short-lived condition and may outlive the tool.
+
+    The dependency list is the part an SSDLC reviewer, a downstream consumer and a vulnerability scan
+    all actually want, and it costs nothing. So it ships unconditionally, and the annotation arrives
+    when the vendor does.
+    """
+
+    def test_generating_the_sbom_is_not_gated_on_the_vendor(self, workflow: dict[str, Any]) -> None:
+        """AT-171 -- neither the job nor the generation step waits on ``KONDUKTO_SECRET_ID``."""
+        jobs = _jobs(workflow)
+        producers = {
+            name: job
+            for name, job in jobs.items()
+            if any("cyclonedx-py" in str(step.get("run", "")) for step in _steps(job))
+        }
+        assert producers, "no job generates an SBOM, so no release can ship one"
+
+        for name, job in producers.items():
+            condition = str(job.get("if", ""))
+            assert "KONDUKTO" not in condition, (
+                f"job `{name}` generates the SBOM but is gated on {condition!r}: while that variable is "
+                "unset the release ships no SBOM at all, and generating one needs no Kondukto"
+            )
+            for step in _steps(job):
+                if "cyclonedx-py" in str(step.get("run", "")):
+                    assert "KONDUKTO" not in str(step.get("if", "")), (
+                        f"the generation step in `{name}` is gated on Kondukto; only the augmentation is"
+                    )
+
+    def test_the_augmentation_is_gated_so_an_unprovisioned_vendor_does_not_fail_the_release(
+        self, workflow: dict[str, Any]
+    ) -> None:
+        """AT-171 -- every step that talks to SilkBomb or Kondukto tests the variable first.
+
+        Ungating the job is only safe because of this. A SilkBomb step that ran with no token would
+        fail the job, and a failing SBOM job after a successful publish is a red release for a reason
+        nobody can act on.
+        """
+        jobs = _jobs(workflow)
+        for name, job in jobs.items():
+            for step in _steps(job):
+                uses = str(step.get("uses", ""))
+                if "abx-release-tools/actions/sbom" not in uses and "KONDUKTO_SECRET_ID" not in str(
+                    step.get("with", "")
+                ):
+                    continue
+                assert "KONDUKTO_SECRET_ID" in str(step.get("if", "")), (
+                    f"step {step.get('name', uses)!r} in `{name}` needs Kondukto but does not test "
+                    "`vars.KONDUKTO_SECRET_ID`, so an unprovisioned vendor fails a successful release"
+                )
+
+
+def _checks_out(job: dict[str, Any]) -> bool:
+    """Whether ``job`` puts a working tree on the runner."""
+    return bool(_step_uses(job, "actions/checkout"))
+
+
+def _step_env(workflow: dict[str, Any], job: dict[str, Any], step: dict[str, Any]) -> dict[str, Any]:
+    """The environment a step sees, with the nearer scope winning, as Actions resolves it."""
+    merged: dict[str, Any] = {}
+    for scope in (workflow.get("env"), job.get("env"), step.get("env")):
+        if isinstance(scope, dict):
+            merged.update(scope)
+    return merged
+
+
+class TestAJobThatChecksNothingOutStillRuns:
+    """``AT-172`` -- the three things a checkout-less job silently depends on.
+
+    Four jobs here never check out: they download an artifact, act on it, and upload the result.
+    That is deliberate -- a job that signs a wheel has no use for a working tree, and a checkout it
+    does not need is a credential and a cache surface it does not need either. But three pieces of
+    this workflow's configuration quietly assume a checkout exists, and each of them fails at run
+    time on a tag, which is the one trigger that cannot be rehearsed: there is no `workflow_dispatch`
+    here, deliberately, so the first run of any of this is a real release of a real version.
+
+    Every assertion below was written against a defect that was in the file, not against a
+    hypothetical. None of them is about style.
+    """
+
+    def test_every_run_step_in_such_a_job_overrides_the_working_directory(self, workflow: dict[str, Any]) -> None:
+        """AT-172 -- the workflow default is a directory that exists only in a checkout.
+
+        ``defaults.run.working-directory: python`` is right for the jobs that build and test, and it
+        is inherited by every ``run:`` step in the file, including those in jobs where ``python/``
+        was never created. The runner fails such a step before the shell starts, so nothing in the
+        script -- including a ``set -e`` trap or an ``if`` guard -- can recover from it.
+        """
+        default = ((workflow.get("defaults") or {}).get("run") or {}).get("working-directory")
+        if not default:
+            pytest.skip("no workflow-level working directory to inherit")
+
+        for name, job in _jobs(workflow).items():
+            if _checks_out(job):
+                continue
+            for step in _steps(job):
+                if "run" not in step:
+                    continue
+                assert step.get("working-directory"), (
+                    f"step {step.get('name', step['run'][:40])!r} in `{name}` runs a script in the inherited "
+                    f"`{default}/`, but `{name}` checks nothing out, so that directory does not exist. "
+                    f"Override it with `working-directory: ${{{{ github.workspace }}}}`"
+                )
+
+    def test_every_step_calling_gh_is_told_which_repository_it_is_in(self, workflow: dict[str, Any]) -> None:
+        """AT-172 -- ``GH_TOKEN`` authenticates; it does not identify a repository.
+
+        ``gh`` resolves the repository from a git remote. A token alone leaves it with nowhere to
+        send the request, and it exits with `none of the git remotes configured for this repository
+        point to a known GitHub host` -- after the release has already been published, because these
+        jobs run downstream of ``publish``.
+
+        Checked for every job rather than only the checkout-less ones: a checkout with
+        ``persist-credentials: false`` still leaves a usable remote, so the inference would work, but
+        it then depends on a flag set for an unrelated reason three steps earlier.
+        """
+        for name, job in _jobs(workflow).items():
+            for step in _steps(job):
+                script = str(step.get("run", ""))
+                if not re.search(r"\bgh\s+\w", script):
+                    continue
+                env = _step_env(workflow, job, step)
+                assert "GH_TOKEN" in env, f"step {step.get('name')!r} in `{name}` calls `gh` with no GH_TOKEN"
+                assert "GH_REPO" in env, (
+                    f"step {step.get('name')!r} in `{name}` calls `gh` but names no repository. Set "
+                    "`GH_REPO: ${{ github.repository }}`; GH_TOKEN authenticates but does not point anywhere"
+                )
+
+    def test_every_job_that_writes_to_a_release_holds_the_permission_to(self, workflow: dict[str, Any]) -> None:
+        """AT-172 -- declaring one scope sets every other to ``none``.
+
+        A job that declares ``permissions: {id-token: write}`` for AWS has, by that act, given up the
+        ``contents: write`` the ambient token would otherwise have carried. ``gh release upload``
+        then fails with a 403 that reads like a token problem rather than a permissions block.
+        """
+        for name, job in _jobs(workflow).items():
+            writes = [
+                step
+                for step in _steps(job)
+                if re.search(r"\bgh\s+release\s+(create|upload|edit|delete)", str(step.get("run", "")))
+            ]
+            if not writes:
+                continue
+            granted = job.get("permissions")
+            assert isinstance(granted, dict) and granted.get("contents") == "write", (
+                f"`{name}` writes to a GitHub Release but its permissions are {granted!r}. Declaring any "
+                "scope sets the rest to `none`, so `contents: write` has to be named explicitly"
+            )
+
+
+class TestTheSbomListsSomethingWorthReading:
+    """``AT-173`` -- an SBOM of a package whose dependencies all live in extras.
+
+    ``pyproject.toml`` declares ``dependencies = []`` on purpose: every runtime dependency belongs to
+    the extra that needs it, so ``pip install strands-mongodb`` is metadata only. That choice has a
+    consequence nobody looking at the SBOM job would guess: ``cyclonedx-py environment`` reports what
+    is installed, so an SBOM built after a bare ``pip install .`` lists this package and nothing else.
+
+    It is a valid CycloneDX document, it attaches to the release, every structural test passes, and it
+    answers none of the questions an SBOM exists to answer. That is the worst failure available here,
+    because it is the one that looks like success.
+    """
+
+    def test_the_premise_still_holds(self) -> None:
+        """AT-173 -- the base install really is empty, which is the whole reason for the test below.
+
+        If the dependencies ever move back out of the extras this assertion fails, and the next test
+        becomes a style preference rather than a correctness one.
+        """
+        manifest = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())
+        assert manifest["project"]["dependencies"] == [], (
+            "the base install now carries dependencies, so a bare `pip install .` would produce a "
+            "populated SBOM; re-read the test below before changing it"
+        )
+
+    def test_the_project_is_installed_with_its_dependencies(self, workflow: dict[str, Any]) -> None:
+        """AT-173 -- the generating job installs an extra, not the bare project."""
+        for name, job in _jobs(workflow).items():
+            for step in _steps(job):
+                script = str(step.get("run", ""))
+                if "cyclonedx-py" not in script:
+                    continue
+                installs = re.findall(
+                    r"pip install[^\n]*?((?:'|\")?\.\[[a-z,]+\](?:'|\")?|(?<![\w.\[])\.$)", script, re.M
+                )
+                assert any("[" in found for found in installs), (
+                    f"the SBOM step in `{name}` does not install the project with an extra. With "
+                    "`dependencies = []` the resulting SBOM lists only strands-mongodb itself"
+                )
+
+
+class TestAPrereleaseIsNotTheLatestRelease:
+    """``AT-174`` -- PEP 440 means nothing to GitHub.
+
+    ``python-v1.0.0.dev1`` is a prerelease to PyPI, which hides it from a plain ``pip install``. The
+    GitHub Release created from the same tag carries no such notion: unless it is marked, GitHub
+    lists it as the repository's latest release, above the last stable one, and that is what the
+    README badge, the releases page and anything reading the API will report.
+    """
+
+    @staticmethod
+    def _creating_step(workflow: dict[str, Any]) -> tuple[str, str]:
+        """The one step that creates the Release, and the job it lives in."""
+        found = [
+            (name, str(step.get("run", "")))
+            for name, job in _jobs(workflow).items()
+            for step in _steps(job)
+            if "gh release create" in str(step.get("run", ""))
+        ]
+        assert found, "nothing creates a GitHub Release, so the signatures have nowhere to attach"
+        assert len(found) == 1, f"{len(found)} steps create a Release; this test assumes one"
+        return found[0]
+
+    @pytest.mark.parametrize(
+        ("tag", "marked"),
+        [
+            ("python-v1.0.0.dev1", True),
+            ("python-v1.0.0rc1", True),
+            ("python-v1.0.0a2", True),
+            ("python-v1.0.0.post1", True),
+            ("python-v1.0.0", False),
+            ("python-v0.1.0", False),
+            ("python-v10.20.30", False),
+        ],
+    )
+    def test_it_marks_exactly_the_versions_that_are_not_final(
+        self, workflow: dict[str, Any], tmp_path: Path, tag: str, marked: bool
+    ) -> None:
+        """AT-174 -- the script is run, not read, because the decision is a shell glob.
+
+        Asserting that the text contains ``--prerelease`` proves nothing: the flag can be computed
+        into a variable that is never passed on, which is a single missing line and exactly the shape
+        of mistake a substring check cannot see. So the step's own script runs here against a
+        recording stand-in for ``gh``, under the same ``set -euo pipefail`` the runner uses, and the
+        assertion is about the arguments ``gh release create`` was actually handed.
+        """
+        _, script = self._creating_step(workflow)
+
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        # `view` exits non-zero so the script takes the create branch; everything else records and
+        # succeeds. Written to a file rather than echoed, so an argument containing a space survives.
+        (bin_dir / "gh").write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$1 $2" = "release view" ]; then exit 1; fi\n'
+            'printf "%s\\n" "$@" >> "$RECORD"\n'
+            'printf "%s\\n" "=== end of call" >> "$RECORD"\n'
+        )
+        (bin_dir / "gh").chmod(0o755)
+
+        record = tmp_path / "calls"
+        (tmp_path / "release").mkdir()
+        result = subprocess.run(  # noqa: S603 - a fixed interpreter on a script this repository owns
+            ["bash", "-c", script],
+            cwd=tmp_path,
+            env={
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "RECORD": str(record),
+                "TAG": tag,
+                "GH_TOKEN": "not-a-token",
+                "GH_REPO": "mongodb/strands-mongodb",
+            },
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f"the step failed for {tag}:\n{result.stderr}"
+
+        calls = [call.splitlines() for call in record.read_text().split("=== end of call\n") if call.strip()]
+        creates = [call for call in calls if call[:2] == ["release", "create"]]
+        assert len(creates) == 1, f"expected one `gh release create` for {tag}, recorded {calls}"
+
+        assert ("--prerelease" in creates[0]) is marked, (
+            f"`gh release create` for {tag} was handed {creates[0]}. A version that is not a final "
+            f"release must be marked, or GitHub lists it as this repository's latest release"
+        )
