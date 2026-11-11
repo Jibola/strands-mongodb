@@ -437,7 +437,8 @@ jobs:
           ATLAS_CLI_SHA256: 045948133107b87f4b3af670ab3931f8a7ac82e5fbe21204943adb336d5e11d4
         run: |
           archive="mongodb-atlas-cli_${ATLAS_CLI_VERSION}_linux_x86_64.tar.gz"
-          curl -sSfL -o "$RUNNER_TEMP/$archive" \
+          # Retried because a transient 504 from GitHub's release download failed the 2026-11-09 run.
+          curl -sSfL --retry 3 --retry-all-errors -o "$RUNNER_TEMP/$archive" \
             "https://github.com/mongodb/mongodb-atlas-cli/releases/download/atlascli%2Fv${ATLAS_CLI_VERSION}/${archive}"
           echo "${ATLAS_CLI_SHA256}  $RUNNER_TEMP/$archive" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
