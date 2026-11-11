@@ -77,7 +77,7 @@ remote: The 'mongodb' organization has enabled or enforced SAML SSO.
 fatal: unable to access 'https://github.com/mongodb/strands-mongodb.git/': The requested URL returned error: 403
 ```
 
-And this is a monorepo. The distribution lives in `python/`, a sibling of a future `typescript/`, so
+This is a monorepo. The distribution lives in `python/`, a sibling of a future `typescript/`, so
 there is no `pyproject.toml` at the repository root for pip to build even once the clone succeeds.
 
 One URL addresses both: SSH for the first, a `subdirectory` fragment for the second.
