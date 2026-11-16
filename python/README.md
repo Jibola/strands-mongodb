@@ -44,7 +44,7 @@ collision all three run into.
 
 Pick the surface you need. Each extra pulls only its own dependencies.
 
-<!-- skip: installs from PyPI; checked by hand in fresh venvs against the published 0.1.0.dev1 -->
+<!-- skip: installs from PyPI, which no test tier reaches -->
 ```bash
 pip install 'strands-mongodb[storage]'   # MongoDBStorage
 pip install 'strands-mongodb[memory]'    # MongoDBMemoryStore

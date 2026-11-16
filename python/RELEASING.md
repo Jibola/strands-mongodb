@@ -12,7 +12,8 @@ environment, so a job added to the workflow and not described here fails the sui
 
 The version is not written down anywhere. `hatch-vcs` derives it from the git tag, matching
 `^python-v(?P<version>.+)$`, so `python-v0.1.0` builds `0.1.0`. A build from a tree with no such tag
-gets a development version counted from the first commit, of the form `0.0.1.devN+g<sha>`, and a build
+gets a development version numbered from the last tag, of the form `<next minor>.devN+g<sha>`
+(setuptools-scm's `release-branch-semver` scheme), and a build
 with no git metadata at all falls back to `0.0.0`. Neither can be mistaken for a release.
 
 This means there is no version bump commit and nothing to keep in sync. It also means the tag is the
@@ -25,15 +26,11 @@ whole decision: tag the commit you mean, because the artifact is built from it a
    the version you are about to tag, and give that heading the release date. Nothing else in the
    repository records what a version contains, and after the upload nobody can add it retroactively to
    the artifact.
-3. **If this is the first release ever**, remove the
-   `<!-- skip: these reach PyPI for a package that is not published yet -->` marker from both
-   `README.md` files in the same commit. A test couples the two: while the marker is present the
-   changelog may date nothing, and once it is gone the changelog must date something.
-4. **Run the gate locally.** `hatch run format-check`, `hatch run lint`, `hatch run typecheck`,
+3. **Run the gate locally.** `hatch run format-check`, `hatch run lint`, `hatch run typecheck`,
    `hatch run cov`. The release workflow runs all four again and a failure there wastes only time, but
    it wastes it after you have already pushed a tag, and a tag pointing at a commit that cannot be
    released has to be deleted from the remote by hand.
-5. **Run the Atlas tiers on that commit.** Start `CI - Python` by hand from the Actions tab on `main` and
+4. **Run the Atlas tiers on that commit.** Start `CI - Python` by hand from the Actions tab on `main` and
    wait for `Atlas tiers`. It is the only job that runs `autoembed`, the package's default search mode,
    against Atlas, and it does not run on a merge.
 
@@ -56,10 +53,12 @@ GPG or SSH signing key configured locally (`git config --get user.signingkey`); 
 fails rather than quietly producing an unsigned tag.
 
 A prerelease is tagged the same way: `python-v1.0.0.dev1` yields version `1.0.0.dev1`, which `pip
-install strands-mongodb` will not resolve to unless asked with `--pre`. The GitHub Release for such
-a tag is marked as a prerelease, so it does not displace the last stable one. A post-release such as `python-v1.0.0.post1` is not a
-prerelease: pip installs it by default and it sorts after `1.0.0`, so its GitHub Release is a normal
-one. It is for republishing the same code with fixed metadata; for any change to the code, bump the patch.
+install strands-mongodb` will not resolve to unless asked with `--pre`, once any final version exists. The GitHub Release for such
+a tag is marked as a prerelease, so it does not displace the last stable one.
+
+A post-release such as `python-v1.0.0.post1` is not a prerelease: pip installs it by default and it
+sorts after `1.0.0`, so its GitHub Release is a normal one. It is for republishing the same code with
+fixed metadata; for any change to the code, bump the patch.
 
 ## What runs, in order
 

@@ -27,6 +27,7 @@ from typing import Any
 
 import pytest
 import yaml
+from packaging.version import Version
 from test_ci import _DEFAULT_TIMEOUT_MINUTES, _TIMEOUT_CEILING_MINUTES
 
 if sys.version_info >= (3, 11):
@@ -768,14 +769,14 @@ class TestTheChangelogAndTheRepositoryAgreeAboutWhatExists:
     """
 
     def test_its_versions_are_the_versions_the_landing_page_publishes(self) -> None:
-        """AT-164 -- compared as sets in both directions; ``Unreleased`` is not a version."""
+        """AT-164 -- compared as sets in both directions; ``Unreleased`` and prereleases are not on the landing page."""
         changelog = _document(CHANGELOG_PATH, _CHANGELOG_DEFECT)
         readme = (REPO_ROOT / "README.md").read_text()
 
         documented = {
             match.group("version")
             for match in _CHANGELOG_HEADING.finditer(changelog)
-            if match.group("version").lower() != "unreleased" and ".dev" not in match.group("version")
+            if match.group("version").lower() != "unreleased" and not Version(match.group("version")).is_prerelease
         }
         published = {match.group("version") for match in _VERSION_ROW.finditer(readme)}
         assert published, "the landing page's version table did not parse, so this test proves nothing"
@@ -1165,6 +1166,9 @@ class TestAPrereleaseIsNotTheLatestRelease:
             ("python-v1.0.0.post1", False),
             ("python-v1.0.0rc1.post1", True),
             ("python-v1.0.0.dev1.post1", True),
+            ("python-v1.0.0.post1.dev2", True),
+            ("python-v1.0.0post1", False),
+            ("python-v1.0.0-post1", False),
             ("python-v1.0.0", False),
             ("python-v0.1.0", False),
             ("python-v10.20.30", False),
