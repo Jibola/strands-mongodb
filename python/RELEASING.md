@@ -57,7 +57,9 @@ fails rather than quietly producing an unsigned tag.
 
 A prerelease is tagged the same way: `python-v1.0.0.dev1` yields version `1.0.0.dev1`, which `pip
 install strands-mongodb` will not resolve to unless asked with `--pre`. The GitHub Release for such
-a tag is marked as a prerelease, so it does not displace the last stable one.
+a tag is marked as a prerelease, so it does not displace the last stable one. A post-release such as `python-v1.0.0.post1` is not a
+prerelease: pip installs it by default and it sorts after `1.0.0`, so its GitHub Release is a normal
+one. It is for republishing the same code with fixed metadata; for any change to the code, bump the patch.
 
 ## What runs, in order
 

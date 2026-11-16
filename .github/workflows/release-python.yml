@@ -354,8 +354,11 @@ jobs:
             # A PEP 440 prerelease is only a prerelease to PyPI: GitHub reads nothing from the
             # version and would list `python-v1.0.0.dev1` as the latest release, ahead of the last
             # stable one. Anything beyond digits and dots -- `.dev1`, `rc1`, `a2`, `+local` -- is
-            # not a final release, so it is marked as one here too.
+            # not a final release, so it is marked as one here too. A `.postN` suffix is the exception:
+            # it is a stable republish that pip prefers over the base version, so it stays unmarked
+            # unless what it follows is a prerelease (`1.0.0rc1.post1`).
             version="${TAG#python-v}"
+            version="${version%[.-]post[0-9]*}"
             prerelease=()
             case "$version" in
               *[!0-9.]*) prerelease=(--prerelease) ;;

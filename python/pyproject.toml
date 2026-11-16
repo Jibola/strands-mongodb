@@ -114,6 +114,11 @@ root = ".."
 # Release tags are `python-v0.1.0`, so the python and typescript artifacts version
 # independently off the same repo.
 tag_regex = "^python-v(?P<version>.+)$"
+# A commit after a `.dev` tag (python-v0.1.0.dev1) cannot be numbered by the default scheme, which
+# raises "choosing custom numbers for the .devX distance is not supported" and fails every build.
+# `release-branch-semver` yields a valid `0.2.0.dev1+g<sha>` there. (`post-release` was tried and
+# yields `0.1.0.dev1.post1`, which is not PEP 440.) After a final tag it numbers the next minor.
+version_scheme = "release-branch-semver"
 # setuptools-scm refuses a non-default `root` without a reference file; pyproject.toml is
 # always next to itself.
 relative_to = "pyproject.toml"
