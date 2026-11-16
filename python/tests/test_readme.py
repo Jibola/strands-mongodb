@@ -500,6 +500,15 @@ class TestTheTwoReadmesAgree:
             "the root README does not link to python/README.md, so nothing leads a reader to the reference"
         )
 
+    def test_the_reference_links_only_to_absolute_urls(self) -> None:
+        """AT-093 -- ``python/README.md`` is the PyPI long description, where a relative link is broken.
+
+        PyPI resolves a relative link against pypi.org, not the repository, so ``MIGRATION.md`` there is a
+        404. In-page ``#anchors`` still work and are allowed.
+        """
+        relative = re.findall(r"\]\((?!https?://|#)([^)]+)\)", _PACKAGE_README.read_text())
+        assert relative == [], f"python/README.md has relative links that break on PyPI: {relative}"
+
 
 class TestTheConfigurationTablesMatchTheTypes:
     """``AT-094`` -- every key of the three configuration ``TypedDict``s is documented.

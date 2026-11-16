@@ -1,21 +1,15 @@
 # Changelog
 
-This file follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with one deviation the
-format does not cover: **no version below carries a date, because none of them has been released.**
-
-The repository's landing page publishes a version table saying what `0.0.1` and `0.1.0` contain, and
-both `README.md` files carry a marker above their install blocks saying the package is not on PyPI
-yet. A test keeps the three in step: the versions here must be exactly the versions the landing page
-publishes, and nothing here may carry a date while either README still says the package is
-unpublished. Removing those markers without dating a release fails the suite.
-
-Versions are `MAJOR.MINOR.PATCH` per [Semantic Versioning](https://semver.org/spec/v2.0.0.html), and
-a release is cut by pushing a `python-v` tag. [RELEASING.md](RELEASING.md) is the procedure.
-
 ## [Unreleased]
 
 Work that has landed on `main` and is not yet inside a tagged version. Entries move down into a
 version heading when that version is tagged.
+
+## [0.1.0.dev1] - 2026-11-12
+
+First upload to PyPI, an end-to-end test of the release pipeline. `pip install 'strands-mongodb[all]'`
+installs it, because pip falls back to a prerelease when no final version exists. It contains what
+`[0.1.0]` below describes, plus the following.
 
 ### Added
 
@@ -73,6 +67,18 @@ not released.
 - The `storage`, `memory` and `all` extras, each pulling only its own dependencies. A bare
   `pip install strands-mongodb` installs no runtime dependencies and gives no working backend.
 - The `strands_mongodb` import path and the public names it exports.
+
+---
+
+This file follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), with one deviation the
+format does not cover: a version with no date has not been released.
+
+The repository's landing page publishes a version table saying what `0.0.1` and `0.1.0` contain. A test
+keeps the two in step: the final versions here must be exactly the versions the landing page publishes.
+A prerelease (`.dev`, `rc`, `a`, `b`) is listed here once it is on PyPI, and is not on the landing page.
+
+Versions are `MAJOR.MINOR.PATCH` per [Semantic Versioning](https://semver.org/spec/v2.0.0.html), and
+a release is cut by pushing a `python-v` tag. [RELEASING.md](RELEASING.md) is the procedure.
 
 <!-- No link reference definitions below. Keep a Changelog puts compare links here; this repository
      has no tags to compare yet. They go in with the first release, alongside that release's date. -->
