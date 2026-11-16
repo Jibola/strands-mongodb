@@ -18,7 +18,7 @@ neither needs a MongoDB-specific class.
 
 ## Status
 
-> **Under construction. Both halves have their operations; neither is released.** `MongoDBStorage`
+> **Both halves have their operations.** `MongoDBStorage`
 > implements all five `Storage` contract methods plus `namespace()` and `delete_prefix()`, so an
 > `Agent` given one gets working sessions, context offloading and context history.
 > `MongoDBMemoryStore` has `initialize()`, `add()`, `search()` across a vector tier, a text tier and a
@@ -49,7 +49,7 @@ neither needs a MongoDB-specific class.
 
 Pick the surface you need. Each extra pulls only its own dependencies.
 
-<!-- skip: these reach PyPI for a package that is not published yet -->
+<!-- skip: installs from PyPI; checked by hand in fresh venvs against the published 0.1.0.dev1 -->
 ```bash
 pip install 'strands-mongodb[storage]'   # MongoDBStorage
 pip install 'strands-mongodb[memory]'    # MongoDBMemoryStore
@@ -63,46 +63,6 @@ pip install 'strands-mongodb[all]'       # both
 A bare `pip install strands-mongodb` installs no runtime dependencies and gives you no working
 backend. It is metadata only. The extra you choose is what selects the dependency set, so
 `[storage]` never drags in vector-search machinery you are not using.
-
-### Before the package reaches PyPI
-
-Nothing is published yet, so the commands above resolve to nothing. Until they do, install from this
-repository. The plain `https://` URL fails for two separate reasons.
-
-The repository is private and MongoDB enforces SAML single sign-on, so an unauthenticated `https://`
-clone stops before pip ever sees a package:
-
-```text
-remote: The 'mongodb' organization has enabled or enforced SAML SSO.
-fatal: unable to access 'https://github.com/mongodb/strands-mongodb.git/': The requested URL returned error: 403
-```
-
-This is a monorepo. The distribution lives in `python/`, a sibling of a future `typescript/`, so
-there is no `pyproject.toml` at the repository root for pip to build even once the clone succeeds.
-
-One URL addresses both: SSH for the first, a `subdirectory` fragment for the second.
-
-<!-- skip: it clones a private repository over SSH, which no test tier holds a key for -->
-```bash
-pip install 'strands-mongodb[all] @ git+ssh://git@github.com/mongodb/strands-mongodb.git#subdirectory=python'
-uv add 'strands-mongodb[all] @ git+ssh://git@github.com/mongodb/strands-mongodb.git#subdirectory=python'
-```
-
-`[all]` is the same choice as above: `[storage]` and `[memory]` work here too, and the extra is still
-what selects the dependency set.
-
-This needs a GitHub account in the `mongodb` organization holding an SSH key authorized for single
-sign-on. A CI runner needs a deploy key for the same reason. There is no anonymous path to this
-package until it is published.
-
-What you get is not a release. No release tag exists yet, so the version is a development version of
-the form `0.0.1.devN+g<sha>`, counted from the first commit, and it changes every time `main` does. Pin
-a commit for anything that has to resolve the same way twice, after the `.git` and before the fragment:
-
-<!-- skip: the same private clone as above, against a commit this document does not pin for you -->
-```bash
-pip install 'strands-mongodb[all] @ git+ssh://git@github.com/mongodb/strands-mongodb.git@<commit-sha>#subdirectory=python'
-```
 
 ## Documentation
 

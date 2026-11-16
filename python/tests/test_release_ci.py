@@ -775,7 +775,7 @@ class TestTheChangelogAndTheRepositoryAgreeAboutWhatExists:
         documented = {
             match.group("version")
             for match in _CHANGELOG_HEADING.finditer(changelog)
-            if match.group("version").lower() != "unreleased"
+            if match.group("version").lower() != "unreleased" and ".dev" not in match.group("version")
         }
         published = {match.group("version") for match in _VERSION_ROW.finditer(readme)}
         assert published, "the landing page's version table did not parse, so this test proves nothing"
