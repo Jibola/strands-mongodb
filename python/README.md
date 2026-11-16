@@ -2,7 +2,7 @@
 
 MongoDB storage and memory backends for the [Strands Agents](https://strandsagents.com) SDK.
 
-This is the Python half of the [strands-mongodb](../README.md) repository. One MongoDB deployment
+This is the Python half of the [strands-mongodb](https://github.com/mongodb/strands-mongodb) repository. One MongoDB deployment
 sits behind both of the SDK's persistence extension points:
 
 | Surface | Class | Module | Extra | SDK protocol | Serves |
@@ -36,7 +36,7 @@ management and context offloading. Each is still turned on with the SDK's own ob
 
 **Already using another MongoDB backend for Strands?** Three exist: the archived `mongodb_memory` tool
 in `strands-agents-tools`, and the community `strands-mongodb-store` and `strands-mongodb-storage`
-packages. [MIGRATION.md](MIGRATION.md) maps each one's settings and document fields onto this
+packages. [MIGRATION.md](https://github.com/mongodb/strands-mongodb/blob/main/python/MIGRATION.md) maps each one's settings and document fields onto this
 package's, says which of the three need data copied and which do not, and covers the index-name
 collision all three run into.
 
@@ -849,7 +849,7 @@ about one. The event names are stable:
 
 ## Examples
 
-Two runnable scripts in [`examples/`](examples/README.md), each split into two commands you run as two
+Two runnable scripts in [`examples/`](https://github.com/mongodb/strands-mongodb/blob/main/python/examples/README.md), each split into two commands you run as two
 processes, so the only thing crossing between them is MongoDB:
 
 <!-- skip: the examples are run by their own tests, which supply the second command and the backend -->
@@ -937,4 +937,4 @@ databases, but is still not recommended.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache-2.0. See [LICENSE](https://github.com/mongodb/strands-mongodb/blob/main/python/LICENSE) and [NOTICE](https://github.com/mongodb/strands-mongodb/blob/main/python/NOTICE).
