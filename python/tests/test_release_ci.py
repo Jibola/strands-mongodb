@@ -27,7 +27,6 @@ from typing import Any
 
 import pytest
 import yaml
-from packaging.version import Version
 from test_ci import _DEFAULT_TIMEOUT_MINUTES, _TIMEOUT_CEILING_MINUTES
 
 if sys.version_info >= (3, 11):
