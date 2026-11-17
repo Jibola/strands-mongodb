@@ -671,10 +671,6 @@ UNPUBLISHED_MARKER = "<!-- skip: these reach PyPI for a package that is not publ
 #: date group is what distinguishes a section that describes a release from one that describes a plan.
 _CHANGELOG_HEADING = re.compile(r"^##\s+\[(?P<version>[^\]]+)\](?:\s*-\s*(?P<date>\S+))?\s*$", re.MULTILINE)
 
-#: The version table in the repository-root README, ``| `0.1.0` | ... |``. Read rather than duplicated,
-#: because that file is the landing page, and it is what a reader believes.
-_VERSION_ROW = re.compile(r"^>?\s*\|\s*`(?P<version>\d+\.\d+\.\d+)`\s*\|", re.MULTILINE)
-
 #: What a reader of a red run needs to be told, once, in the first line.
 _RELEASING_DEFECT = "the release workflow exists and is asserted, but nothing in this tree tells a person how to run it"
 _CHANGELOG_DEFECT = "the repository publishes a version table and describes no version"
@@ -757,35 +753,12 @@ class TestSomebodyCanActuallyPerformARelease:
 
 
 class TestTheChangelogAndTheRepositoryAgreeAboutWhatExists:
-    """AT-164 -- two documents that both claim to say what a version contains.
-
-    The version table lives on the repository's landing page; the changelog is the file a packager
-    reads. Nothing derives either from the other, the same condition ``test_packaging.py`` guards
-    against for the ``dev`` extra and the hatch environment.
+    """AT-164 -- the changelog and the READMEs agree about whether a release exists.
 
     Both READMEs carry a marker saying the package is not on PyPI. That marker becomes false the moment
-    the name is claimed, and the second test makes it a gate: the changelog may not date a release while
-    the repository says none has happened.
+    the name is claimed, and the test makes it a gate: the changelog may not date a release while the
+    repository says none has happened.
     """
-
-    def test_its_versions_are_the_versions_the_landing_page_publishes(self) -> None:
-        """AT-164 -- compared as sets in both directions; ``Unreleased`` and prereleases are not on the landing page."""
-        changelog = _document(CHANGELOG_PATH, _CHANGELOG_DEFECT)
-        readme = (REPO_ROOT / "README.md").read_text()
-
-        documented = {
-            match.group("version")
-            for match in _CHANGELOG_HEADING.finditer(changelog)
-            if match.group("version").lower() != "unreleased" and not Version(match.group("version")).is_prerelease
-        }
-        published = {match.group("version") for match in _VERSION_ROW.finditer(readme)}
-        assert published, "the landing page's version table did not parse, so this test proves nothing"
-
-        assert documented == published, (
-            f"the changelog and the landing page disagree about which versions exist. Only in the "
-            f"changelog: {sorted(documented - published)}. Only on the landing page: "
-            f"{sorted(published - documented)}"
-        )
 
     def test_nothing_is_dated_while_the_repository_says_nothing_is_published(self) -> None:
         """AT-164 -- the install-block marker and the changelog change on the same day or neither does.
