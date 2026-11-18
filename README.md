@@ -16,35 +16,6 @@ neither needs a MongoDB-specific class.
 
 ![strands-mongodb in a Strands agent: the SDK's session manager, context manager and memory manager use MongoDBStorage and MongoDBMemoryStore, which store to MongoDB](docs/images/architecture.png)
 
-## Status
-
-> **Both halves have their operations.** `MongoDBStorage`
-> implements all five `Storage` contract methods plus `namespace()` and `delete_prefix()`, so an
-> `Agent` given one gets working sessions, context offloading and context history.
-> `MongoDBMemoryStore` has `initialize()`, `add()`, `search()` across a vector tier, a text tier and a
-> `hybrid` tier fusing the two with `$rankFusion`,
-> `delete()`, `delete_all()` and `get_tools()`. `add_messages()` is absent on purpose: the SDK's
-> `MemoryManager` feature-detects it, and a present one would take extraction away from the SDK's own
-> extractor and hand it to one this package would have to write.
->
-> | Version | Contains |
-> |---|---|
-> | `0.0.1` | Package metadata, extras, import paths, public names |
-> | `0.1.0` | `MongoDBStorage` + `MongoDBMemoryStore`, the three search tiers, record expiry, OpenTelemetry spans and structured log fields, docs, tests |
->
-> Storage `search()` ranks by token overlap in a single aggregation over the key space, where the SDK's
-> default issues one read per key. Scores come from keys rather than payload text, so a word that appears
-> only inside a stored value will not match.
->
-> Record expiry is armed differently on each surface. `MongoDBMemoryStore.initialize()` provisions the
-> TTL index itself, so a store configured with `ttl_seconds` expires its records without further work.
-> `MongoDBStorage` leaves it to an explicit `await storage.ensure_indexes()` at startup, because an
-> `Agent` builds its storage in a code path the operator never sees and DDL should not be issued from
-> one. Without that index, `MongoDBStorage` stamps the expiry field and nothing removes the record.
->
-> Tested against MongoDB 8.3.8 with a local `mongot` and against Atlas. The two report search index state
-> differently, and the tests accept both forms.
-
 ## Install
 
 Pick the surface you need. Each extra pulls only its own dependencies.
@@ -86,21 +57,7 @@ you run as separate processes, so the only thing that carries state between them
 
 ## Requirements
 
-| | |
-|---|---|
-| Python | >= 3.10 |
-| `strands-agents` | >= 1.54.0, the first release shipping every `strands` module the storage backend imports, `strands.storage.search.keyword` among them |
-| `pymongo` | >= 4.14.0 |
-| `pymongo-search-utils` | >= 0.3.0, with the `memory` extra only |
-| `opentelemetry-api` | >= 1.30.0. The API only; exporting spans is the application's choice |
-| MongoDB | Any deployment serves storage. The text tier needs Atlas Search; the vector tier needs Atlas or an Atlas CLI local deployment. The default embedding path also needs an embedding model registered on the cluster, which Atlas provides and a local `mongot` 8.3.8 does not. |
-
-## Erasing memories
-
-`MongoDBMemoryStore` has `delete(memory_id)` and `delete_all()`, so an erasure request against stored
-facts has something to call. Both need `writable: True`, and both reach exactly as far as `search()`
-does, which is one scope and one store. [`python/README.md`](python/README.md#erasing-memories) has the
-details, including the two ways this surprises people.
+Python 3.10 or newer. [`python/README.md`](python/README.md#requirements) lists the dependency floors and what each MongoDB deployment can serve.
 
 ## Repository layout
 
