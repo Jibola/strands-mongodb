@@ -69,10 +69,16 @@ _PYPROJECT = _PROJECT_ROOT / "pyproject.toml"
 # replaces the whole userinfo with `<redacted>`, so `mongodb+srv://<redacted>@host` is the redaction
 # working rather than a leak, and without the lookahead the guard would flag the redacted output. A
 # partial redaction such as `user:<redacted>@` does not start with the placeholder and is still caught.
+# So is a second `@` after the placeholder, which is what a redaction that stops at the first `@` of
+# `p@ss` leaves behind.
 #
 # `\S*`, not `[^\s/]*`: a password pasted without percent-encoding can hold a `/`, and a pattern that
 # stops at the first one does not see that URI at all.
-_CREDENTIALED_URI = re.compile(r"mongodb(\+srv)?://(?!<redacted>@)\S*@")
+_CREDENTIALED_URI = re.compile(r"mongodb(\+srv)?://(?!<redacted>@[^\s@]*(?:\s|$))\S*@")
+
+# The password in a URI, read two ways because an `@` after the authority makes the userinfo
+# ambiguous: up to the last `@` anywhere, and up to the last `@` before the first `/` or `?`.
+_URI_PASSWORDS = (re.compile(r"://[^:@/]+:(.+)@"), re.compile(r"://[^:@/]+:([^/?]+)@"))
 
 # Punctuation the no-shared-word check strips before comparing, so `"dark-mode."` and `"dark mode"`
 # are not counted as different words. The memory example makes this check itself; the two-process test
@@ -173,9 +179,10 @@ def _no_credentials(result: subprocess.CompletedProcess[str], uri: str | None = 
     output = _both_streams(result)
     assert not _CREDENTIALED_URI.search(output), f"a credentialed URI reached the output\n{output}"
     if uri:
-        password = re.search(r"://[^:@/]+:(.+)@", uri)
-        if password:
-            assert password.group(1) not in output, "the URI password reached the output"
+        for pattern in _URI_PASSWORDS:
+            password = pattern.search(uri)
+            if password:
+                assert password.group(1) not in output, "the URI password reached the output"
 
 
 def _recall_until_embedded(
@@ -567,6 +574,8 @@ class TestTheScriptsRefuseToStartAndSayWhy:
             ("connecting to mongodb+srv://<redacted>:pw@cluster.example.mongodb.net/", True),
             ("connecting to mongodb+srv://appuser:pa/ss@cluster.example.mongodb.net/", True),
             ("connecting to mongodb://appuser:p@ss@127.0.0.1:27017/", True),
+            ("connecting to mongodb://<redacted>@ss@127.0.0.1:27017/", True),
+            ("connecting to mongodb://appuser:p?ss@127.0.0.1:27017/", True),
             ("connecting to mongodb+srv://cluster.example.mongodb.net/", False),
         ],
     )
@@ -578,6 +587,20 @@ class TestTheScriptsRefuseToStartAndSayWhy:
         everything, so the two partial redactions below prove that only the exact redaction passes.
         """
         assert bool(_CREDENTIALED_URI.search(line)) is is_a_leak
+
+    @pytest.mark.parametrize(
+        ("uri", "printed"),
+        [
+            ("mongodb://appuser:s3cret@localhost:27017/?appName=demo@example", "the password is s3cret"),
+            ("mongodb://appuser:p@ss@127.0.0.1:27017/", "the password is p@ss"),
+        ],
+    )
+    def test_the_password_check_sees_a_password_printed_without_its_uri(self, uri: str, printed: str) -> None:
+        """An ``@`` in the query string does not widen the password until the bare secret slips past."""
+        result = subprocess.CompletedProcess(args=[], returncode=0, stdout=printed, stderr="")
+
+        with pytest.raises(AssertionError, match="the URI password reached the output"):
+            _no_credentials(result, uri)
 
 
 class TestTheExamplesAreInsideEveryFileSet:
