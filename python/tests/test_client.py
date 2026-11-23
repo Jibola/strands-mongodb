@@ -1003,19 +1003,10 @@ class TestThePasswordNeverLeavesTheConfig:
 class TestTheCredentialsTheUriRedactionDoesNotCover:
     """AT-177 — credentials passed as driver options never reach a repr of the connection or registry.
 
-    ``AsyncMongoClient.__repr__`` prints every non-default option the client was built with, and the
-    password in the URI is the one value it always redacts. Two other options carry a secret, and on the
-    supported pymongo range (``>=4.14.0``) the driver renders them with the exact call :meth:`_resolve`
-    makes:
-
-    * ``tlsCertificateKeyFilePassword='PEMPASSPHRASE'``, a password by name, printed verbatim by every
-      release in the range;
-    * ``authmechanismproperties={'AWS_SESSION_TOKEN': 'SESSIONTOKENSECRET'}``, a live STS token, printed
-      verbatim before 4.18.0 and rendered ``'<redacted>'`` from 4.18.0 on.
-
-    Both behaviours of the token are asserted, because CI installs both: the ``Dependency floors`` job
-    resolves the floor and the matrix jobs resolve the newest driver. The package supports its floor, so
-    the newest driver's redaction is not something it can rely on.
+    PyMongo redacts ``AWS_SESSION_TOKEN`` in the client repr from 4.18.0 and
+    ``tlsCertificateKeyFilePassword`` from 4.20.1. The package also supports drivers that print these
+    values. The ``connection_with_leaky_repr`` fixture makes both dummy values visible in the driver
+    repr so the package's own protection is exercised on every driver version.
 
     ``_Connection`` is a dataclass and the registry's values are ``_Connection`` objects, so a generated
     ``__repr__`` that included the client would carry these secrets into a debug line interpolating the
@@ -1072,25 +1063,20 @@ class TestTheCredentialsTheUriRedactionDoesNotCover:
         }
         return _client.resolve(config)
 
-    def test_the_driver_prints_the_certificate_key_password_which_is_why_this_class_exists(self) -> None:
-        """The driver's own ``repr`` of the client carries the certificate key password.
-
-        This is the vacuity guard for every test below: if pymongo ever starts redacting this option,
-        those tests keep passing while asserting nothing, and this one fails and says why. The
-        certificate key password is what the guard rests on rather than the session token, because it is
-        the option no release in the supported range redacts;
-        :meth:`test_the_session_tokens_redaction_is_the_drivers_and_moves_between_releases` carries the
-        one that does.
-        """
+    @pytest.fixture
+    def connection_with_leaky_repr(self, monkeypatch: pytest.MonkeyPatch) -> _client._Connection:
+        """Provide a real connection whose client repr includes both dummy secrets."""
         connection = self._resolve(
             tlsCertificateKeyFilePassword=self.PEM,
             authMechanism="MONGODB-AWS",
             authMechanismProperties=f"AWS_SESSION_TOKEN:{self.TOKEN}",
         )
-
+        monkeypatch.setattr(
+            type(connection.client), "__repr__", lambda _: f"AsyncMongoClient({self.PEM}, {self.TOKEN})"
+        )
         rendered = repr(connection.client)
-
-        assert self.PEM in rendered
+        assert self.PEM in rendered and self.TOKEN in rendered
+        return connection
 
     def test_the_session_tokens_redaction_is_the_drivers_and_moves_between_releases(self) -> None:
         """The session token's exposure depends on the installed driver, not on this package.
@@ -1100,7 +1086,6 @@ class TestTheCredentialsTheUriRedactionDoesNotCover:
         its client, so the driver's choice about this option never reaches a caller through the package.
         """
         connection = self._resolve(
-            tlsCertificateKeyFilePassword=self.PEM,
             authMechanism="MONGODB-AWS",
             authMechanismProperties=f"AWS_SESSION_TOKEN:{self.TOKEN}",
         )
@@ -1113,36 +1098,34 @@ class TestTheCredentialsTheUriRedactionDoesNotCover:
         else:
             assert self.TOKEN in rendered, "pymongo began redacting the session token below 4.18.0"
 
-    def test_neither_reaches_the_connection_or_the_registry(self) -> None:
+    def test_neither_reaches_the_connection_or_the_registry(
+        self, connection_with_leaky_repr: _client._Connection
+    ) -> None:
         """Neither secret appears in the repr of the connection or of the registry.
 
         The registry matters most: it is a module global, so it is what
         a crash reporter walking ``vars(_client)`` renders, and it holds every connection in the process
         rather than the one a frame happens to be looking at.
         """
-        connection = self._resolve(
-            tlsCertificateKeyFilePassword=self.PEM,
-            authMechanism="MONGODB-AWS",
-            authMechanismProperties=f"AWS_SESSION_TOKEN:{self.TOKEN}",
-        )
+        self.assert_no_secret(connection_with_leaky_repr, _client._REGISTRY, *_client._REGISTRY.values())
 
-        self.assert_no_secret(connection, _client._REGISTRY, *_client._REGISTRY.values())
-
-    def test_a_debug_line_interpolating_the_connection_is_clean(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_a_debug_line_interpolating_the_connection_is_clean(
+        self, connection_with_leaky_repr: _client._Connection, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """A debug line that interpolates the connection carries no credential.
 
         Nothing in the package logs a connection. Any line that does still cannot expose a credential,
         because ``%s`` and ``%r`` of a dataclass are its ``__repr__``.
         """
-        connection = self._resolve(tlsCertificateKeyFilePassword=self.PEM)
-
         with caplog.at_level(logging.DEBUG, logger="strands_mongodb"):
-            logging.getLogger("strands_mongodb").debug("connection=%r", connection)
+            logging.getLogger("strands_mongodb").debug("connection=%r", connection_with_leaky_repr)
 
         assert "connection=" in caplog.text
         self.assert_no_secret(caplog.text)
 
-    def test_an_error_that_names_the_connection_carries_no_secret_into_its_traceback(self) -> None:
+    def test_an_error_that_names_the_connection_carries_no_secret_into_its_traceback(
+        self, connection_with_leaky_repr: _client._Connection
+    ) -> None:
         """An exception whose message renders the connection carries no credential.
 
         The standard renderer prints no locals, so what this asserts is the interpolation rather than the
@@ -1150,12 +1133,10 @@ class TestTheCredentialsTheUriRedactionDoesNotCover:
         both format it. Errors in this package already put ``_target`` and a namespace into the message,
         and an error that rendered the connection would be just as safe.
         """
-        connection = self._resolve(
-            authMechanism="MONGODB-AWS", authMechanismProperties=f"AWS_SESSION_TOKEN:{self.TOKEN}"
-        )
-
         try:
-            raise StorageError(f"strands_mongodb: pretending something failed while holding {connection!r}")
+            raise StorageError(
+                f"strands_mongodb: pretending something failed while holding {connection_with_leaky_repr!r}"
+            )
         except StorageError as error:
             rendered = "".join(traceback.format_exception(error))
 
